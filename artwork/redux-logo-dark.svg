@@ -16,5 +16,5 @@
     <path d="M20.79 78.78 A82 82 0 0 1 60.25 28.28" fill="none" stroke="#E8679A" stroke-width="13"/>
     <path d="M66.55 39.65 L53.94 16.91 L87.17 19.01 Z" fill="#E8679A" stroke="#E8679A" stroke-width="1.5"/>
   </g>
-  <text x="62" y="46" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="44" font-weight="700" fill="#E8E6E1" letter-spacing="-0.5">CosmosEx<tspan dx="11" font-weight="300" fill="#F5A623">redux</tspan></text>
+  <text x="62" y="46" textLength="337" lengthAdjust="spacingAndGlyphs" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="44" font-weight="700" fill="#E8E6E1" letter-spacing="-0.5">CosmosEx<tspan dx="11" font-weight="300" fill="#F5A623">redux</tspan></text>
 </svg>
