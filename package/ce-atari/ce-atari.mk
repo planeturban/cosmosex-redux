@@ -89,6 +89,9 @@ define CE_ATARI_INSTALL_TARGET_CMDS
 		$(CE_ATARI_SEED_DIR)/update/flash_xilinx
 	$(INSTALL) -D -m 0644 $(CE_ATARI_PKGDIR)/st/ce_dd.prg \
 		$(CE_ATARI_SEED_DIR)/app/configdrive/drivers/ce_dd.prg
+	# the app's licence (BSD 2-clause) asks for its text to go along with binaries
+	$(INSTALL) -D -m 0644 $(@D)/ce_main_app/license.txt \
+		$(TARGET_DIR)/usr/share/licenses/ce_main_app/license.txt
 endef
 
 $(eval $(generic-package))

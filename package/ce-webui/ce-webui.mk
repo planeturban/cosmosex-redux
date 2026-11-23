@@ -7,7 +7,7 @@
 CE_WEBUI_VERSION = 1.0
 CE_WEBUI_SITE = $(BR2_EXTERNAL_COSMOSEX_PATH)/webui
 CE_WEBUI_SITE_METHOD = local
-CE_WEBUI_LICENSE = OFL-1.1 (fonts)
+CE_WEBUI_LICENSE = GPL-3.0+, OFL-1.1 (fonts)
 CE_WEBUI_LICENSE_FILES = fonts/LICENSE-barlow fonts/LICENSE-barlow-condensed fonts/LICENSE-jetbrains-mono
 # The classic pages that stay come from the release's webroot; fonts are
 # downloaded by ce-webui-fonts
