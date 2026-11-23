@@ -1,0 +1,20 @@
+linux.defconfig: the 32-bit kernel configuration (savedefconfig format),
+applied before ../common/linux.fragment.
+
+Made from the Raspberry Pi kernel's bcm2709_defconfig (Pi 2, 3, 3 B+) +
+linux.fragment with "make localmodconfig": only the modules in
+../common/kernel-modules.lsmod are kept (91 of 1281). That list is the
+module set of the trimmed 64-bit kernel (see ../arm64/linux.defconfig.README):
+what a CosmosEx loads (this image and a stock Raspbian unit), plus what's
+needed on demand (cifs, nfsd, joydev, xpad, all HID device drivers, i2c-dev,
+Wi-Fi, cdc_ether for QEMU).
+
+To regenerate (e.g. after a kernel update), in the build container:
+  cd /work/output-armv7/build/linux-custom
+  export PATH=/work/output-armv7/host/bin:$PATH
+  make ARCH=arm CROSS_COMPILE=arm-buildroot-linux-gnueabihf- \
+       LSMOD=/src/board/cosmosex/common/kernel-modules.lsmod localmodconfig
+  make ARCH=arm CROSS_COMPILE=arm-buildroot-linux-gnueabihf- savedefconfig
+  cp defconfig /src/board/cosmosex/armv7/linux.defconfig
+A module that's missing: add CONFIG_<X>=m to ../common/linux.fragment (and
+its name to kernel-modules.lsmod).

@@ -1,0 +1,388 @@
+From b3721b53ee4b96efba4485b0768ba189f10f87ca Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:19:16 +0100
+Subject: [PATCH] ce_main_app: several hard disk images, one per ACSI ID
+
+HDDIMAGE_<id> ("path" or "path RO") attaches an image to exactly that
+ACSI ID (it has to be raw; otherwise the image stays unattached, logged).
+The single HDDIMAGE of before (and of the config screen) moves to the first
+raw ID without an image when the settings are loaded. USB drives in raw
+mode take the raw IDs that are left, as before.
+
+settings/hddimage: "ids" (per ID: raw, path, readOnly), each image's
+"id"; PUT {"attach": {path, id, readOnly}} (an image on one ID only) and
+{"detach": {id | path}}; {"path", "readOnly"} as before goes to the
+image's ID or the first free raw one. Delete refuses an image on any ID,
+rename follows it on its ID.
+---
+ ce_main_app/native/scsi.cpp                   |  59 ++++--
+ ce_main_app/native/scsi.h                     |   5 +-
+ .../api/resource/settingsresource.cpp         | 174 +++++++++++++++---
+ 3 files changed, 198 insertions(+), 40 deletions(-)
+
+diff --git a/ce_main_app/native/scsi.cpp b/ce_main_app/native/scsi.cpp
+index a93564b7..9db2f980 100644
+--- a/ce_main_app/native/scsi.cpp
++++ b/ce_main_app/native/scsi.cpp
+@@ -45,7 +45,7 @@ void Scsi::setAcsiDataTrans(AcsiDataTrans *dt)
+     dataTrans = dt;
+ }
+ 
+-bool Scsi::attachToHostPath(std::string hostPath, int hostSourceType, int accessType)
++bool Scsi::attachToHostPath(std::string hostPath, int hostSourceType, int accessType, int wantedId)
+ {
+     bool res;
+     IMedia *dm;
+@@ -58,7 +58,7 @@ bool Scsi::attachToHostPath(std::string hostPath, int hostSourceType, int access
+ 
+     if(index != -1) {                                               // if we already have this media
+         if(attachedMedia[index].devInfoIndex == -1) {               // but it's not attached to ACSI ID
+-            res = attachMediaToACSIid(index, hostSourceType, accessType);          // attach media to ACSI ID
++            res = attachMediaToACSIid(index, hostSourceType, accessType, wantedId);          // attach media to ACSI ID
+ 
+             if(res) {
+                 Debug::out(LOG_DEBUG, "Scsi::attachToHostPath - %s(%s) - media was already attached, attached to ACSI ID %d", hostPath.c_str(), SourceTypeStr(hostSourceType), attachedMedia[index].devInfoIndex);
+@@ -160,7 +160,7 @@ bool Scsi::attachToHostPath(std::string hostPath, int hostSourceType, int access
+         break;
+     }
+ 
+-    res = attachMediaToACSIid(index, hostSourceType, accessType);          // last step - attach media to ACSI ID
++    res = attachMediaToACSIid(index, hostSourceType, accessType, wantedId);          // last step - attach media to ACSI ID
+ 
+     if(res) {
+         Debug::out(LOG_DEBUG, "Scsi::attachToHostPath - %s - attached to ACSI ID %d", hostPath.c_str(), attachedMedia[index].devInfoIndex);
+@@ -171,9 +171,12 @@ bool Scsi::attachToHostPath(std::string hostPath, int hostSourceType, int access
+     return res;
+ }
+ 
+-bool Scsi::attachMediaToACSIid(int mediaIndex, int hostSourceType, int accessType)
++bool Scsi::attachMediaToACSIid(int mediaIndex, int hostSourceType, int accessType, int wantedId)
+ {
+     for(int i=0; i<8; i++) {                                                // find empty and proper ACSI ID
++        if(wantedId >= 0 && wantedId <= 7 && i != wantedId) {             // only that ID
++            continue;
++        }
+         // if this index is already used, skip it
+         if(devInfo[i].attachedMediaIndex != -1) {
+             continue;
+@@ -369,11 +372,41 @@ void Scsi::loadSettings(void)
+     }
+ #endif
+ 
+-    std::string img;
+-    img = s.getString("HDDIMAGE", "");
+-    while(!img.empty() && (img[img.length()-1] == '\n' || img[img.length()-1] == ' '))
+-        img.erase(img.length()-1);
+-    if(!img.empty()) {
++    // Hard disk images: HDDIMAGE_<id> ("path" or "path RO") on that ACSI ID
++    // (it has to be raw); an image whose ID isn't raw stays unattached.
++    // The single HDDIMAGE of before (and of the config screen) moves to the
++    // first raw ID without an image of its own.
++    std::string legacy = s.getString("HDDIMAGE", "");
++    while(!legacy.empty() && (legacy[legacy.length()-1] == '\n' || legacy[legacy.length()-1] == ' '))
++        legacy.erase(legacy.length()-1);
++    if(!legacy.empty()) {
++        int to = -1;
++        char key[32];
++        for(int id=0; id<8 && to < 0; id++) {
++            snprintf(key, sizeof(key), "HDDIMAGE_%d", id);
++            if(acsiIdInfo.acsiIDdevType[id] == DEVTYPE_RAW && strlen(s.getString(key, "")) == 0) to = id;
++        }
++        if(to < 0) {                                    // no raw ID free: the first ID without an image
++            for(int id=0; id<8 && to < 0; id++) {
++                snprintf(key, sizeof(key), "HDDIMAGE_%d", id);
++                if(strlen(s.getString(key, "")) == 0) to = id;
++            }
++        }
++        if(to >= 0) {
++            snprintf(key, sizeof(key), "HDDIMAGE_%d", to);
++            s.setString(key, legacy.c_str());
++            s.setString("HDDIMAGE", "");
++            Debug::out(LOG_INFO, "Scsi::loadSettings - HDDIMAGE %s now on ID %d (%s)", legacy.c_str(), to, key);
++        }
++    }
++
++    for(int id=0; id<8; id++) {
++        char key[32];
++        snprintf(key, sizeof(key), "HDDIMAGE_%d", id);
++        std::string img = s.getString(key, "");
++        while(!img.empty() && (img[img.length()-1] == '\n' || img[img.length()-1] == ' '))
++            img.erase(img.length()-1);
++        if(img.empty()) continue;
+         int accessType = SCSI_ACCESSTYPE_FULL;
+         size_t pos = img.find_last_of(' ');
+         if(pos != std::string::npos) {
+@@ -383,8 +416,12 @@ void Scsi::loadSettings(void)
+                 img = img.substr(0, pos);
+             }
+         }
+-        if(!attachToHostPath(img, SOURCETYPE_IMAGE, accessType)) {
+-            Debug::out(LOG_ERROR, "Scsi::loadSettings fail to attach HDDIMAGE %s", img.c_str());
++        if(acsiIdInfo.acsiIDdevType[id] != DEVTYPE_RAW) {
++            Debug::out(LOG_ERROR, "Scsi::loadSettings - %s is set for ID %d, which isn't raw: not attached", img.c_str(), id);
++            continue;
++        }
++        if(!attachToHostPath(img, SOURCETYPE_IMAGE, accessType, id)) {
++            Debug::out(LOG_ERROR, "Scsi::loadSettings fail to attach %s %s", key, img.c_str());
+         }
+     }
+ }
+diff --git a/ce_main_app/native/scsi.h b/ce_main_app/native/scsi.h
+index 697d2c9a..252859e7 100644
+--- a/ce_main_app/native/scsi.h
++++ b/ce_main_app/native/scsi.h
+@@ -71,7 +71,8 @@ public:
+ 
+     void setAcsiDataTrans(AcsiDataTrans *dt);
+ 
+-    bool attachToHostPath(std::string hostPath, int hostSourceType, int accessType);
++    // wantedId 0..7: only on that ACSI ID (a hard disk image set for an ID), else the first that fits
++    bool attachToHostPath(std::string hostPath, int hostSourceType, int accessType, int wantedId = -1);
+     void dettachFromHostPath(std::string hostPath);
+     void detachAll(void);
+     void detachAllUsbMedia(void);
+@@ -162,7 +163,7 @@ private:
+     int  findAttachedMediaByHostPath(std::string hostPath);
+     void dettachBySourceType(int hostSourceType);
+     void dettachByIndex(int index);
+-    bool attachMediaToACSIid(int mediaIndex, int hostSourceType, int accessType);
++    bool attachMediaToACSIid(int mediaIndex, int hostSourceType, int accessType, int wantedId = -1);
+     void detachMediaFromACSIidByIndex(int index);
+ 
+     void initializeAttachedMediaVars(int index);
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index d9af3c62..f5bfdf13 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -219,6 +219,45 @@ static bool listedImage(const std::string &path, std::string &real, std::string
+     return false;
+ }
+ 
++// "path" or "path RO" -> path, read-only
++static std::string splitImageSetting(std::string img, bool *readOnly)
++{
++    while(!img.empty() && (img[img.length() - 1] == '\n' || img[img.length() - 1] == ' ')) img.erase(img.length() - 1);
++    bool ro = false;
++    size_t sp = img.find_last_of(' ');
++    if(sp != std::string::npos) {
++        std::string end = img.substr(sp + 1);
++        if(end == "RO" || end == "READONLY" || end == "READ_ONLY") { ro = true; img.erase(sp); }
++    }
++    if(readOnly) *readOnly = ro;
++    return img;
++}
++
++// the image set for an ACSI ID (HDDIMAGE_<id>, Scsi::loadSettings)
++static std::string idImage(Settings &s, int id, bool *readOnly)
++{
++    char key[32];
++    snprintf(key, sizeof(key), "HDDIMAGE_%d", id);
++    return splitImageSetting(s.getString(key, ""), readOnly);
++}
++
++static void setIdImage(Settings &s, int id, const std::string &path, bool readOnly)
++{
++    char key[32];
++    snprintf(key, sizeof(key), "HDDIMAGE_%d", id);
++    std::string v = path;
++    if(!v.empty() && readOnly) v += " RO";
++    s.setString(key, v.c_str());
++}
++
++// the ID an image is set for (also the old single HDDIMAGE: 8), -1: none
++static int imageId(Settings &s, const std::string &path)
++{
++    for(int id = 0; id < 8; id++) if(!path.empty() && idImage(s, id, NULL) == path) return id;
++    if(!path.empty() && splitImageSetting(s.getString("HDDIMAGE", ""), NULL) == path) return 8;
++    return -1;
++}
++
+ // the attached image's path (HDDIMAGE without " RO")
+ static std::string attachedImage(Settings &s, bool *readOnly)
+ {
+@@ -436,7 +475,29 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+             std::string end = img.substr(sp + 1);
+             if(end == "RO" || end == "READONLY" || end == "READ_ONLY") { readOnly = true; img.erase(sp); }
+         }
+-        cJSON_AddStringToObject(out, "path", img.c_str());
++        // per ACSI ID: the image set for it (HDDIMAGE_<id>; the old single
++        // HDDIMAGE moves to an ID when the app loads its settings)
++        cJSON *ids = cJSON_CreateArray();
++        std::string first;
++        bool firstRo = false;
++        for(int id = 0; id < 8; id++) {
++            bool ro = false;
++            std::string p = idImage(s, id, &ro);
++            char dk[32];
++            sprintf(dk, "ACSI_DEVTYPE_%d", id);
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddNumberToObject(o, "id", id);
++            cJSON_AddBoolToObject(o, "raw", s.getInt(dk, DEVTYPE_OFF) == DEVTYPE_RAW);
++            cJSON_AddStringToObject(o, "path", p.c_str());
++            cJSON_AddBoolToObject(o, "readOnly", ro);
++            cJSON_AddItemToArray(ids, o);
++            if(first.empty() && !p.empty()) { first = p; firstRo = ro; }
++        }
++        cJSON_AddItemToObject(out, "ids", ids);
++        if(first.empty() && !img.empty()) { first = img; firstRo = readOnly; }   // not moved yet
++        img = first;
++        readOnly = firstRo;
++        cJSON_AddStringToObject(out, "path", img.c_str());          // the first one (as before)
+         cJSON_AddBoolToObject(out, "readOnly", readOnly);
+ 
+         // the image is served on an ACSI ID set to "raw"
+@@ -471,7 +532,9 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+             cJSON_AddNumberToObject(o, "sizeMB", (double) (st.st_size / (1024 * 1024)));
+             cJSON_AddStringToObject(o, "notes", imageNotes(names[i]).c_str());
+             cJSON_AddStringToObject(o, "where", "storage");
+-            cJSON_AddBoolToObject(o, "attached", full == img);
++            int on = imageId(s, full);
++            cJSON_AddBoolToObject(o, "attached", on >= 0);
++            cJSON_AddNumberToObject(o, "id", on >= 0 && on < 8 ? on : -1);
+             cJSON_AddItemToArray(imgs, o);
+         }
+         cJSON_AddItemToObject(out, "images", imgs);
+@@ -500,7 +563,9 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+                 cJSON_AddNumberToObject(o, "sizeMB", (double) (st.st_size / (1024 * 1024)));
+                 cJSON_AddStringToObject(o, "where", "usb");
+                 cJSON_AddStringToObject(o, "drive", mounts[m].c_str());
+-                cJSON_AddBoolToObject(o, "attached", full == img);
++                int on = imageId(s, full);
++                cJSON_AddBoolToObject(o, "attached", on >= 0);
++                cJSON_AddNumberToObject(o, "id", on >= 0 && on < 8 ? on : -1);
+                 cJSON_AddItemToArray(usb, o);
+             }
+         }
+@@ -877,7 +942,7 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+                 msg = "Only images in " HDD_IMAGES_DIR " can be deleted here.";
+                 return false;
+             }
+-            if(real == attachedImage(s, NULL)) { msg = "That image is attached: detach it first."; return false; }
++            if(imageId(s, real) >= 0) { msg = "That image is attached: detach it first."; return false; }
+             std::string name = real.substr(real.find_last_of('/') + 1);
+             if(unlink(real.c_str()) != 0) { msg = "Couldn't delete " + name + ": " + strerror(errno) + "."; return false; }
+             unlink((real + ".json").c_str());
+@@ -910,10 +975,11 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+             if(lstat(to.c_str(), &st) == 0) { msg = "There's already a file called " + name + "."; return false; }
+             if(rename(real.c_str(), to.c_str()) != 0) { msg = std::string("Couldn't rename: ") + strerror(errno) + "."; return false; }
+             rename((real + ".json").c_str(), (to + ".json").c_str());       // the notes, if any
+-            bool ro = false;
+-            if(attachedImage(s, &ro) == real) {                             // attached: follow it
+-                std::string v = to + (ro ? " RO" : "");
+-                s.setString("HDDIMAGE", v.c_str());
++            int on = imageId(s, real);
++            if(on >= 0) {                                                   // attached: follow it
++                bool ro = false;
++                if(on < 8) { idImage(s, on, &ro); setIdImage(s, on, to, ro); }
++                else { attachedImage(s, &ro); std::string v = to + (ro ? " RO" : ""); s.setString("HDDIMAGE", v.c_str()); }
+                 reload(SETTINGSUSER_ACSI);
+             }
+             Debug::out(LOG_INFO, "SettingsResource: renamed HDD image %s to %s", real.c_str(), to.c_str());
+@@ -952,31 +1018,85 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+             }
+         }
+ 
++        // {"detach": {"id": n}} or {"detach": {"path": p}}
++        cJSON *det = cJSON_GetObjectItem(in, "detach");
++        if(det) {
++            cJSON *ji = cJSON_GetObjectItem(det, "id"), *jp = cJSON_GetObjectItem(det, "path");
++            int id = (ji && ji->type == cJSON_Number) ? ji->valueint : -1;
++            if(id < 0 && jp && jp->type == cJSON_String && jp->valuestring) {
++                char real[PATH_MAX];
++                std::string p = realpath(jp->valuestring, real) ? real : jp->valuestring;
++                id = imageId(s, p);
++            }
++            if(id == 8) s.setString("HDDIMAGE", "");
++            else if(id >= 0 && id < 8) setIdImage(s, id, "", false);
++            else { msg = "Nothing attached there."; return false; }
++            reload(SETTINGSUSER_ACSI);
++            Utils::forceSync();
++            return true;
++        }
++
++        // {"attach": {"path": p, "id": n, "readOnly": b}}: the image on that ACSI ID
++        // (one image per ID, an image on one ID only); also {"path", "readOnly"}
++        // as before: on the ID it's on, or the first raw ID without an image
++        cJSON *att = cJSON_GetObjectItem(in, "attach");
+         std::string path;
+-        if(!getString(in, "path", path)) {                  // no "path": the image setting stays as it is
++        int id = -1;
++        bool readOnly = false;
++        if(att) {
++            cJSON *jp = cJSON_GetObjectItem(att, "path"), *ji = cJSON_GetObjectItem(att, "id"), *jr = cJSON_GetObjectItem(att, "readOnly");
++            if(!jp || jp->type != cJSON_String || !jp->valuestring || !jp->valuestring[0]) { msg = "attach: which image (path)?"; return false; }
++            if(!ji || ji->type != cJSON_Number || ji->valueint < 0 || ji->valueint > 7) { msg = "attach: an ACSI ID 0 to 7."; return false; }
++            path = jp->valuestring;
++            id = ji->valueint;
++            readOnly = jr && jr->type == cJSON_True;
++        } else if(!getString(in, "path", path)) {          // no "path": the image settings stay as they are
+             Utils::forceSync();
+             return true;
++        } else {
++            getBool(in, "readOnly", readOnly);
++            if(path.empty()) {                              // detach all
++                for(int i = 0; i < 8; i++) setIdImage(s, i, "", false);
++                s.setString("HDDIMAGE", "");
++                reload(SETTINGSUSER_ACSI);
++                Utils::forceSync();
++                return true;
++            }
+         }
+-        if(!path.empty()) {
+-            struct stat st;
+-            if(path[0] != '/' || !safeText(path))   { msg = "The path must be absolute, e.g. /mnt/sda1/disk.img."; return false; }
+-            if(stat(path.c_str(), &st) < 0)        { msg = "Can't access that file."; return false; }
+-            // only images on data drives: the ST gets read-write access to
+-            // this file, and the web API has no login (stricter than the
+-            // config screen, which takes any path)
+-            char real[PATH_MAX];
+-            if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/storage/", 9) != 0)) {
+-                msg = "The image must be on a USB drive, the shared drive or /storage (a path under /mnt/ or /storage/).";
+-                return false;
++
++        struct stat st;
++        if(path[0] != '/' || !safeText(path))   { msg = "The path must be absolute, e.g. /mnt/sda1/disk.img."; return false; }
++        if(stat(path.c_str(), &st) < 0)        { msg = "Can't access that file."; return false; }
++        // only images on data drives: the ST gets read-write access to this file
++        char real[PATH_MAX];
++        if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/storage/", 9) != 0)) {
++            msg = "The image must be on a USB drive, the shared drive or /storage (a path under /mnt/ or /storage/).";
++            return false;
++        }
++        path = real;
++        if(!S_ISREG(st.st_mode))               { msg = "That's not a regular file."; return false; }
++        if(path.find("/mnt/shared/") == 0) warning = "An HDD image on the network isn't safe: a dropped connection can corrupt it.";
++
++        int was = imageId(s, path);
++        if(id < 0) {                                    // the old way: where it is, or the first raw ID without an image
++            if(was >= 0 && was < 8) id = was;
++            for(int i = 0; i < 8 && id < 0; i++) {
++                char dk[32];
++                sprintf(dk, "ACSI_DEVTYPE_%d", i);
++                if(s.getInt(dk, DEVTYPE_OFF) == DEVTYPE_RAW && idImage(s, i, NULL).empty()) id = i;
+             }
+-            path = real;
+-            if(!S_ISREG(st.st_mode))               { msg = "That's not a regular file."; return false; }
+-            if(path.find("/mnt/shared/") == 0) warning = "An HDD image on the network isn't safe: a dropped connection can corrupt it.";
++            if(id < 0) { msg = "No raw ACSI ID is free for the image: set one to Raw first."; return false; }
++        }
++        if(was == 8) s.setString("HDDIMAGE", "");
++        else if(was >= 0 && was != id) setIdImage(s, was, "", false);      // an image on one ID only
++        setIdImage(s, id, path, readOnly);
++        char dk[32];
++        sprintf(dk, "ACSI_DEVTYPE_%d", id);
++        if(s.getInt(dk, DEVTYPE_OFF) != DEVTYPE_RAW && warning.empty()) {
++            char w[120];
++            snprintf(w, sizeof(w), "ID %d isn't set to Raw: the ST doesn't see the image until it is.", id);
++            warning = w;
+         }
+-        bool readOnly = false;
+-        getBool(in, "readOnly", readOnly);
+-        if(!path.empty() && readOnly) path += " RO";        // Scsi::loadSettings: read-only for the ST
+-        s.setString("HDDIMAGE", path.c_str());
+         reload(SETTINGSUSER_ACSI);
+         Utils::forceSync();
+         return true;
+-- 
+2.54.0 (Apple Git-157)
+

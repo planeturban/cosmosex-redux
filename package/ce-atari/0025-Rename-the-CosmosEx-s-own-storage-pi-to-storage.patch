@@ -1,0 +1,408 @@
+From cedf9c528b1417c3ba645d71084d914d572d9291 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:08:16 +0100
+Subject: [PATCH] Rename the CosmosEx's own storage /pi to /storage
+
+The partition was mounted at /pi, after the user, which says nothing about
+what it is. Now /storage: translated drives, downloaded images, hard disk
+images. The sharing settings (section "pishare") become "storageshare",
+with the tool /usr/sbin/ce-storageshare and /etc/ce-storageshare.conf.
+---
+ ce_main_app/floppy/imagelibsources.cpp        |  2 +-
+ ce_main_app/floppy/imagelibsources.h          |  4 +--
+ ce_main_app/floppy/imagestorage.h             |  6 ++--
+ ce_main_app/floppy/unpackcache.cpp            |  2 +-
+ ce_main_app/translated/translateddisk.h       |  6 ++--
+ .../translated/translateddisk_general.cpp     |  6 ++--
+ ce_main_app/webserver/api/resource/pishare.h  | 19 -----------
+ .../api/resource/settingsresource.cpp         | 18 +++++-----
+ .../webserver/api/resource/settingsresource.h |  2 +-
+ .../{pishare.cpp => storageshare.cpp}         | 34 +++++++++----------
+ .../webserver/api/resource/storageshare.h     | 19 +++++++++++
+ 11 files changed, 59 insertions(+), 59 deletions(-)
+ delete mode 100644 ce_main_app/webserver/api/resource/pishare.h
+ rename ce_main_app/webserver/api/resource/{pishare.cpp => storageshare.cpp} (90%)
+ create mode 100644 ce_main_app/webserver/api/resource/storageshare.h
+
+diff --git a/ce_main_app/floppy/imagelibsources.cpp b/ce_main_app/floppy/imagelibsources.cpp
+index 50e39d2e..3ca29e26 100644
+--- a/ce_main_app/floppy/imagelibsources.cpp
++++ b/ce_main_app/floppy/imagelibsources.cpp
+@@ -156,7 +156,7 @@ bool ImageLibSources::parseEntry(const std::string &entry, ImageLibSource &src)
+         src.label = "SHARE " + src.path;
+     } else if(type == IMAGELIB_TYPE_LOCAL) {
+         src.id    = "local-" + shortHash(src.path);
+-        src.label = "LOCAL /pi" + (src.path == "/" ? std::string("") : src.path);
++        src.label = "LOCAL /storage" + (src.path == "/" ? std::string("") : src.path);
+     } else {
+         src.id    = sanitizeId("usb-" + src.serial);
+         std::string shortSerial = src.serial.length() > 8 ? src.serial.substr(0, 8) + "..." : src.serial;
+diff --git a/ce_main_app/floppy/imagelibsources.h b/ce_main_app/floppy/imagelibsources.h
+index 3fb430ac..c8f04696 100644
+--- a/ce_main_app/floppy/imagelibsources.h
++++ b/ce_main_app/floppy/imagelibsources.h
+@@ -7,7 +7,7 @@
+ //   http://... / https://...   a remote imagelist.csv (the original list or a mirror)
+ //   share:<path>               a folder on the shared drive
+ //   usb:<serial>:<path>        a folder on the USB stick with this USB serial number
+-//   local:<path>               a folder on the CosmosEx's own storage (/pi)
++//   local:<path>               a folder on the CosmosEx's own storage (/storage)
+ // An entry starting with '!' is disabled: kept in place, but not used.
+ // A comma inside a share:/usb: path is written as %2C (decoded); URLs are
+ // passed through unchanged. Empty entries are ignored, unknown ones skipped,
+@@ -26,7 +26,7 @@
+ #define IMAGELIB_TYPE_WEB           0
+ #define IMAGELIB_TYPE_SHARE         1
+ #define IMAGELIB_TYPE_USB           2
+-#define IMAGELIB_TYPE_LOCAL         3       // local:<path>, a folder on the CosmosEx's own storage (/pi)
++#define IMAGELIB_TYPE_LOCAL         3       // local:<path>, a folder on the CosmosEx's own storage (/storage)
+ 
+ typedef struct {
+     int         type;       // IMAGELIB_TYPE_*
+diff --git a/ce_main_app/floppy/imagestorage.h b/ce_main_app/floppy/imagestorage.h
+index 8b073815..b8616a9f 100644
+--- a/ce_main_app/floppy/imagestorage.h
++++ b/ce_main_app/floppy/imagestorage.h
+@@ -10,14 +10,14 @@
+ 
+ // IMAGE_STORAGE: where downloaded floppy images go.
+ //   auto (default)     first USB stick, else the shared drive (as before), else
+-//                      the CosmosEx's own storage (/pi/img_download), else RAM
++//                      the CosmosEx's own storage (/storage/img_download), else RAM
+ //   shared             the shared drive (even with a USB stick attached)
+ //   share:<path>, usb:<serial>:<path>, local:<path>   that folder
+ // When the chosen place isn't available, downloads go to RAM
+ // (IMAGE_STORAGE_RAM_DIR): usable until a reboot, saves to them are lost.
+ #define IMAGE_STORAGE_KEY       "IMAGE_STORAGE"
+ #define IMAGE_STORAGE_RAM_DIR   "/tmp/floppy_images"
+-#define LOCAL_STORAGE_ROOT      "/pi"
++#define LOCAL_STORAGE_ROOT      "/storage"
+ #define LOCAL_STORAGE_DOWNLOADS "/img_download"
+ 
+ typedef struct {
+@@ -56,7 +56,7 @@ public:
+     // Where downloads go now and why (for the web UI)
+     static void getStorageInfo(StorageInfo &info);
+ 
+-    // /pi (the CosmosEx's own storage) is mounted
++    // /storage (the CosmosEx's own storage) is mounted
+     static bool localStorageAvailable(void);
+ 
+ private:
+diff --git a/ce_main_app/floppy/unpackcache.cpp b/ce_main_app/floppy/unpackcache.cpp
+index a0f75e32..cd247e68 100644
+--- a/ce_main_app/floppy/unpackcache.cpp
++++ b/ce_main_app/floppy/unpackcache.cpp
+@@ -119,7 +119,7 @@ bool UnpackCache::copyFileSafely(const std::string &src, const std::string &dst)
+     std::string tmp = dst + ".tmp";
+     int in = open(src.c_str(), O_RDONLY);
+     if(in < 0) return false;
+-    int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);     // the umask decides (the image runs the app with 002: group-writable on /pi)
++    int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);     // the umask decides (the image runs the app with 002: group-writable on /storage)
+     if(out < 0) { close(in); return false; }
+ 
+     bool ok = true;
+diff --git a/ce_main_app/translated/translateddisk.h b/ce_main_app/translated/translateddisk.h
+index 568d4cd1..8fae9148 100644
+--- a/ce_main_app/translated/translateddisk.h
++++ b/ce_main_app/translated/translateddisk.h
+@@ -73,12 +73,12 @@ typedef struct {
+ #define TRANSLATEDTYPE_NORMAL           0
+ #define TRANSLATEDTYPE_SHAREDDRIVE      1
+ #define TRANSLATEDTYPE_CONFIGDRIVE      2
+-#define TRANSLATEDTYPE_LOCALFOLDER      3       // a folder on the CosmosEx's own storage: /pi/translated_<letter>
++#define TRANSLATEDTYPE_LOCALFOLDER      3       // a folder on the CosmosEx's own storage: /storage/translated_<letter>
+ 
+-// Local folders as drives: /pi/translated_G is G: on the Atari (letters C-P).
++// Local folders as drives: /storage/translated_G is G: on the Atari (letters C-P).
+ // Their letters are reserved: USB drives skip them.
+ #ifndef LOCAL_DRIVES_ROOT
+-#define LOCAL_DRIVES_ROOT               "/pi"
++#define LOCAL_DRIVES_ROOT               "/storage"
+ #endif
+ #define LOCAL_DRIVES_PREFIX             "translated_"
+ 
+diff --git a/ce_main_app/translated/translateddisk_general.cpp b/ce_main_app/translated/translateddisk_general.cpp
+index 4b9647f4..443a11f6 100644
+--- a/ce_main_app/translated/translateddisk_general.cpp
++++ b/ce_main_app/translated/translateddisk_general.cpp
+@@ -93,7 +93,7 @@ TranslatedDisk::TranslatedDisk(AcsiDataTrans *dt, ConfigService *cs, ScreencastS
+ 
+     loadSettings();
+ 
+-    attachLocalFolders();                                               // /pi/translated_<letter> folders: their letters first
++    attachLocalFolders();                                               // /storage/translated_<letter> folders: their letters first
+     mountAndAttachSharedDrive();                                        // if shared drive is enabled, try to mount it and attach it
+     attachConfigDrive();                                                // if config drive is enabled, attach it
+ 
+@@ -301,7 +301,7 @@ void TranslatedDisk::attachConfigDrive(void)
+     }
+ }
+ 
+-// /pi/translated_<letter> folders become drives with that letter (C-P). A
++// /storage/translated_<letter> folders become drives with that letter (C-P). A
+ // letter that is the shared or config drive's is skipped (logged); USB
+ // drives skip the letters used here.
+ void TranslatedDisk::attachLocalFolders(void)
+@@ -406,7 +406,7 @@ bool TranslatedDisk::attachToHostPath(std::string hostRootPath, int translatedTy
+             continue;
+         }
+ 
+-        // if this letter is used by a local folder (/pi/translated_<letter>)
++        // if this letter is used by a local folder (/storage/translated_<letter>)
+         if(driveLetters.localFolders & (1 << i)) {
+             continue;
+         }
+diff --git a/ce_main_app/webserver/api/resource/pishare.h b/ce_main_app/webserver/api/resource/pishare.h
+deleted file mode 100644
+index cfd076cb..00000000
+--- a/ce_main_app/webserver/api/resource/pishare.h
++++ /dev/null
+@@ -1,19 +0,0 @@
+-#ifndef PISHARE_H
+-#define PISHARE_H
+-
+-// /pi sharing (NFS and SMB) for GET/PUT /api/v1/settings/pishare: the settings
+-// file PISHARE_CONF, applied by the image's PISHARE_TOOL (Buildroot image:
+-// /usr/sbin/ce-pishare). Without the tool the section reports "available":
+-// false and refuses changes.
+-
+-#include <string>
+-
+-struct cJSON;
+-
+-#define PISHARE_CONF    "/etc/ce-pishare.conf"
+-#define PISHARE_TOOL    "/usr/sbin/ce-pishare"
+-
+-bool pishareBuild(cJSON *out);
+-bool pishareSave(cJSON *in, std::string &msg);
+-
+-#endif
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index e893a1d1..dde7784a 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -23,7 +23,7 @@
+ #include "debug.h"
+ #include "global.h"
+ #include "settingsresource.h"
+-#include "pishare.h"
++#include "storageshare.h"
+ #include "../../webauth.h"
+ #include "../../../floppy/imagelibsources.h"
+ #include "../../../floppy/imagestorage.h"
+@@ -47,10 +47,10 @@ extern volatile bool do_loadIkbdConfig;
+ 
+ // hard disk images on the CosmosEx's own storage (made by the image's ce-preinit)
+ #ifndef HDD_IMAGES_DIR
+-#define HDD_IMAGES_DIR      "/pi/hdd_images"
++#define HDD_IMAGES_DIR      "/storage/hdd_images"
+ #endif
+ 
+-static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage", "pishare", "weblogin" };
++static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage", "storageshare", "weblogin" };
+ #define SECTION_COUNT   (int) (sizeof(SECTIONS) / sizeof(SECTIONS[0]))
+ 
+ static const char *ACSI_MODES[4] = { "off", "sd", "raw", "translated" };    // index = DEVTYPE_*
+@@ -222,8 +222,8 @@ static bool writeImageNotes(const std::string &imageName, const std::string &not
+ 
+ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+ {
+-    if(name == "pishare") {                                 // /pi over NFS and SMB (pishare.cpp)
+-        return pishareBuild(out);
++    if(name == "storageshare") {                                 // the storage (/storage) over NFS and SMB (storageshare.cpp)
++        return storageshareBuild(out);
+     }
+ 
+     if(name == "weblogin") {                                // the web interface's login (webauth.cpp)
+@@ -408,8 +408,8 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+ 
+ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::string &msg, std::string &warning)
+ {
+-    if(name == "pishare") {
+-        return pishareSave(in, msg);
++    if(name == "storageshare") {
++        return storageshareSave(in, msg);
+     }
+ 
+     if(name == "weblogin") {
+@@ -726,8 +726,8 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+             // this file, and the web API has no login (stricter than the
+             // config screen, which takes any path)
+             char real[PATH_MAX];
+-            if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/pi/", 4) != 0)) {
+-                msg = "The image must be on a USB drive, the shared drive or /pi (a path under /mnt/ or /pi/).";
++            if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/storage/", 4) != 0)) {
++                msg = "The image must be on a USB drive, the shared drive or /storage (a path under /mnt/ or /storage/).";
+                 return false;
+             }
+             path = real;
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+index 6d9c5a69..6b5ac2df 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.h
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -15,7 +15,7 @@ struct cJSON;
+ //   GET /api/v1/settings/<section>    one section
+ //   PUT /api/v1/settings/<section>    save one section (application/json only)
+ // Sections: acsi, translated, shared, floppy, network, ikbd, other, hddimage,
+-// pishare (/pi over NFS and SMB, pishare.cpp; its SMB password is set with
++// storageshare (/storage over NFS and SMB, storageshare.cpp; its SMB password is set with
+ // "password" and reported as "passwordSet").
+ // Secrets are never returned: the shared drive password and the Wi-Fi key
+ // are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
+diff --git a/ce_main_app/webserver/api/resource/pishare.cpp b/ce_main_app/webserver/api/resource/storageshare.cpp
+similarity index 90%
+rename from ce_main_app/webserver/api/resource/pishare.cpp
+rename to ce_main_app/webserver/api/resource/storageshare.cpp
+index f9bd0ce5..cbe347fa 100644
+--- a/ce_main_app/webserver/api/resource/pishare.cpp
++++ b/ce_main_app/webserver/api/resource/storageshare.cpp
+@@ -1,4 +1,4 @@
+-// /pi sharing settings (see pishare.h)
++// storage sharing settings (see storageshare.h)
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -12,16 +12,16 @@
+ 
+ #include "lib/cjson-code-58/cJSON.h"
+ #include "debug.h"
+-#include "pishare.h"
++#include "storageshare.h"
+ 
+-#define PISHARE_MAX_CLIENTS 16
++#define STORAGESHARE_MAX_CLIENTS 16
+ 
+ typedef std::map<std::string, std::string> KeyValues;
+ 
+ // KEY=value / KEY="a b" lines; comments (#) and anything else ignored
+ static void readConf(KeyValues &kv)
+ {
+-    FILE *f = fopen(PISHARE_CONF, "r");
++    FILE *f = fopen(STORAGESHARE_CONF, "r");
+     if(!f) return;
+     char line[1024];
+     while(fgets(line, sizeof(line), f)) {
+@@ -93,12 +93,12 @@ static void addClients(cJSON *o, const std::string &list)
+ 
+ static bool toolAvailable(void)
+ {
+-    return access(PISHARE_TOOL, X_OK) == 0;
++    return access(STORAGESHARE_TOOL, X_OK) == 0;
+ }
+ 
+ static void readStatus(KeyValues &st)
+ {
+-    FILE *p = popen(PISHARE_TOOL " status 2>/dev/null", "r");
++    FILE *p = popen(STORAGESHARE_TOOL " status 2>/dev/null", "r");
+     if(!p) return;
+     char line[2048];
+     while(fgets(line, sizeof(line), p)) {
+@@ -111,7 +111,7 @@ static void readStatus(KeyValues &st)
+     pclose(p);
+ }
+ 
+-bool pishareBuild(cJSON *out)
++bool storageshareBuild(cJSON *out)
+ {
+     bool avail = toolAvailable();
+     cJSON_AddBoolToObject(out, "available", avail);
+@@ -141,7 +141,7 @@ bool pishareBuild(cJSON *out)
+     cJSON_AddBoolToObject(smb,   "running",     st["smb_running"] == "yes");
+     cJSON_AddItemToObject(out, "smb", smb);
+ 
+-    cJSON_AddBoolToObject(out, "piMounted", st["pi_mounted"] == "yes");
++    cJSON_AddBoolToObject(out, "storageMounted", st["storage_mounted"] == "yes");
+     char host[256] = "";
+     gethostname(host, sizeof(host) - 1);
+     cJSON_AddStringToObject(out, "hostname", host);
+@@ -182,7 +182,7 @@ static bool getClients(cJSON *o, std::string &joined, std::string &msg, const ch
+                 msg = std::string(what) + ": \"" + parts[i] + "\" isn't an address, a network (e.g. 192.168.1.0/24)" + (hostNames ? ", a host name" : "") + " or *.";
+                 return false;
+             }
+-            if(++n > PISHARE_MAX_CLIENTS) { msg = std::string(what) + ": at most 16 entries."; return false; }
++            if(++n > STORAGESHARE_MAX_CLIENTS) { msg = std::string(what) + ": at most 16 entries."; return false; }
+             joined += (joined.empty() ? "" : " ") + parts[i];
+         }
+     }
+@@ -191,7 +191,7 @@ static bool getClients(cJSON *o, std::string &joined, std::string &msg, const ch
+ 
+ static bool runTool(const char *args, const std::string *stdinText)
+ {
+-    std::string cmd = std::string(PISHARE_TOOL " ") + args + " > /dev/null 2>&1";
++    std::string cmd = std::string(STORAGESHARE_TOOL " ") + args + " > /dev/null 2>&1";
+     FILE *p = popen(cmd.c_str(), stdinText ? "w" : "r");
+     if(!p) return false;
+     if(stdinText) fprintf(p, "%s\n", stdinText->c_str());
+@@ -199,10 +199,10 @@ static bool runTool(const char *args, const std::string *stdinText)
+     return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+ }
+ 
+-bool pishareSave(cJSON *in, std::string &msg)
++bool storageshareSave(cJSON *in, std::string &msg)
+ {
+     if(!toolAvailable()) {
+-        msg = "/pi sharing isn't available on this system.";
++        msg = "storage sharing isn't available on this system.";
+         return false;
+     }
+ 
+@@ -273,18 +273,18 @@ bool pishareSave(cJSON *in, std::string &msg)
+     }
+ 
+     // write the settings file (temp, rename)
+-    std::string tmp = std::string(PISHARE_CONF) + ".tmp";
++    std::string tmp = std::string(STORAGESHARE_CONF) + ".tmp";
+     FILE *f = fopen(tmp.c_str(), "w");
+     if(!f) { msg = "Couldn't save the settings."; return false; }
+-    fprintf(f, "# /pi sharing (ce-pishare). Edited by the web interface (Config > /pi sharing);\n");
+-    fprintf(f, "# by hand: edit, then run \"sudo ce-pishare apply\".\n");
++    fprintf(f, "# storage sharing (ce-storageshare). Edited by the web interface (Config > storage sharing);\n");
++    fprintf(f, "# by hand: edit, then run \"sudo ce-storageshare apply\".\n");
+     fprintf(f, "NFS=%s\nNFS_ACCESS=%s\nNFS_MAP=%s\nNFS_CLIENTS=\"%s\"\nNFS_MANUAL=%s\n",
+             nfsOn.c_str(), nfsAccess.c_str(), nfsMap.c_str(), nfsClients.c_str(), nfsManual.c_str());
+     fprintf(f, "SMB=%s\nSMB_ACCESS=%s\nSMB_GUEST=%s\nSMB_CLIENTS=\"%s\"\nSMB_WORKGROUP=%s\n",
+             smbOn.c_str(), smbAccess.c_str(), smbGuest.c_str(), smbClients.c_str(), smbWorkgroup.c_str());
+     bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+     if(fclose(f) != 0) ok = false;
+-    if(!ok || rename(tmp.c_str(), PISHARE_CONF) != 0) {
++    if(!ok || rename(tmp.c_str(), STORAGESHARE_CONF) != 0) {
+         unlink(tmp.c_str());
+         msg = "Couldn't save the settings.";
+         return false;
+@@ -294,6 +294,6 @@ bool pishareSave(cJSON *in, std::string &msg)
+         msg = "Saved, but starting the file sharing failed (see the system log).";
+         return false;
+     }
+-    Debug::out(LOG_INFO, "pishare: NFS %s %s, SMB %s %s", nfsOn.c_str(), nfsAccess.c_str(), smbOn.c_str(), smbAccess.c_str());
++    Debug::out(LOG_INFO, "storageshare: NFS %s %s, SMB %s %s", nfsOn.c_str(), nfsAccess.c_str(), smbOn.c_str(), smbAccess.c_str());
+     return true;
+ }
+diff --git a/ce_main_app/webserver/api/resource/storageshare.h b/ce_main_app/webserver/api/resource/storageshare.h
+new file mode 100644
+index 00000000..66b71ff4
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/storageshare.h
+@@ -0,0 +1,19 @@
++#ifndef STORAGESHARE_H
++#define STORAGESHARE_H
++
++// storage sharing (NFS and SMB) for GET/PUT /api/v1/settings/storageshare: the settings
++// file STORAGESHARE_CONF, applied by the image's STORAGESHARE_TOOL (Buildroot image:
++// /usr/sbin/ce-storageshare). Without the tool the section reports "available":
++// false and refuses changes.
++
++#include <string>
++
++struct cJSON;
++
++#define STORAGESHARE_CONF    "/etc/ce-storageshare.conf"
++#define STORAGESHARE_TOOL    "/usr/sbin/ce-storageshare"
++
++bool storageshareBuild(cJSON *out);
++bool storageshareSave(cJSON *in, std::string &msg);
++
++#endif
+-- 
+2.54.0 (Apple Git-157)
+

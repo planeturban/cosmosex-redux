@@ -1,0 +1,210 @@
+From 4c22cd06207634e970a2e5356521898afd14baef Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:20:31 +0100
+Subject: [PATCH] ce_main_app: HDD image settings: images in /pi/hdd_images,
+ notes, read only
+
+GET /api/v1/settings/hddimage now also lists the image files in
+HDD_IMAGES_DIR (/pi/hdd_images on the Buildroot image: the CosmosEx's
+own storage, reachable over NFS/SMB) with their sizes and notes, for the
+web UI to pick from; says whether an ACSI ID is set to "raw" (the image
+is only served on one); and reports a read-only image ("<path> RO",
+which Scsi::loadSettings already understood) as "readOnly". PUT takes
+"readOnly" (stored as the suffix) and "notes": {"<image file>": "text"}:
+the notes about each image are kept next to it as <image>.json
+({"notes": "..."}; other fields in that file are kept; empty notes
+remove it), so they move with the image; at most 4000 characters. A PUT
+without "path" leaves the image setting as it is.
+---
+ .../api/resource/settingsresource.cpp         | 139 +++++++++++++++++-
+ 1 file changed, 137 insertions(+), 2 deletions(-)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 1bf27012..ecf0c1a3 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -14,6 +14,9 @@
+ #include <strings.h>
+ #include <ctype.h>
+ #include <sys/stat.h>
++#include <dirent.h>
++#include <unistd.h>
++#include <errno.h>
+ #include <limits.h>
+ 
+ #include "lib/cjson-code-58/cJSON.h"
+@@ -41,6 +44,11 @@ extern volatile bool do_loadIkbdConfig;
+ 
+ #define SETTINGS_MAX_BODY   (16 * 1024)
+ 
++// hard disk images on the CosmosEx's own storage (made by the image's ce-preinit)
++#ifndef HDD_IMAGES_DIR
++#define HDD_IMAGES_DIR      "/pi/hdd_images"
++#endif
++
+ static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage", "pishare" };
+ #define SECTION_COUNT   (int) (sizeof(SECTIONS) / sizeof(SECTIONS[0]))
+ 
+@@ -150,6 +158,63 @@ static bool getLetter(cJSON *o, const char *key, char &letter, std::string &msg)
+ 
+ /* -------------------------------------------------------------- sections */
+ 
++// Notes about a hard disk image in HDD_IMAGES_DIR: <image>.json next to it,
++// {"notes": "..."} (other fields in the file are kept). For the web UI.
++#define HDD_NOTES_MAX   4000
++
++static bool isNotesFile(const std::string &name)
++{
++    return name.length() > 5 && strcasecmp(name.c_str() + name.length() - 5, ".json") == 0;
++}
++
++static cJSON *readNotesFile(const std::string &imageName)
++{
++    std::string p = std::string(HDD_IMAGES_DIR "/") + imageName + ".json";
++    FILE *f = fopen(p.c_str(), "rb");
++    if(!f) return NULL;
++    char buf[16384];
++    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
++    fclose(f);
++    buf[n] = 0;
++    cJSON *o = cJSON_Parse(buf);
++    if(o && o->type != cJSON_Object) { cJSON_Delete(o); o = NULL; }
++    return o;
++}
++
++static std::string imageNotes(const std::string &imageName)
++{
++    cJSON *o = readNotesFile(imageName);
++    std::string notes;
++    cJSON *n = o ? cJSON_GetObjectItem(o, "notes") : NULL;
++    if(n && n->type == cJSON_String && n->valuestring) notes = n->valuestring;
++    if(o) cJSON_Delete(o);
++    return notes;
++}
++
++static bool writeImageNotes(const std::string &imageName, const std::string &notes)
++{
++    std::string p = std::string(HDD_IMAGES_DIR "/") + imageName + ".json";
++    cJSON *o = readNotesFile(imageName);
++    if(!o) o = cJSON_CreateObject();
++    cJSON_DeleteItemFromObject(o, "notes");
++    if(!notes.empty()) cJSON_AddStringToObject(o, "notes", notes.c_str());
++
++    if(!o->child) {                                 // nothing left: no file
++        cJSON_Delete(o);
++        return unlink(p.c_str()) == 0 || errno == ENOENT;
++    }
++    char *txt = cJSON_Print(o);
++    cJSON_Delete(o);
++    if(!txt) return false;
++    std::string tmp = p + ".tmp";
++    FILE *f = fopen(tmp.c_str(), "w");
++    bool ok = f && fputs(txt, f) >= 0 && fputc('\n', f) != EOF;
++    free(txt);
++    if(f) { ok = (fflush(f) == 0) && (fsync(fileno(f)) == 0) && ok; if(fclose(f) != 0) ok = false; }
++    if(!ok || rename(tmp.c_str(), p.c_str()) != 0) { unlink(tmp.c_str()); return false; }
++    return true;
++}
++
+ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+ {
+     if(name == "pishare") {                                 // /pi over NFS and SMB (pishare.cpp)
+@@ -277,7 +342,52 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+     }
+ 
+     if(name == "hddimage") {
+-        cJSON_AddStringToObject(out, "path", s.getString("HDDIMAGE", ""));
++        // "path" or "path RO" (read-only; Scsi::loadSettings also takes READ_ONLY / READONLY)
++        std::string img = s.getString("HDDIMAGE", "");
++        while(!img.empty() && (img[img.length() - 1] == '\n' || img[img.length() - 1] == ' ')) img.erase(img.length() - 1);
++        bool readOnly = false;
++        size_t sp = img.find_last_of(' ');
++        if(sp != std::string::npos) {
++            std::string end = img.substr(sp + 1);
++            if(end == "RO" || end == "READONLY" || end == "READ_ONLY") { readOnly = true; img.erase(sp); }
++        }
++        cJSON_AddStringToObject(out, "path", img.c_str());
++        cJSON_AddBoolToObject(out, "readOnly", readOnly);
++
++        // the image is served on an ACSI ID set to "raw"
++        bool rawId = false;
++        char key[32];
++        for(int id=0; id<8; id++) {
++            sprintf(key, "ACSI_DEVTYPE_%d", id);
++            if(s.getInt(key, DEVTYPE_OFF) == DEVTYPE_RAW) rawId = true;
++        }
++        cJSON_AddBoolToObject(out, "rawIdSet", rawId);
++
++        // the images in the CosmosEx's own folder for them, to pick from
++        cJSON_AddStringToObject(out, "folder", HDD_IMAGES_DIR);
++        cJSON *imgs = cJSON_CreateArray();
++        std::vector<std::string> names;
++        DIR *d = opendir(HDD_IMAGES_DIR);
++        if(d) {
++            struct dirent *de;
++            while((de = readdir(d)) != NULL && names.size() < 200) {
++                if(de->d_name[0] != '.' && !isNotesFile(de->d_name)) names.push_back(de->d_name);   // not the notes files
++            }
++            closedir(d);
++        }
++        std::sort(names.begin(), names.end());
++        for(size_t i=0; i<names.size(); i++) {
++            std::string full = std::string(HDD_IMAGES_DIR "/") + names[i];
++            struct stat st;
++            if(stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddStringToObject(o, "name", names[i].c_str());
++            cJSON_AddStringToObject(o, "path", full.c_str());
++            cJSON_AddNumberToObject(o, "sizeMB", (double) (st.st_size / (1024 * 1024)));
++            cJSON_AddStringToObject(o, "notes", imageNotes(names[i]).c_str());
++            cJSON_AddItemToArray(imgs, o);
++        }
++        cJSON_AddItemToObject(out, "images", imgs);
+         return true;
+     }
+ 
+@@ -557,8 +667,30 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+     }
+ 
+     if(name == "hddimage") {                                // onHddImageSave(), without the usb/shared shortcuts
++        // notes about images in HDD_IMAGES_DIR: {"notes": {"<image file>": "text", ...}}
++        cJSON *notes = cJSON_GetObjectItem(in, "notes");
++        if(notes && notes->type == cJSON_Object) {
++            for(cJSON *n = notes->child; n; n = n->next) {
++                std::string img = n->string ? n->string : "";
++                std::string full = std::string(HDD_IMAGES_DIR "/") + img;
++                struct stat st;
++                if(img.empty() || img[0] == '.' || img.find('/') != std::string::npos || isNotesFile(img) ||
++                   stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
++                    msg = "Notes: no image \"" + img + "\" in " HDD_IMAGES_DIR ".";
++                    return false;
++                }
++                if(n->type != cJSON_String || !n->valuestring) { msg = "Notes must be text."; return false; }
++                std::string text = n->valuestring;
++                if(text.length() > HDD_NOTES_MAX) { msg = "Notes: at most 4000 characters per image."; return false; }
++                if(!writeImageNotes(img, text)) { msg = "Couldn't save the notes for " + img + "."; return false; }
++            }
++        }
++
+         std::string path;
+-        getString(in, "path", path);
++        if(!getString(in, "path", path)) {                  // no "path": the image setting stays as it is
++            Utils::forceSync();
++            return true;
++        }
+         if(!path.empty()) {
+             struct stat st;
+             if(path[0] != '/' || !safeText(path))   { msg = "The path must be absolute, e.g. /mnt/sda1/disk.img."; return false; }
+@@ -575,6 +707,9 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+             if(!S_ISREG(st.st_mode))               { msg = "That's not a regular file."; return false; }
+             if(path.find("/mnt/shared/") == 0) warning = "An HDD image on the network isn't safe: a dropped connection can corrupt it.";
+         }
++        bool readOnly = false;
++        getBool(in, "readOnly", readOnly);
++        if(!path.empty() && readOnly) path += " RO";        // Scsi::loadSettings: read-only for the ST
+         s.setString("HDDIMAGE", path.c_str());
+         reload(SETTINGSUSER_ACSI);
+         Utils::forceSync();
+-- 
+2.54.0 (Apple Git-157)
+

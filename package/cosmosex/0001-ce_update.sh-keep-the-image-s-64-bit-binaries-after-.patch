@@ -1,0 +1,42 @@
+From 52e1228725525d24f73c026b7436b1d6bab1d951 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:52:07 +0200
+Subject: [PATCH] ce_update.sh: keep the image's 64-bit binaries after an
+ update
+
+The release ships 32-bit (armhf) builds of cosmosex, flash_stm32 and
+flash_xilinx. On the 64-bit Buildroot image they can't run, so an update
+from the internet or USB would leave the CosmosEx without a working app.
+Copy the image's own builds back from /usr/share/cosmosex/ce afterwards,
+together with this script, which the update replaces with the unpatched
+release version.
+---
+ ce_update.sh | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/ce_update.sh b/ce_update.sh
+index 3efe5f9..4559543 100755
+--- a/ce_update.sh
++++ b/ce_update.sh
+@@ -74,6 +74,18 @@ else    # download update from internet, by git or wget
+     fi
+ fi
+ 
++#--------------------------
++# CosmosEx Buildroot image: the release's Raspberry Pi binaries are 32-bit
++# (armhf) and can't run on this 64-bit system, and the update has just
++# replaced this script with the unpatched release version. Put back the
++# image's own copies of both. Files are replaced by rename, so the shell
++# running this script keeps reading the old file.
++for f in app/cosmosex update/flash_stm32 update/flash_xilinx ce_update.sh; do
++    if [ -f "/usr/share/cosmosex/ce/$f" ]; then
++        cp -f "/usr/share/cosmosex/ce/$f" "/ce/$f.new" && mv -f "/ce/$f.new" "/ce/$f"
++    fi
++done
++
+ #--------------------------
+ # add execute permissions to scripts and binaries (if they don't have them yet)
+ chmod +x /ce/app/cosmosex
+-- 
+2.54.0 (Apple Git-157)
+

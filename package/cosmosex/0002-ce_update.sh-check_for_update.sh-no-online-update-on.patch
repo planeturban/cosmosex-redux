@@ -1,0 +1,68 @@
+From 10f02a8ab6f8a499f2025db76051aa23f88894a5 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:06:09 +0100
+Subject: [PATCH] ce_update.sh, check_for_update.sh: no online update on the
+ Buildroot image
+
+The online update needs git or an HTTPS-capable wget, which the image
+doesn't have: it downloaded nothing, ran the rest of the update anyway
+and then reported "Update done". check_for_update.sh, without git,
+always reported an update as pending.
+
+Now check_for_update.sh reports no pending update ("no online update:
+new SD image" as the status), and ce_update.sh stops before doing
+anything unless it's an update from a USB stick (/tmp/UPDATE_FROM_USB),
+which works as before. The image is updated by writing a new image (later
+by its own update mechanism).
+---
+ ce_update.sh               | 14 ++++++++++++++
+ update/check_for_update.sh |  8 ++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/ce_update.sh b/ce_update.sh
+index 4559543..62724dd 100755
+--- a/ce_update.sh
++++ b/ce_update.sh
+@@ -3,6 +3,20 @@
+ start=$( date )
+ echo "ce_update.sh started at : $start"     # show start time
+ 
++#--------------------------
++# CosmosEx Buildroot image: no online update. It would need git or a wget
++# with HTTPS (the image has neither) and would only replace the release's
++# files in /ce, never the system or the image's own app. The image is
++# updated by writing a new image to the SD card (later: the image's own
++# update). An update from a USB stick (/tmp/UPDATE_FROM_USB) still works.
++if [ ! -f /tmp/UPDATE_FROM_USB ]; then
++    echo "Online update is not available on this image."
++    echo "To update, write a new image to the SD card."
++    echo "no online update: new SD image" > /tmp/UPDATE_STATUS
++    echo "ce_update.sh finished at: $( date )"
++    exit 1
++fi
++
+ # Stop any cosmosex app, and pass 1st and 2nd argument of this script to the stop script
+ # When arguments are not given, ce_stop will stop not only CosmosEx app, but also cesuper.sh script, which is fine when called manually from shell by user.
+ # When 'nosystemctl dontkillcesuper' arguments are given, ce_stop will stop onl CosmosEx app, but not cesuper.sh script, which is what we want when ce_update.sh is called as a part of update process within the cesuper.sh script
+diff --git a/update/check_for_update.sh b/update/check_for_update.sh
+index 967eedf..cfa89db 100755
+--- a/update/check_for_update.sh
++++ b/update/check_for_update.sh
+@@ -13,6 +13,14 @@ echo "checking for update" > /tmp/UPDATE_STATUS
+ rm -f /tmp/UPDATE_PENDING_YES
+ rm -f /tmp/UPDATE_PENDING_NO
+ 
++# CosmosEx Buildroot image: no online update (see ce_update.sh), so never
++# report one as pending
++echo "Online update is not available on this image."
++echo "no online update: new SD image" > /tmp/UPDATE_STATUS
++touch /tmp/UPDATE_PENDING_NO
++echo "check_for_update.sh finished at: $( date )"
++exit
++
+ read_from_file()
+ {
+     if [ -f $1 ]; then      # does the file exist? read value from file
+-- 
+2.54.0 (Apple Git-157)
+

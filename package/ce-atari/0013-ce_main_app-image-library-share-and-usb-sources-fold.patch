@@ -1,0 +1,405 @@
+From b8e7005cc5dfbabb0ba3eef0e91779dc97ad5426 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:24:59 +0100
+Subject: [PATCH] ce_main_app: image library: share: and usb: sources (folders
+ used in place)
+
+Stage 6.2, first part (cosmosex-floppy-library.md): share:<path> and
+usb:<serial>:<path> sources of IMAGELIB_SOURCES are now loaded.
+
+- A folder with an imagelist.csv (legacy format) uses that list; its file
+  column is a path relative to the folder (no "..", no absolute paths, no
+  URLs).
+- A folder without a list is scanned for .st, .msa and .zip (up to 8
+  levels, 20000 images, dot-folders skipped); the file name is the title.
+- Their images are used where they are, without a download:
+  ImageStorage::getImageLocalPath() asks the image list first, so the web
+  API, the Atari config screen and "downloaded" markers all see them as
+  available.
+- The same image name (case-insensitive, without .zip/.st/.msa) from
+  several sources is listed once, from the first source in
+  IMAGELIB_SOURCES that has it.
+- A source whose drive isn't attached is "unavailable" and its images
+  aren't listed; the list is loaded again when the drive appears or the
+  folder or its list changes.
+- The list version for updates comes from web lists only.
+
+Not yet: the 16 MB unpack cache and save copies (6.2/6.4): zipped images
+from a folder are unpacked as before, and writes to a plain image from a
+library folder go to that file, as for any image on a USB drive.
+---
+ ce_main_app/floppy/imagelist.cpp              | 191 ++++++++++++++++--
+ ce_main_app/floppy/imagelist.h                |  16 +-
+ ce_main_app/floppy/imagestorage.cpp           |   9 +
+ .../api/resource/libraryresource.cpp          |   1 +
+ 4 files changed, 202 insertions(+), 15 deletions(-)
+
+diff --git a/ce_main_app/floppy/imagelist.cpp b/ce_main_app/floppy/imagelist.cpp
+index c13c5579..599ace16 100644
+--- a/ce_main_app/floppy/imagelist.cpp
++++ b/ce_main_app/floppy/imagelist.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ 
+ #include <unistd.h>
++#include <dirent.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ 
+@@ -161,8 +162,9 @@ void ImageList::getSourceStatus(int index, std::string &status)
+         status = "disabled";
+         return;
+     }
+-    if(ls.src.type != IMAGELIB_TYPE_WEB) {
+-        status = "not_loaded";          // share: and usb: sources are loaded from stage 6.2 on
++    if(ls.src.type != IMAGELIB_TYPE_WEB) {     // share: / usb: folder: is its drive attached?
++        std::string root;
++        status = ImageStorage::resolveLocation(ls.src.spec, root) ? "online" : "unavailable";
+         return;
+     }
+ 
+@@ -191,7 +193,12 @@ bool ImageList::exists(void)
+ 
+     for(int i=0; i<(int) sources.size(); i++) {
+         ImageListSource &ls = sources[i];
+-        if(!ls.src.enabled || ls.src.type != IMAGELIB_TYPE_WEB) {
++        if(!ls.src.enabled) {
++            continue;
++        }
++        if(ls.src.type != IMAGELIB_TYPE_WEB) {          // share: / usb: folder: nothing to download
++            std::string root;
++            if(ImageStorage::resolveLocation(ls.src.spec, root)) anyList = true;
+             continue;
+         }
+         anyWeb = true;
+@@ -221,10 +228,21 @@ std::string ImageList::cacheSignature(void)
+ {
+     std::ostringstream sig;
+     for(size_t i=0; i<sources.size(); i++) {
+-        if(!sources[i].src.enabled || sources[i].src.type != IMAGELIB_TYPE_WEB) {
++        if(!sources[i].src.enabled) {
+             continue;
+         }
+         struct stat st;
++        if(sources[i].src.type != IMAGELIB_TYPE_WEB) {  // share: / usb: folder: where it is now, folder and list times
++            std::string root;
++            sig << sources[i].src.id << ":";
++            if(ImageStorage::resolveLocation(sources[i].src.spec, root)) {
++                sig << root;
++                if(stat(root.c_str(), &st) == 0) sig << "/" << (long) st.st_mtime;
++                if(stat((root + "/imagelist.csv").c_str(), &st) == 0) sig << "/" << (long) st.st_mtime << "/" << (long) st.st_size;
++            }
++            sig << ";";
++            continue;
++        }
+         sig << sources[i].src.id << ":";
+         if(stat(sources[i].cachePath.c_str(), &st) == 0) {
+             sig << (long) st.st_size << "/" << (long) st.st_mtime;
+@@ -250,9 +268,15 @@ bool ImageList::loadList(void)
+     bool anyLoaded  = false;
+     bool anyWeb     = false;
+ 
++    localImages.clear();
++
+     for(int i=0; i<(int) sources.size(); i++) {
+         sources[i].entries = 0;
+-        if(!sources[i].src.enabled || sources[i].src.type != IMAGELIB_TYPE_WEB) {
++        if(!sources[i].src.enabled) {
++            continue;
++        }
++        if(sources[i].src.type != IMAGELIB_TYPE_WEB) {  // share: / usb: folder, if its drive is attached
++            loadLocalSource(i, seen);
+             continue;
+         }
+         anyWeb = true;
+@@ -277,7 +301,7 @@ void ImageList::writeVersionFile(void)
+     // the newest version (they are dates, e.g. 2026-08-14) over all lists
+     std::string newest;
+     for(size_t i=0; i<sources.size(); i++) {
+-        if(sources[i].entries > 0 && sources[i].version > newest) {
++        if(sources[i].src.type == IMAGELIB_TYPE_WEB && sources[i].entries > 0 && sources[i].version > newest) {
+             newest = sources[i].version;
+         }
+     }
+@@ -292,11 +316,11 @@ void ImageList::writeVersionFile(void)
+     rename(tmp.c_str(), IMAGELIST_VERSION_FILE);
+ }
+ 
+-bool ImageList::loadOneList(int sourceIndex, std::map<std::string, bool> &seen)
++bool ImageList::loadOneList(int sourceIndex, std::map<std::string, bool> &seen, const char *listPath, const std::string &localRoot)
+ {
+     ImageListSource &ls = sources[sourceIndex];
+ 
+-    FILE *f = fopen(ls.cachePath.c_str(), "rt");        // open file
++    FILE *f = fopen(listPath ? listPath : ls.cachePath.c_str(), "rt");     // the cached web list, or a local folder's imagelist.csv
+ 
+     if(!f) {
+         return false;
+@@ -352,6 +376,17 @@ bool ImageList::loadOneList(int sourceIndex, std::map<std::string, bool> &seen)
+         Utils::splitFilenameFromPath(li.url, path, file);
+         li.imageName = file;                            // also store only image name (without URL)
+ 
++        li.localPath.clear();
++        if(!localRoot.empty()) {                        // a local folder's list: the "URL" is a path in that folder
++            std::string rel = li.url;
++            std::string chk = "/" + rel + "/";
++            if(rel.empty() || rel[0] == '/' || rel.find("://") != std::string::npos || chk.find("/../") != std::string::npos) {
++                continue;                               // never outside the source folder
++            }
++            li.localPath = localRoot + "/" + rel;
++            li.url.clear();
++        }
++
+         tok = strtok(NULL, ",");                        // get next token - checksum
+ 
+         if(tok == NULL) {
+@@ -389,18 +424,146 @@ bool ImageList::loadOneList(int sourceIndex, std::map<std::string, bool> &seen)
+         li.marked = false;
+         li.sourceIndex = sourceIndex;
+ 
+-        if(seen.count(li.imageName)) {                  // same image from a source with higher priority
++        addItem(li, seen);
++    }
++
++    fclose(f);
++
++    Debug::out(LOG_DEBUG, "ImageList: %s: %d images (list version %s)", ls.src.id.c_str(), ls.entries, ls.version.c_str());
++    return true;
++}
++
++// Adds an image unless one with the same name (case-insensitive, without
++// .zip / .st / .msa) came from a source with higher priority
++bool ImageList::addItem(ImageListItem &li, std::map<std::string, bool> &seen)
++{
++    std::string key = li.imageName;
++    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
++    size_t dot = key.rfind('.');
++    if(dot != std::string::npos) {
++        std::string ext = key.substr(dot);
++        if(ext == ".zip" || ext == ".st" || ext == ".msa") key.erase(dot);
++    }
++    if(seen.count(key)) {
++        return false;
++    }
++    seen[key] = true;
++
++    vectorOfImages.push_back(li);
++    if(!li.localPath.empty()) {
++        localImages[li.imageName] = li.localPath;
++    }
++    if(li.sourceIndex >= 0 && li.sourceIndex < (int) sources.size()) {
++        sources[li.sourceIndex].entries++;
++    }
++    return true;
++}
++
++static bool isImageFile(const std::string &name)
++{
++    size_t dot = name.rfind('.');
++    if(dot == std::string::npos) return false;
++    std::string ext = name.substr(dot);
++    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
++    return ext == ".st" || ext == ".msa" || ext == ".zip";
++}
++
++// relative paths of the images below root/rel, dot-folders skipped
++void ImageList::scanFolder(const std::string &root, const std::string &rel, int depth, std::vector<std::string> &found)
++{
++    if(depth > IMAGELIST_SCAN_MAX_DEPTH || (int) found.size() >= IMAGELIST_SCAN_MAX_IMAGES) {
++        return;
++    }
++
++    std::string dirPath = rel.empty() ? root : root + "/" + rel;
++    DIR *dir = opendir(dirPath.c_str());
++    if(!dir) {
++        return;
++    }
++
++    struct dirent *de;
++    while((de = readdir(dir)) != NULL && (int) found.size() < IMAGELIST_SCAN_MAX_IMAGES) {
++        std::string name = de->d_name;
++        if(name.empty() || name[0] == '.') {            // ., .., hidden folders (.cache, saves)
+             continue;
+         }
+-        seen[li.imageName] = true;
++        std::string relPath = rel.empty() ? name : rel + "/" + name;
+ 
+-        vectorOfImages.push_back(li);                   // store it in vector
+-        ls.entries++;
++        struct stat st;
++        if(stat((root + "/" + relPath).c_str(), &st) != 0) {
++            continue;
++        }
++        if(S_ISDIR(st.st_mode)) {
++            scanFolder(root, relPath, depth + 1, found);
++        } else if(S_ISREG(st.st_mode) && isImageFile(name)) {
++            found.push_back(relPath);
++        }
+     }
++    closedir(dir);
++}
+ 
+-    fclose(f);
++bool ImageList::loadLocalSource(int sourceIndex, std::map<std::string, bool> &seen)
++{
++    ImageListSource &ls = sources[sourceIndex];
++    ls.resolvedPath.clear();
+ 
+-    Debug::out(LOG_DEBUG, "ImageList: %s: %d images (list version %s)", ls.src.id.c_str(), ls.entries, ls.version.c_str());
++    std::string root;
++    if(!ImageStorage::resolveLocation(ls.src.spec, root)) {
++        Debug::out(LOG_DEBUG, "ImageList: %s: drive not attached, skipped", ls.src.id.c_str());
++        return false;
++    }
++    ls.resolvedPath = root;
++    ls.updated      = time(NULL);
++
++    // a list in the folder: titles and games from it, files relative to it
++    std::string csv = root + "/imagelist.csv";
++    if(Utils::fileExists(csv)) {
++        bool ok = loadOneList(sourceIndex, seen, csv.c_str(), root);
++        Debug::out(LOG_DEBUG, "ImageList: %s: %d images from %s", ls.src.id.c_str(), ls.entries, csv.c_str());
++        return ok;
++    }
++
++    // no list: every image in the folder, the file name as its title
++    std::vector<std::string> found;
++    scanFolder(root, "", 0, found);
++    std::sort(found.begin(), found.end());
++
++    for(size_t i=0; i<found.size(); i++) {
++        ImageListItem li;
++        std::string path, file;
++        Utils::splitFilenameFromPath(found[i], path, file);
++        li.imageName    = file;
++        li.localPath    = root + "/" + found[i];
++        li.checksum     = 0;
++        li.sourceIndex  = sourceIndex;
++        li.marked       = false;
++
++        std::string title = file;
++        size_t dot = title.rfind('.');
++        if(dot != std::string::npos) title.erase(dot);
++        std::replace(title.begin(), title.end(), ',', ' ');     // games are comma-separated
++        std::replace(title.begin(), title.end(), '"', '\'');
++        li.gamesDisplay = title;
++        li.games        = title;
++        std::transform(li.games.begin(), li.games.end(), li.games.begin(), ::tolower);
++
++        addItem(li, seen);
++    }
++
++    char ver[32];
++    snprintf(ver, sizeof(ver), "local-%d", ls.entries);
++    ls.version = ver;
++    Debug::out(LOG_DEBUG, "ImageList: %s: %d images found in %s", ls.src.id.c_str(), ls.entries, root.c_str());
++    return true;
++}
++
++bool ImageList::getLocalImagePath(const std::string &imageName, std::string &path)
++{
++    std::map<std::string, std::string>::iterator it = localImages.find(imageName);
++    if(it == localImages.end()) {
++        return false;
++    }
++    path = it->second;
+     return true;
+ }
+ 
+diff --git a/ce_main_app/floppy/imagelist.h b/ce_main_app/floppy/imagelist.h
+index b96afa7e..4fe77f02 100644
+--- a/ce_main_app/floppy/imagelist.h
++++ b/ce_main_app/floppy/imagelist.h
+@@ -25,6 +25,10 @@
+ // minimum time between two automatic download attempts of a missing list
+ #define IMAGELIST_RETRY_MS      (60 * 1000)
+ 
++// share: / usb: folders without an imagelist.csv are scanned for images
++#define IMAGELIST_SCAN_MAX_DEPTH    8
++#define IMAGELIST_SCAN_MAX_IMAGES   20000
++
+ typedef struct {
+     std::string imageName;
+     std::string url;
+@@ -32,6 +36,7 @@ typedef struct {
+     std::string games;          // lower case, for searching (as before)
+     std::string gamesDisplay;   // original case, for showing
+     int         sourceIndex;    // index in the source list
++    std::string localPath;      // share: / usb: sources: the image on the drive (no download); "" for web
+     bool        marked;
+ } ImageListItem;
+ 
+@@ -44,6 +49,7 @@ typedef struct {
+ typedef struct {
+     ImageLibSource src;
+     std::string cachePath;      // web: the cached list
++    std::string resolvedPath;   // share/usb: the folder on the host when it was last loaded ("" = not attached)
+     int         entries;        // images loaded from it
+     std::string version;        // first line of the list
+     time_t      updated;        // cached list's modification time (0: none)
+@@ -81,6 +87,10 @@ public:
+     void searchImages(const char *part, std::vector<int> &imageIndexes);
+     const ImageListItem *getImage(int imageIndex);
+ 
++    // Images from share: / usb: sources are used in place: their path on the
++    // drive (false for web images and unknown names)
++    bool getLocalImagePath(const std::string &imageName, std::string &path);
++
+     // IMAGELIST_URL / IMAGELIB_SOURCE from earlier builds -> IMAGELIB_SOURCES
+     static void migrateSettings(void);
+ 
+@@ -102,7 +112,11 @@ private:
+     std::string loadedSignature;    // cached lists (names, sizes, times) at the last load
+ 
+     void getSingleGame(std::string &games, std::string &game, size_t pos);
+-    bool loadOneList(int sourceIndex, std::map<std::string, bool> &seen);
++    bool loadOneList(int sourceIndex, std::map<std::string, bool> &seen, const char *listPath = NULL, const std::string &localRoot = "");
++    bool loadLocalSource(int sourceIndex, std::map<std::string, bool> &seen);
++    void scanFolder(const std::string &root, const std::string &rel, int depth, std::vector<std::string> &found);
++    bool addItem(ImageListItem &li, std::map<std::string, bool> &seen);
++    std::map<std::string, std::string> localImages;     // image name -> path on the drive
+     void downloadSource(int sourceIndex);
+     std::string cacheSignature(void);
+     volatile BYTE *downloadStatusFor(const std::string &id);
+diff --git a/ce_main_app/floppy/imagestorage.cpp b/ce_main_app/floppy/imagestorage.cpp
+index ecde5e8a..7bdfc1bd 100644
+--- a/ce_main_app/floppy/imagestorage.cpp
++++ b/ce_main_app/floppy/imagestorage.cpp
+@@ -19,6 +19,10 @@
+ #include "../translated/translateddisk.h"
+ #include "../usbserial.h"
+ #include "imagelibsources.h"
++#include "imagelist.h"
++#include "../periodicthread.h"
++
++extern SharedObjects shared;
+ 
+ ImageStorage::ImageStorage(void)
+ {
+@@ -94,6 +98,11 @@ bool ImageStorage::getImageLocalPath(const char *imageFileName, std::string &pat
+ {
+     std::string filename = imageFileName;   // to std::string
+ 
++    // an image from a share: / usb: library folder is used where it is
++    if(shared.imageList && shared.imageList->getLocalImagePath(filename, path)) {
++        return true;
++    }
++
+     bool res = getStoragePath(path);        // get path to storage
+     if(!res) {                              // no path? fail
+         Debug::out(LOG_DEBUG, "ImageStorage::getImageLocalPath() - fail, no storage path");
+diff --git a/ce_main_app/webserver/api/resource/libraryresource.cpp b/ce_main_app/webserver/api/resource/libraryresource.cpp
+index f1b67f10..f13a38a1 100644
+--- a/ce_main_app/webserver/api/resource/libraryresource.cpp
++++ b/ce_main_app/webserver/api/resource/libraryresource.cpp
+@@ -371,6 +371,7 @@ void LibraryResource::onSearch(mg_connection *conn, mg_request_info *req_info)
+         }
+ 
+         cJSON_AddBoolToObject(o, "haveIt", shared.imageStorage->weHaveThisImage(img->imageName.c_str()));
++        cJSON_AddBoolToObject(o, "local", !img->localPath.empty());     // from a share: / usb: folder, used in place
+ 
+         char inSlots[3];
+         std::string name = img->imageName;
+-- 
+2.54.0 (Apple Git-157)
+

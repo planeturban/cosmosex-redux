@@ -1,0 +1,250 @@
+diff --git a/package/dhcpcd/dhcpcd.hash b/package/dhcpcd/dhcpcd.hash
+index a5d80b13..508189a8 100644
+--- a/package/dhcpcd/dhcpcd.hash
++++ b/package/dhcpcd/dhcpcd.hash
+@@ -1,4 +1,4 @@
+-# sha256 from https://github.com/NetworkConfiguration/dhcpcd/releases/tag/v10.2.4
+-sha256  6721e606609226dbf4d864a78802a9e96beec0ee034a1bd84138b3e037bba7d9  dhcpcd-10.2.4.tar.xz
++# sha256 from https://github.com/NetworkConfiguration/dhcpcd/releases/tag/v10.5.2
++sha256  3e476657fdb6eeb38b277da3a48d0ac0113ecce5858ebdcddff2b629faed52b4  dhcpcd-10.5.2.tar.xz
+ # Locally calculated
+ sha256  3aeab006b01c1573b42d4440d7edad0adfe61ad05848ca82e02e745424a2b4fa  LICENSE
+diff --git a/package/dhcpcd/dhcpcd.mk b/package/dhcpcd/dhcpcd.mk
+index 55049140..4400c684 100644
+--- a/package/dhcpcd/dhcpcd.mk
++++ b/package/dhcpcd/dhcpcd.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-DHCPCD_VERSION = 10.2.4
++DHCPCD_VERSION = 10.5.2
+ DHCPCD_SOURCE = dhcpcd-$(DHCPCD_VERSION).tar.xz
+ DHCPCD_SITE = https://github.com/NetworkConfiguration/dhcpcd/releases/download/v$(DHCPCD_VERSION)
+ DHCPCD_DEPENDENCIES = host-pkgconf
+diff --git a/package/expat/expat.hash b/package/expat/expat.hash
+index 5d34adfc..e8939fd3 100644
+--- a/package/expat/expat.hash
++++ b/package/expat/expat.hash
+@@ -1,4 +1,4 @@
+-# From https://github.com/libexpat/libexpat/releases/tag/R_2_8_1
+-sha256  10b195ee78160a908388180a8fe3603d4e9a12f4755fbf5f3816b23a9d750da0  expat-2.8.1.tar.xz
++# From https://github.com/libexpat/libexpat/releases/tag/R_2_10_0
++sha256  c624ba2998fc65df1163a49641ff3f9ab73138b11641d92c86bee0fb01b1bc7f  expat-2.10.0.tar.xz
+ # Locally calculated
+ sha256  31b15de82aa19a845156169a17a5488bf597e561b2c318d159ed583139b25e87  COPYING
+diff --git a/package/expat/expat.mk b/package/expat/expat.mk
+index 3b529c33..23a635e5 100644
+--- a/package/expat/expat.mk
++++ b/package/expat/expat.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-EXPAT_VERSION = 2.8.1
++EXPAT_VERSION = 2.10.0
+ EXPAT_SITE = https://github.com/libexpat/libexpat/releases/download/R_$(subst .,_,$(EXPAT_VERSION))
+ EXPAT_SOURCE = expat-$(EXPAT_VERSION).tar.xz
+ EXPAT_INSTALL_STAGING = YES
+@@ -14,8 +14,16 @@ EXPAT_CPE_ID_VENDOR = libexpat_project
+ EXPAT_CPE_ID_PRODUCT = libexpat
+ 
+ EXPAT_CONF_OPTS = \
+-	--without-docbook --without-examples --without-tests --without-xmlwf
+-HOST_EXPAT_CONF_OPTS = --without-docbook --without-examples --without-tests
++	--with-dev-urandom \
++	--without-docbook \
++	--without-examples \
++	--without-tests \
++	--without-xmlwf
++
++HOST_EXPAT_CONF_OPTS = \
++	--without-docbook \
++	--without-examples \
++	--without-tests
+ 
+ $(eval $(autotools-package))
+ $(eval $(host-autotools-package))
+diff --git a/package/ffmpeg/ffmpeg.hash b/package/ffmpeg/ffmpeg.hash
+index 4c489f16..2cc1a6db 100644
+--- a/package/ffmpeg/ffmpeg.hash
++++ b/package/ffmpeg/ffmpeg.hash
+@@ -1,5 +1,5 @@
+ # Locally calculated
+-sha256  05fbe9db1f5452a3605bb1d9bf91da9d4bb08162891692e4f172b58c49109412  ffmpeg-6.1.5.tar.xz
++sha256  d4fcb164028dd3beee5d92c0ac72e46aac6973c75ea12dc14de07bf8f407370a  ffmpeg-6.1.6.tar.xz
+ sha256  8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  COPYING.GPLv2
+ sha256  246041b6ecf9bc32d718a62c57877c78b5eb397b6467e74ed7ae2626ab189c30  COPYING.LGPLv2.1
+ sha256  cb48bf09a11f5fb576cddb0431c8f5ed0a60157a9ec942adffc13907cbe083f2  LICENSE.md
+diff --git a/package/ffmpeg/ffmpeg.mk b/package/ffmpeg/ffmpeg.mk
+index 1289cd5e..b29f00c8 100644
+--- a/package/ffmpeg/ffmpeg.mk
++++ b/package/ffmpeg/ffmpeg.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-FFMPEG_VERSION = 6.1.5
++FFMPEG_VERSION = 6.1.6
+ FFMPEG_SOURCE = ffmpeg-$(FFMPEG_VERSION).tar.xz
+ FFMPEG_SITE = https://ffmpeg.org/releases
+ FFMPEG_INSTALL_STAGING = YES
+diff --git a/package/libopenssl/0001-Reproducible-build-do-not-leak-compiler-path.patch b/package/libopenssl/0001-Reproducible-build-do-not-leak-compiler-path.patch
+index 9353c1ae..f4baf916 100644
+--- a/package/libopenssl/0001-Reproducible-build-do-not-leak-compiler-path.patch
++++ b/package/libopenssl/0001-Reproducible-build-do-not-leak-compiler-path.patch
+@@ -5,6 +5,8 @@ Subject: [PATCH] Reproducible build: do not leak compiler path
+ 
+ Signed-off-by: Peter Seiderer <ps.report@gmx.net>
+ 
++Upstream: https://github.com/openssl/openssl/pull/5218 (rejected)
++
+ [Rebased on openssl-1.1.1.a]
+ Signed-off-by: Peter Seiderer <ps.report@gmx.net>
+ ---
+diff --git a/package/libopenssl/0002-Configure-use-ELFv2-ABI-on-some-ppc64-big-endian-sys.patch b/package/libopenssl/0002-Configure-use-ELFv2-ABI-on-some-ppc64-big-endian-sys.patch
+deleted file mode 100644
+index f74576be..00000000
+--- a/package/libopenssl/0002-Configure-use-ELFv2-ABI-on-some-ppc64-big-endian-sys.patch
++++ /dev/null
+@@ -1,37 +0,0 @@
+-From b57cc2e4ee21babacbffc243626de72c248068ea Mon Sep 17 00:00:00 2001
+-From: Andy Polyakov <appro@openssl.org>
+-Date: Sun, 5 May 2019 18:30:55 +0200
+-Subject: [PATCH] Configure: use ELFv2 ABI on some ppc64 big endian systems
+-
+-If _CALL_ELF is defined to be 2, it's an ELFv2 system.
+-Conditionally switch to the v2 perlasm scheme.
+-
+-Reviewed-by: Paul Dale <paul.dale@oracle.com>
+-Reviewed-by: Richard Levitte <levitte@openssl.org>
+-(Merged from https://github.com/openssl/openssl/pull/8883)
+-[vfazio: fixup for 1.1.1d]
+-Signed-off-by: Vincent Fazio <vfazio@xes-inc.com>
+-[rebased on openssl-1.1.1i]
+-Signed-off-by: Bernd Kuhls <bernd.kuhls@t-online.de>
+----
+- Configure | 4 ++++
+- 1 file changed, 4 insertions(+)
+-
+-diff --git a/Configure b/Configure
+-index 15054f9..ac3206e 100755
+---- a/Configure
+-+++ b/Configure
+-@@ -1686,6 +1686,10 @@ unless ($disabled{asm}) {
+-     }
+- }
+- 
+-+if ($target eq "linux-ppc64" && !$disabled{asm}) {
+-+       $target{perlasm_scheme} = "linux64v2" if ($predefined_C{_CALL_ELF} == 2);
+-+}
+-+
+- # Check for makedepend capabilities.
+- if (!$disabled{makedepend}) {
+-     # If the attribute makedep_scheme is defined, then we assume that the
+--- 
+-2.25.0
+-
+diff --git a/package/libopenssl/0003-Revert-Fix-static-builds.patch b/package/libopenssl/0002-Revert-Fix-static-builds.patch
+similarity index 97%
+rename from package/libopenssl/0003-Revert-Fix-static-builds.patch
+rename to package/libopenssl/0002-Revert-Fix-static-builds.patch
+index 10ca97a2..daeece2a 100644
+--- a/package/libopenssl/0003-Revert-Fix-static-builds.patch
++++ b/package/libopenssl/0002-Revert-Fix-static-builds.patch
+@@ -5,7 +5,8 @@ Subject: [PATCH] Revert "Fix -static builds"
+ 
+ This reverts commit cfd7225fbb9507b2e443a494459bdaab5236d29d.
+ 
+-Upstream: https://github.com/openssl/openssl/issues/14574#issuecomment-817209126
++Upstream: https://github.com/openssl/openssl/issues/14574#issuecomment-3791009156
++(rejected)
+ 
+ Signed-off-by: Bernd Kuhls <bernd@kuhls.net>
+ [Dario: make the patch to be applied with fuzz factor 0]
+diff --git a/package/libopenssl/libopenssl.hash b/package/libopenssl/libopenssl.hash
+index 05777cda..b7083cc3 100644
+--- a/package/libopenssl/libopenssl.hash
++++ b/package/libopenssl/libopenssl.hash
+@@ -1,5 +1,5 @@
+-# From https://github.com/openssl/openssl/releases/download/openssl-3.6.2/openssl-3.6.2.tar.gz.sha256
+-sha256  aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f  openssl-3.6.2.tar.gz
++# From https://github.com/openssl/openssl/releases/download/openssl-3.6.5/openssl-3.6.5.tar.gz.sha256
++sha256  a2157c2830efdec3788939b00c9b0638306d3f0bbb76dc4832ee503bb397df98  openssl-3.6.5.tar.gz
+ 
+ # License files
+ sha256  7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a  LICENSE.txt
+diff --git a/package/libopenssl/libopenssl.mk b/package/libopenssl/libopenssl.mk
+index bd4b889c..4aad749e 100644
+--- a/package/libopenssl/libopenssl.mk
++++ b/package/libopenssl/libopenssl.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-LIBOPENSSL_VERSION = 3.6.2
++LIBOPENSSL_VERSION = 3.6.5
+ LIBOPENSSL_SITE = https://github.com/openssl/openssl/releases/download/openssl-$(LIBOPENSSL_VERSION)
+ LIBOPENSSL_SOURCE = openssl-$(LIBOPENSSL_VERSION).tar.gz
+ LIBOPENSSL_LICENSE = Apache-2.0
+@@ -23,6 +23,10 @@ ifeq ($(BR2_m68k_cf),y)
+ LIBOPENSSL_CFLAGS += -mxgot
+ # resolves an assembler "out of range error" with blake2 and sha512 algorithms
+ LIBOPENSSL_CFLAGS += -DOPENSSL_SMALL_FOOTPRINT
++# disable atomic operations
++ifeq ($(BR2_TOOLCHAIN_HAS_ATOMIC),)
++LIBOPENSSL_CFLAGS += -DBROKEN_CLANG_ATOMICS
++endif
+ endif
+ 
+ ifeq ($(BR2_USE_MMU),)
+diff --git a/package/pcre2/pcre2.hash b/package/pcre2/pcre2.hash
+index 17f15c0f..3d758587 100644
+--- a/package/pcre2/pcre2.hash
++++ b/package/pcre2/pcre2.hash
+@@ -1,6 +1,5 @@
+-# Locally calculated after checking pgp signature:
+-# https://github.com/PhilipHazel/pcre2/releases/download/pcre2-10.47/pcre2-10.47.tar.bz2.sig
+-sha256  47fe8c99461250d42f89e6e8fdaeba9da057855d06eb7fc08d9ca03fd08d7bc7  pcre2-10.47.tar.bz2
++# From https://github.com/PCRE2Project/pcre2/releases/tag/pcre2-10.49
++sha256  53c156e1ba416a20da8e65395daa132da0d80e76910424caca3fcdae7831d384  pcre2-10.49.tar.bz2
+ # Locally computed
+ sha256  197d8a73ffee0d6b09adba2f9c677b5f5aede24edf89258a68e48248d010d811  LICENCE.md
+ sha256  5f216505c0f6ea3273caec89e766eef93cdeb7bbb0c429f9360116d7c938feeb  deps/sljit/LICENSE
+diff --git a/package/pcre2/pcre2.mk b/package/pcre2/pcre2.mk
+index f2b56081..a3e74e32 100644
+--- a/package/pcre2/pcre2.mk
++++ b/package/pcre2/pcre2.mk
+@@ -4,7 +4,7 @@
+ #
+ ################################################################################
+ 
+-PCRE2_VERSION = 10.47
++PCRE2_VERSION = 10.49
+ PCRE2_SITE = https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$(PCRE2_VERSION)
+ PCRE2_SOURCE = pcre2-$(PCRE2_VERSION).tar.bz2
+ PCRE2_LICENSE = BSD-3-Clause
+diff --git a/package/sqlite/sqlite.hash b/package/sqlite/sqlite.hash
+index 7c5068c7..3844da47 100644
+--- a/package/sqlite/sqlite.hash
++++ b/package/sqlite/sqlite.hash
+@@ -1,3 +1,3 @@
+ # Locally computed
+-sha256  81f5be397049b0cae1b167f2225af7646fc0f82e4a9b3c48c9ea3a533e21d77a  sqlite-autoconf-3510300.tar.gz
++sha256  0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c  sqlite-autoconf-3530400.tar.gz
+ sha256  66e056b6e8687f32af30d5187611b98b12a8f46f07aaf62f43585f276e8f0ac9  tea/license.terms
+diff --git a/package/sqlite/sqlite.mk b/package/sqlite/sqlite.mk
+index e9fb8743..5d0fdf47 100644
+--- a/package/sqlite/sqlite.mk
++++ b/package/sqlite/sqlite.mk
+@@ -4,8 +4,8 @@
+ #
+ ################################################################################
+ 
+-SQLITE_VERSION = 3.51.3
+-SQLITE_TAR_VERSION = 3510300
++SQLITE_VERSION = 3.53.4
++SQLITE_TAR_VERSION = 3530400
+ SQLITE_SOURCE = sqlite-autoconf-$(SQLITE_TAR_VERSION).tar.gz
+ SQLITE_SITE = https://www.sqlite.org/2026
+ SQLITE_LICENSE = blessing

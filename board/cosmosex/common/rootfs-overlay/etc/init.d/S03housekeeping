@@ -1,0 +1,20 @@
+#!/bin/sh
+# Hourly log rotation and clock saving (ce-housekeeping); saves the clock at
+# shutdown.
+PIDFILE=/var/run/ce-housekeeping.pid
+
+case "$1" in
+start)
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x /usr/sbin/ce-housekeeping -- loop
+	;;
+stop)
+	start-stop-daemon -K -q -p "$PIDFILE"
+	/usr/sbin/ce-housekeeping clock
+	;;
+restart)
+	"$0" stop; "$0" start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"; exit 1
+	;;
+esac

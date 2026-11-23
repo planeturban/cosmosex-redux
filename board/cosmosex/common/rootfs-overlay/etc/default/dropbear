@@ -1,0 +1,2 @@
+# -w: no root logins, -s: no password logins (keys only; see ce-sshkeys)
+DROPBEAR_ARGS="-w -s"

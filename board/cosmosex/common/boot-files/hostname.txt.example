@@ -1,0 +1,17 @@
+# The name of this CosmosEx on your network.
+#
+# To use it: change the name on the last line, save, and rename this file
+# to hostname.txt. Put the card back and start the CosmosEx: it takes the
+# name and renames the file to hostname.done.
+#
+# The web interface is then at http://<name>.local (here:
+# http://cosmosex-studio.local).
+#
+# A name has letters, digits and "-" only (no spaces, no dots), at most
+# 63 characters, and does not start or end with "-". Lines starting with
+# "#" are ignored.
+#
+# Without a hostname.txt the CosmosEx names itself cosmosex-XXXX (the last
+# four digits of its serial number).
+
+cosmosex-studio

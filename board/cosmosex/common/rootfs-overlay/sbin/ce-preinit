@@ -1,0 +1,348 @@
+#!/bin/sh
+# CosmosEx pre-init (see README.md, "SD card layout"). The kernel starts this
+# instead of /sbin/init (init=/sbin/ce-preinit in cmdline.txt). The root
+# filesystem is read-only; this script makes the persistent parts writable,
+# then hands over to BusyBox init.
+#
+#   /data (partition 5, ext4, created on first boot): settings, network config (/etc overlay),
+#         logs, /ce, dhcpcd/random-seed state, home dirs, SSH host keys
+#   /storage   (partition 6, ext4): user files, created on first boot to fill
+#         the rest of the card
+#
+# Rule: the system always boots. If /data can't be repaired it is recreated
+# (factory settings); if /storage can't be set up, the system runs without it.
+# Every step is safe to interrupt by a power cut and is redone or finished
+# on the next boot.
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+DISK=/dev/mmcblk0
+DATA=${DISK}p5
+STORAGE=${DISK}p6
+SKEL=/usr/share/ce-data-skel
+MSG=""                      # log lines, written to /data/log/preinit.log
+RECOVERY=""                 # problems, also written to /boot/ce-recovery.txt
+NOTICE=""                   # this boot's events for the HDMI banner (ce-issue)
+
+log() {
+	MSG="$MSG[$(cut -d' ' -f1 /proc/uptime)s] $*
+"
+	echo "ce-preinit: $*" > /dev/kmsg 2>/dev/null
+}
+
+# On the HDMI screen (the console), for long first-boot steps. The front
+# display needs its own tool, since the app isn't running yet (planned).
+say() {
+	printf '\n  CosmosEx: %s\n' "$*" > /dev/console 2>/dev/null
+}
+
+notice() {
+	NOTICE="$NOTICE$*
+"
+}
+
+problem() {
+	log "PROBLEM: $*"
+	notice "Problem: $*"
+	RECOVERY="$RECOVERY$*
+"
+}
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+log "start"
+
+# --- boot partition: factory reset request ---------------------------------
+FACTORYRESET=""
+if mount -t vfat -o ro "${DISK}p1" /boot 2>/dev/null; then
+	[ -e /boot/factoryreset.txt ] && FACTORYRESET=1
+	umount /boot
+fi
+
+# --- partitions 4 + 5 (first boot) -----------------------------------------
+# The image holds only partitions 1-3 (3 is just a table entry), so it is
+# quick to write. On first boot: the extended partition 4 from the end of 3
+# to the end of the card, then the logical partition 5 (data, 128 MB) at its
+# start. Each step leaves a valid partition table; a power cut in between is
+# finished on the next boot. Partition 6 (/storage) follows below.
+part_end() {
+	sfdisk -d "$DISK" 2>/dev/null | awk -v d="$1" '
+		$1 == d { gsub(/[,=]/, " "); for (i = 1; i <= NF; i++) { if ($i == "start") s = $(i+1); if ($i == "size") n = $(i+1) } print s + n }'
+}
+part_start() {
+	sfdisk -d "$DISK" 2>/dev/null | awk -v d="$1" '
+		$1 == d { gsub(/[,=]/, " "); for (i = 1; i <= NF; i++) if ($i == "start") print $(i+1) }'
+}
+
+DATA_NEW=""
+setup_data_partition() {
+	if [ -z "$(part_start "${DISK}p4")" ]; then
+		p3_end=$(part_end "${DISK}p3")
+		[ -n "$p3_end" ] || { problem "no partition 3 in the partition table"; return 1; }
+		p4_start=$(( (p3_end + 8191) / 8192 * 8192 ))
+		log "first boot: adding the extended partition 4 at sector $p4_start"
+		say "first boot: setting up the SD card."
+		echo "start=$p4_start, type=5" | sfdisk -q --no-reread --no-tell-kernel --append "$DISK" >/dev/null 2>&1 ||
+			{ problem "adding partition 4 failed"; return 1; }
+	fi
+	if [ -z "$(part_start "$DATA")" ]; then
+		# 4 MB into partition 4: room for partition 5's table sector, aligned
+		p5_start=$(( $(part_start "${DISK}p4") + 8192 ))
+		log "first boot: adding the data partition 5 at sector $p5_start"
+		echo "start=$p5_start, size=$((128 * 2048)), type=83" | sfdisk -q --no-reread --no-tell-kernel --append "$DISK" >/dev/null 2>&1 ||
+			{ problem "adding the data partition failed (card too small?)"; return 1; }
+		DATA_NEW=1
+	fi
+	partx --add --nr 5 "$DISK" 2>/dev/null
+	i=0
+	while [ ! -b "$DATA" ] && [ $i -lt 5 ]; do sleep 1; i=$((i + 1)); done
+}
+[ -b "$DATA" ] || setup_data_partition
+
+# --- /data ------------------------------------------------------------------
+fs_type() {
+	blkid -o value -s TYPE "$1" 2>/dev/null
+}
+
+make_data() {
+	problem "creating a new data partition ($1); settings are back to defaults"
+	mkfs.ext4 -q -F -L data "$DATA" >/dev/null 2>&1
+}
+
+if [ ! -b "$DATA" ]; then
+	problem "no data partition $DATA; running with settings in RAM only"
+else
+	# First boot: a new partition (always formatted: the card may hold an
+	# old install's data at the same place), or an empty one while /storage
+	# doesn't exist yet (power cut during the first boot)
+	if [ -n "$DATA_NEW" ] || { [ -z "$(fs_type "$DATA")" ] && [ -z "$(part_start "$STORAGE")" ]; }; then
+		log "first boot: formatting the data partition"
+		mkfs.ext4 -q -F -L data "$DATA" >/dev/null 2>&1 ||
+			problem "formatting the data partition failed"
+	fi
+	if [ "$(fs_type "$DATA")" != ext4 ]; then
+		make_data "no filesystem"
+	else
+		e2fsck -p "$DATA" >/dev/null 2>&1
+		rc=$?
+		if [ $rc -ge 4 ]; then
+			log "e2fsck -p: $rc, trying e2fsck -y"
+			e2fsck -y "$DATA" >/dev/null 2>&1
+			rc=$?
+			[ $rc -ge 4 ] && make_data "e2fsck failed ($rc)"
+		elif [ $rc -ne 0 ]; then
+			log "e2fsck -p: repaired ($rc)"
+		fi
+	fi
+	if ! mount -t ext4 -o noatime "$DATA" /data; then
+		make_data "mount failed"
+		mount -t ext4 -o noatime "$DATA" /data ||
+			problem "can't mount the data partition; running with settings in RAM only"
+	fi
+fi
+mountpoint -q /data || mount -t tmpfs -o mode=0755,size=64m tmpfs /data
+
+# The clock: no battery on the Pi. Continue from the last saved time so logs
+# and e2fsck don't see 1970 (the app sets the real time via NTP later).
+if [ -f /data/clock ]; then
+	saved=$(cat /data/clock)
+	[ "$saved" -gt "$(date +%s)" ] 2>/dev/null && date -s "@$saved" >/dev/null
+fi
+
+if [ -n "$FACTORYRESET" ]; then
+	log "factory reset (factoryreset.txt): wiping /data except SSH host keys"
+	notice "Factory reset done on this boot (factoryreset.txt): settings are back to defaults"
+	for d in /data/* /data/.[!.]*; do
+		case "${d##*/}" in ssh|lost+found|'*'|'.[!.]*') ;; *) rm -rf "$d" ;; esac
+	done
+fi
+
+# Directories on /data; missing ones are created from the image's skeleton
+for d in ce log var/db var/lib home ssh etc/upper etc/work; do
+	if [ ! -d "/data/$d" ]; then
+		mkdir -p "/data/$d"
+		[ -d "$SKEL/$d" ] && cp -a "$SKEL/$d/." "/data/$d/"
+		log "created /data/$d"
+	fi
+done
+chmod 700 /data/ssh
+# Home directories (users.table: pi 1000, ce 1001)
+for u in pi:1000 ce:1001; do
+	h=/data/home/${u%%:*}
+	[ -d "$h" ] || { mkdir -p "$h"; chown "${u#*:}:${u#*:}" "$h"; chmod 750 "$h"; }
+done
+
+# /etc: read-only image + changes on /data
+mount -t overlay overlay -o lowerdir=/etc,upperdir=/data/etc/upper,workdir=/data/etc/work /etc ||
+	problem "can't mount the /etc overlay; network settings won't be saved"
+
+# Logs: keep each below ~2 MB (+ one old copy); ce-housekeeping does the same hourly
+for f in /data/log/*; do
+	case "$f" in *.1) continue ;; esac
+	[ -f "$f" ] && [ "$(wc -c < "$f")" -gt 2097152 ] && mv -f "$f" "$f.1"
+done
+
+# --- /storage ----------------------------------------------------------------
+# Partition 6, a logical partition after data (5) in the extended partition
+# (4). Created on first boot to fill the rest of the card, in an order where
+# every intermediate state is a valid partition table: grow the extended
+# partition first (MBR), then add the logical partition (its own table
+# sector, then the link from partition 5's table sector).
+setup_storage_partition() {
+	disk_sectors=$(cat /sys/block/mmcblk0/size)
+	p4_end=$(part_end "${DISK}p4")
+	if [ -z "$p4_end" ]; then
+		problem "/storage: no extended partition 4 in the partition table"
+		return 1
+	fi
+	free=$((disk_sectors - p4_end))
+	if [ "$p4_end" -lt "$disk_sectors" ] && [ $free -ge 131072 ]; then
+		log "/storage: growing the extended partition by $((free / 2048)) MB"
+		say "first boot: setting up /storage on the rest of the SD card ($((free / 2048)) MB)."
+		echo ", +" | sfdisk -q --no-reread --no-tell-kernel -N 4 "$DISK" >/dev/null 2>&1 ||
+			{ problem "/storage: growing partition 4 failed"; return 1; }
+	fi
+	if ! sfdisk -d "$DISK" 2>/dev/null | grep -q "^${STORAGE} "; then
+		# Explicit start: 4 MB after the end of data (room for partition 6's
+		# table sector, and 4 MB aligned like the others). Without it sfdisk
+		# would use the first free gap, the alignment gap before data.
+		p5_end=$(part_end "$DATA")
+		p6_start=$(( (p5_end + 8192 + 8191) / 8192 * 8192 ))
+		log "/storage: adding partition 6 at sector $p6_start"
+		echo "start=$p6_start, type=83" | sfdisk -q --no-reread --no-tell-kernel --append "$DISK" >/dev/null 2>&1 ||
+			{ problem "/storage: adding partition 6 failed (card too small?)"; return 1; }
+	fi
+	partx --add --nr 6 "$DISK" 2>/dev/null
+	i=0
+	while [ ! -b "$STORAGE" ] && [ $i -lt 5 ]; do sleep 1; i=$((i + 1)); done
+	[ -b "$STORAGE" ]
+}
+
+setup_storage() {
+	if [ ! -b "$STORAGE" ]; then
+		setup_storage_partition || return 1
+	fi
+	t=$(fs_type "$STORAGE")
+	if [ -z "$t" ]; then
+		# Nothing on it: new (or mkfs was interrupted). Never format anything else.
+		log "/storage: formatting $STORAGE ($(($(cat /sys/class/block/mmcblk0p6/size) / 2048)) MB)"
+		say "formatting /storage ($(($(cat /sys/class/block/mmcblk0p6/size) / 2048)) MB), only on the first boot.
+            This can take up to a minute. Switching off now is safe;
+            it continues on the next boot."
+		mkfs.ext4 -q -F -L storage -E lazy_itable_init=1,lazy_journal_init=1 "$STORAGE" >/dev/null 2>&1 ||
+			{ problem "/storage: mkfs failed"; return 1; }
+	elif [ "$t" != ext4 ]; then
+		problem "/storage: $STORAGE holds a $t filesystem; not touching it, /storage unavailable"
+		return 1
+	else
+		e2fsck -p "$STORAGE" >/dev/null 2>&1
+		rc=$?
+		if [ $rc -ge 4 ]; then
+			problem "/storage: e2fsck found errors it can't fix automatically ($rc); not mounted. Your files are untouched: run 'sudo e2fsck $STORAGE'"
+			return 1
+		fi
+		[ $rc -ne 0 ] && log "/storage: e2fsck repaired ($rc)"
+	fi
+	# Cards set up before the rename (pre-release images mounted this at /pi)
+	[ "$(e2label "$STORAGE" 2>/dev/null)" = pi ] && e2label "$STORAGE" storage && log "/storage: label pi -> storage"
+	mount -t ext4 -o noatime "$STORAGE" /storage || { problem "/storage: mount failed"; return 1; }
+	[ -e /storage/.ce-pi-ready ] && mv -f /storage/.ce-pi-ready /storage/.ce-storage-ready
+	# Standard folders (also on cards set up by an earlier image): downloaded
+	# floppy images, unpacked zipped floppies and save disks, hard disk images
+	for d in img_download floppy_disks hdd_images; do
+		if [ ! -d "/storage/$d" ]; then
+			mkdir -p "/storage/$d" && chown 1000:1000 "/storage/$d" && chmod 2775 "/storage/$d"
+		fi
+	done
+	# image notes written by earlier app versions were root's: with the sticky
+	# bit the app now puts on this folder, the share user couldn't delete them
+	# (regular files only, and not through a link: the share user can make
+	# links in /storage, and this runs as root)
+	[ -d /storage/hdd_images ] && [ ! -L /storage/hdd_images ] &&
+		find /storage/hdd_images -maxdepth 1 -type f -name '*.json' -user 0 -exec chown -h 1000:1000 {} + 2>/dev/null
+	if [ ! -e /storage/.ce-storage-ready ]; then
+		# Owned by user pi (as shared-drive files are); group pi (incl. ce) may write
+		chown -R 1000:1000 /storage 2>/dev/null
+		chmod 2775 /storage
+		touch /storage/.ce-storage-ready
+		log "/storage: ready"
+		notice "/storage was set up on this boot ($(df -h /storage | awk 'NR == 2 { print $2 }'))"
+		say "/storage is ready."
+	fi
+}
+setup_storage
+
+# Settings from before the rename of /pi to /storage (pre-release images)
+if [ -f /etc/ce-pishare.conf ]; then
+	# the user's own copy (in the overlay on /data), not the image's defaults
+	[ -f /data/etc/upper/ce-storageshare.conf ] || cp -p /etc/ce-pishare.conf /etc/ce-storageshare.conf
+	rm -f /etc/ce-pishare.conf
+	log "settings: ce-pishare.conf -> ce-storageshare.conf"
+fi
+rm -f /etc/avahi/services/cosmosex-pi-*.service
+for f in /data/ce/settings/HDDIMAGE /data/ce/settings/IMAGE_STORAGE; do
+	if [ -f "$f" ] && grep -q '^/pi/' "$f"; then
+		sed -i 's#^/pi/#/storage/#' "$f" && log "settings: $f moved to /storage"
+	fi
+done
+
+# --- hostname ---------------------------------------------------------------
+# Default on the first boot: cosmosex-XXXX (last 4 hex digits of the Pi's
+# serial number), so several CosmosEx on one network get different
+# <name>.local names. hostname.txt on the boot partition sets it from a PC
+# (its first line that isn't empty or a # comment; hostname.txt.example on
+# the card says how);
+# it is renamed to hostname.done afterwards. The app's network screen
+# changes /etc/hostname too (as on stock: used from the next boot).
+valid_hostname() {
+	[ ${#1} -le 63 ] && echo "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$'
+}
+set_hostname() {
+	echo "$1" > /etc/hostname
+	if grep -q '^127\.0\.1\.1' /etc/hosts 2>/dev/null; then
+		sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$1/" /etc/hosts
+	else
+		printf '127.0.1.1\t%s\n' "$1" >> /etc/hosts
+	fi
+}
+if [ ! -e /data/.hostname-default ]; then
+	serial=$(sed -n 's/^Serial[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo | tr 'A-F' 'a-f')
+	suffix=$(printf '%s' "$serial" | tail -c 4)
+	case "$suffix" in ''|0000) suffix=$(cat /sys/class/net/*/address 2>/dev/null | grep -v '^00:00:00' | head -1 | tr -d ':' | tail -c 4) ;; esac
+	[ -n "$suffix" ] || suffix=0000
+	set_hostname "cosmosex-$suffix"
+	touch /data/.hostname-default
+	log "hostname: cosmosex-$suffix (default)"
+fi
+HOSTNAME_TXT=
+if mount -t vfat -o ro "${DISK}p1" /boot 2>/dev/null; then
+	if [ -f /boot/hostname.txt ]; then
+		name=$(tr -d '\r' < /boot/hostname.txt | sed -n '/^[[:space:]]*#/d;/[^[:space:]]/{s/^[[:space:]]*//;s/[[:space:]]*$//;p;q}')
+		if valid_hostname "$name"; then
+			set_hostname "$name"
+			log "hostname: $name (from hostname.txt)"
+			say "hostname set to $name (hostname.txt)."
+		else
+			problem "hostname.txt: '$name' isn't a valid name (letters, digits and '-', up to 63); not used"
+		fi
+		HOSTNAME_TXT=1
+	fi
+	umount /boot
+fi
+
+# --- hand over --------------------------------------------------------------
+log "done"
+printf '%s' "$MSG" >> /data/log/preinit.log
+printf '%s' "$NOTICE" > /data/boot-notice
+if [ -n "$RECOVERY" ] || [ -n "$FACTORYRESET" ] || [ -n "$HOSTNAME_TXT" ]; then
+	if mount -t vfat -o rw "${DISK}p1" /boot 2>/dev/null; then
+		[ -n "$RECOVERY" ] && printf '%s %s' "$(date '+%F %T')" "$RECOVERY" >> /boot/ce-recovery.txt
+		[ -n "$FACTORYRESET" ] && mv -f /boot/factoryreset.txt /boot/factoryreset.done
+		[ -n "$HOSTNAME_TXT" ] && mv -f /boot/hostname.txt /boot/hostname.done
+		umount /boot
+	fi
+fi
+umount /sys /proc 2>/dev/null
+exec /sbin/init "$@"

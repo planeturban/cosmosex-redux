@@ -1,0 +1,9 @@
+config BR2_PACKAGE_CE_FILES
+	bool "ce-files"
+	select BR2_PACKAGE_ZLIB
+	help
+	  The file work of the web interface's Files page: list, read,
+	  write, zip, rename and delete in the CosmosEx's places
+	  (/storage, translated drives, USB drives, the shared drive,
+	  partitions of hard disk images through ce-hdinspect), paths
+	  kept inside each place.

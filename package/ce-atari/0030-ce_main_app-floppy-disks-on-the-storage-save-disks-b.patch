@@ -1,0 +1,761 @@
+From 4e3ce30cacd595f598985fdba65fa980b076da68 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:02:02 +0100
+Subject: [PATCH] ce_main_app: floppy disks on the storage, save disks by
+ content hash; backup API
+
+Zipped floppies are unpacked to /storage/floppy_disks instead of a 16 MB
+RAM disk (RAM only without the storage): the ST's saves survive a
+power-off. A disk's folder is "<name>-<hash of its contents>", looked up
+by the hash, so the same disk finds its saves whatever its name, path or
+source. Plain .st/.msa images from the library's download folders are
+copied into such a folder on insert and written there (the download stays
+as it came); other image files are written in place as before. Folders
+the ST wrote to are marked and kept; the rest is a cache (128 MB).
+
+/api/v1/system/backup: what a backup holds, the backup itself (made by
+the image's ce-backup as it's sent, chunked), and restore (upload).
+---
+ ce_main_app/floppy/floppyimagefactory.cpp     |  13 ++
+ ce_main_app/floppy/floppyimagemsa.cpp         |   5 +-
+ ce_main_app/floppy/floppyimagest.cpp          |   2 +
+ ce_main_app/floppy/unpackcache.cpp            | 204 ++++++++++++++++--
+ ce_main_app/floppy/unpackcache.h              |  55 ++++-
+ .../webserver/api/resource/systemresource.cpp | 161 +++++++++++++-
+ .../webserver/api/resource/systemresource.h   |  15 +-
+ 7 files changed, 421 insertions(+), 34 deletions(-)
+
+diff --git a/ce_main_app/floppy/floppyimagefactory.cpp b/ce_main_app/floppy/floppyimagefactory.cpp
+index e7bb7dcc..c907b042 100644
+--- a/ce_main_app/floppy/floppyimagefactory.cpp
++++ b/ce_main_app/floppy/floppyimagefactory.cpp
+@@ -46,6 +46,19 @@ FloppyImage *FloppyImageFactory::getImage(const char *fileName, const std::vecto
+         }
+     }
+ 
++    //--------------
++    // a plain image from the library: its copy with the ST's saves (unpackcache.h)
++    std::string libCopy;
++    if(fileNameInZip.empty() && (strcasecmp(ext, "st") == 0 || strcasecmp(ext, "msa") == 0) && UnpackCache::isLibraryImage(fileName)) {
++        std::string error;
++        if(UnpackCache::getPlainImage(fileName, inUse, libCopy, error)) {
++            Debug::out(LOG_DEBUG, "FloppyImageFactory -- library image %s used as %s", fileName, libCopy.c_str());
++            fileName = libCopy.c_str();
++        } else {
++            Debug::out(LOG_ERROR, "FloppyImageFactory -- library image %s: %s; using it in place", fileName, error.c_str());
++        }
++    }
++
+     //--------------
+     if(strcasecmp(ext, "msa") == 0) {   // msa image?
+         Debug::out(LOG_DEBUG, "FloppyImageFactory -- using MSA image on %s", fileName);
+diff --git a/ce_main_app/floppy/floppyimagemsa.cpp b/ce_main_app/floppy/floppyimagemsa.cpp
+index 0f5536d2..de7e047c 100644
+--- a/ce_main_app/floppy/floppyimagemsa.cpp
++++ b/ce_main_app/floppy/floppyimagemsa.cpp
+@@ -1,4 +1,5 @@
+ // vim: shiftwidth=4 softtabstop=4 tabstop=4 expandtab
++#include "unpackcache.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include "floppyimagemsa.h"
+@@ -71,5 +72,7 @@ bool FloppyImageMsa::loadImageIntoMemory(void)
+ bool FloppyImageMsa::save(void)
+ {
+     sectorsWritten = 0;                         // clear unwritten sectors counter
+-	return MSA_WriteDisk(currentFileName.c_str(), image.data, image.size);
++	bool ok = MSA_WriteDisk(currentFileName.c_str(), image.data, image.size);
++    if(ok) UnpackCache::noteSaved(currentFileName);     // a save disk now (unpackcache.h)
++    return ok;
+ }
+diff --git a/ce_main_app/floppy/floppyimagest.cpp b/ce_main_app/floppy/floppyimagest.cpp
+index e1f6d978..15d4c90c 100644
+--- a/ce_main_app/floppy/floppyimagest.cpp
++++ b/ce_main_app/floppy/floppyimagest.cpp
+@@ -1,6 +1,7 @@
+ // vim: shiftwidth=4 softtabstop=4 tabstop=4 expandtab
+ #include <string.h>
+ #include "floppyimagest.h"
++#include "unpackcache.h"
+ #include "../debug.h"
+ 
+ bool FloppyImageSt::open(const char *fileName)
+@@ -87,5 +88,6 @@ bool FloppyImageSt::save(void)
+     int res = fwrite(image.data, 1, image.size, f); // write
+ 
+     fclose(f);                          // close
++    if(res == image.size) UnpackCache::noteSaved(currentFileName);     // a save disk now (unpackcache.h)
+     return (res == image.size);         // success if written as much as should
+ }
+diff --git a/ce_main_app/floppy/unpackcache.cpp b/ce_main_app/floppy/unpackcache.cpp
+index cd247e68..aade9dad 100644
+--- a/ce_main_app/floppy/unpackcache.cpp
++++ b/ce_main_app/floppy/unpackcache.cpp
+@@ -11,11 +11,15 @@
+ #include <sys/time.h>
+ #include <sys/wait.h>
+ #include <strings.h>
++#include <limits.h>
++#include <ctype.h>
+ #include <algorithm>
+ 
+ #include "unpackcache.h"
+ #include "ziputil.h"
+ #include "imagelibsources.h"
++#include "imagestorage.h"
++#include <openssl/evp.h>
+ #include "../debug.h"
+ 
+ std::string UnpackCache::lastErr;
+@@ -47,6 +51,28 @@ static int64_t treeSize(const std::string &path)
+     return total;
+ }
+ 
++// a disk folder on the storage belongs to user pi like the rest of it
++// (shared over SMB/NFS as pi), group-writable; unzip keeps the zip's modes
++static void ownTree(const std::string &path)
++{
++    struct stat st;
++    if(lstat(path.c_str(), &st) != 0 || S_ISLNK(st.st_mode)) return;
++    if(lchown(path.c_str(), 1000, 1000) != 0) { /* not fatal */ }
++    if(S_ISDIR(st.st_mode)) {
++        chmod(path.c_str(), 02775);
++        DIR *d = opendir(path.c_str());
++        if(!d) return;
++        struct dirent *de;
++        while((de = readdir(d)) != NULL) {
++            if(strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
++            ownTree(path + "/" + de->d_name);
++        }
++        closedir(d);
++    } else if(S_ISREG(st.st_mode)) {
++        chmod(path.c_str(), 0664);
++    }
++}
++
+ bool UnpackCache::removeTree(const std::string &path)
+ {
+     struct stat st;
+@@ -151,14 +177,14 @@ void UnpackCache::cleanupOnce(void)
+     if(done) return;
+     done = true;
+ 
+-    mkdir(UNPACK_CACHE_DIR, 0755);
+-    DIR *d = opendir(UNPACK_CACHE_DIR);
++    mkdir(cacheDir().c_str(), 0775);
++    DIR *d = opendir(cacheDir().c_str());
+     if(!d) return;
+     struct dirent *de;
+     std::vector<std::string> remove;
+     while((de = readdir(d)) != NULL) {
+         if(de->d_name[0] == '.') continue;
+-        std::string p = std::string(UNPACK_CACHE_DIR "/") + de->d_name;
++        std::string p = (cacheDir() + "/") + de->d_name;
+         struct stat st;
+         if(!isDir(p) || stat((p + "/" UNPACK_DONE_MARKER).c_str(), &st) != 0) remove.push_back(p);
+     }
+@@ -190,6 +216,50 @@ static bool readMarker(const std::string &dir, std::string &image)
+ }
+ 
+ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error)
++{
++    return prepare(zipPath, true, inUse, imagePath, error);
++}
++
++bool UnpackCache::getPlainImage(const std::string &path, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error)
++{
++    return prepare(path, false, inUse, imagePath, error);
++}
++
++std::string UnpackCache::contentHash(const std::string &path)
++{
++    FILE *f = fopen(path.c_str(), "rb");
++    if(!f) return "";
++    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
++    if(!ctx || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) { if(ctx) EVP_MD_CTX_free(ctx); fclose(f); return ""; }
++    unsigned char buf[65536];
++    size_t n;
++    while((n = fread(buf, 1, sizeof(buf), f)) > 0) EVP_DigestUpdate(ctx, buf, n);
++    bool err = ferror(f) != 0;
++    fclose(f);
++    unsigned char md[EVP_MAX_MD_SIZE];
++    unsigned int mdLen = 0;
++    EVP_DigestFinal_ex(ctx, md, &mdLen);
++    EVP_MD_CTX_free(ctx);
++    if(err || mdLen < 8) return "";
++    char hex[17];
++    for(int i = 0; i < 8; i++) snprintf(hex + i * 2, 3, "%02x", md[i]);
++    return hex;
++}
++
++bool UnpackCache::isLibraryImage(const std::string &path)
++{
++    size_t slash = path.find_last_of('/');
++    if(slash == std::string::npos) return false;
++    std::string dir = path.substr(0, slash);
++    std::string base = dir.substr(dir.find_last_of('/') + 1);
++    if(base == IMAGE_STORAGE_SUBDIR || base == "img_download") return true;      // the download folders
++    if(dir == IMAGE_STORAGE_RAM_DIR) return true;
++    StorageInfo info;                                   // a download folder set by hand
++    ImageStorage::getStorageInfo(info);
++    return !info.path.empty() && dir == info.path;
++}
++
++bool UnpackCache::prepare(const std::string &zipPath, bool zip, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error)
+ {
+     cleanupOnce();
+     error.clear();
+@@ -201,11 +271,36 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+         return false;
+     }
+ 
+-    // The folder name changes when the zip does (size, time), so a changed
+-    // zip is unpacked again; the old folder ages out
+-    char key[96];
+-    snprintf(key, sizeof(key), "%s%s-%lld-%lld", "", ImageLibSources::shortHash(zipPath).c_str(), (long long) zst.st_size, (long long) zst.st_mtime);
+-    std::string dir = std::string(UNPACK_CACHE_DIR "/") + key;
++    // The folder: "<file name>-<hash of the contents>"; looked up by the hash
++    // alone, so the same disk under another name or path finds its saves
++    std::string hash = contentHash(zipPath);
++    if(hash.empty()) {
++        error = "can't read the image file";
++        lastErr = error;
++        return false;
++    }
++    std::string zipName = zipPath.substr(zipPath.find_last_of('/') + 1);
++    std::string key;
++    for(size_t i = 0; i < zipName.length() && key.length() < 48; i++) {
++        char c = zipName[i];
++        key += (isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-') ? c : '_';
++    }
++    if(key.empty() || key[0] == '.') key = "_" + key;
++    key += "-" + hash;
++    std::string dir = (cacheDir() + "/") + key;
++    if(!isDir(dir)) {                                   // the same disk under another name?
++        DIR *hd = opendir(cacheDir().c_str());
++        if(hd) {
++            struct dirent *de;
++            std::string tail = "-" + hash;
++            while((de = readdir(hd)) != NULL) {
++                std::string n = de->d_name;
++                if(n.length() > tail.length() && n.compare(n.length() - tail.length(), tail.length(), tail) == 0 &&
++                   isDir((cacheDir() + "/") + n)) { dir = (cacheDir() + "/") + n; break; }
++            }
++            closedir(hd);
++        }
++    }
+ 
+     if(isDir(dir) && readMarker(dir, imagePath)) {
+         utimes(dir.c_str(), NULL);                  // used now (least recently inserted goes first)
+@@ -216,7 +311,7 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+     removeTree(dir);
+ 
+     int entries = 0;
+-    int64_t need = ZipUtil::unpackedSize(zipPath.c_str(), &entries);
++    int64_t need = zip ? ZipUtil::unpackedSize(zipPath.c_str(), &entries) : (int64_t) zst.st_size;
+     if(need < 0) {
+         Debug::out(LOG_DEBUG, "UnpackCache: can't read the size from %s, unpacking anyway", zipPath.c_str());
+         need = 0;
+@@ -224,13 +319,30 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+     need += UNPACK_MARGIN + (int64_t) entries * 4096;  // per-file rounding up to a page
+ 
+     struct statvfs vfs;
+-    if(statvfs(UNPACK_CACHE_DIR, &vfs) != 0) {
++    if(statvfs(cacheDir().c_str(), &vfs) != 0) {
+         error = "unpack RAM disk not available";
+         lastErr = error;
+         return false;
+     }
+     int64_t total = (int64_t) vfs.f_blocks * vfs.f_frsize;
+     int64_t freeB = (int64_t) vfs.f_bavail * vfs.f_frsize;
++    if(cacheDir() == FLOPPY_DISKS_DIR) {            // on the storage: a budget for the unwritten ones
++        int64_t used = 0;
++        DIR *d = opendir(cacheDir().c_str());
++        if(d) {
++            struct dirent *de;
++            while((de = readdir(d)) != NULL) {
++                if(de->d_name[0] == '.') continue;
++                std::string p = (cacheDir() + "/") + de->d_name;
++                struct stat wst;
++                if(isDir(p) && stat((p + "/" UNPACK_WRITTEN_MARKER).c_str(), &wst) != 0) used += treeSize(p);
++            }
++            closedir(d);
++        }
++        int64_t budgetFree = UNPACK_STORAGE_BUDGET - used;
++        total = UNPACK_STORAGE_BUDGET;
++        if(budgetFree < freeB) freeB = budgetFree;
++    }
+ 
+     if(need > total) {
+         error = "the zip unpacks to more than the unpack RAM disk holds";
+@@ -242,19 +354,20 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+     if(need > freeB) {
+         // what's in the cache, and which of it is in a slot
+         std::vector<UnpackCacheEntry> entriesNow;
+-        DIR *d = opendir(UNPACK_CACHE_DIR);
++        DIR *d = opendir(cacheDir().c_str());
+         if(d) {
+             struct dirent *de;
+             while((de = readdir(d)) != NULL) {
+                 if(de->d_name[0] == '.') continue;
+-                std::string p = std::string(UNPACK_CACHE_DIR "/") + de->d_name;
++                std::string p = (cacheDir() + "/") + de->d_name;
+                 struct stat st;
+                 if(stat(p.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+                 UnpackCacheEntry e;
+                 e.name     = de->d_name;
+                 e.size     = treeSize(p);
+                 e.lastUsed = st.st_mtime;
+-                e.inSlot   = false;
++                struct stat wst;
++                e.inSlot   = stat((p + "/" UNPACK_WRITTEN_MARKER).c_str(), &wst) == 0;   // a save disk: kept
+                 for(size_t i = 0; i < inUse.size(); i++) {
+                     if(inUse[i].compare(0, p.length() + 1, p + "/") == 0) e.inSlot = true;
+                 }
+@@ -272,7 +385,7 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+         }
+         for(size_t i = 0; i < evict.size(); i++) {
+             Debug::out(LOG_INFO, "UnpackCache: evicting %s (least recently inserted)", evict[i].c_str());
+-            removeTree(std::string(UNPACK_CACHE_DIR "/") + evict[i]);
++            removeTree((cacheDir() + "/") + evict[i]);
+         }
+     }
+ 
+@@ -284,20 +397,32 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+         return false;
+     }
+ 
+-    bool ok = runUnzip(zipPath, part);
++    bool ok;
+     std::string found;
+-    if(ok) ok = findFirstImage(part, found);
++    if(zip) {
++        ok = runUnzip(zipPath, part);
++        if(ok) ok = findFirstImage(part, found);
++    } else {                                            // a plain image: a copy for its saves
++        found = part + "/" + zipName;
++        ok = copyFileSafely(zipPath, found);
++    }
+ 
+     if(!ok) {
+-        statvfs(UNPACK_CACHE_DIR, &vfs);
++        statvfs(cacheDir().c_str(), &vfs);
+         bool full = (int64_t) vfs.f_bavail * vfs.f_frsize < UNPACK_MARGIN;
+-        error = full ? "the unpack RAM disk filled up while unpacking" : "no .st or .msa image in the zip (or a damaged zip)";
++        error = full ? "no room for the disk on the storage" : (zip ? "no .st or .msa image in the zip (or a damaged zip)" : "can't copy the image");
+         Debug::out(LOG_ERROR, "UnpackCache: %s: %s", zipPath.c_str(), error.c_str());
+         removeTree(part);
+         lastErr = error;
+         return false;
+     }
+ 
++    if(cacheDir() == FLOPPY_DISKS_DIR) ownTree(part);
++
++    // which disk this is (for people browsing the folder, and the backup)
++    FILE *nf = fopen((part + "/.ce-source").c_str(), "w");
++    if(nf) { fprintf(nf, "%s\n", zipPath.c_str()); fclose(nf); }
++
+     // marker: the image's path inside the folder
+     std::string rel = found.substr(part.length() + 1);
+     FILE *f = fopen((part + "/" UNPACK_DONE_MARKER).c_str(), "w");
+@@ -311,7 +436,50 @@ bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::st
+     }
+ 
+     imagePath = dir + "/" + rel;
++    if(cacheDir() == FLOPPY_DISKS_DIR) ownTree(dir);
+     Debug::out(LOG_DEBUG, "UnpackCache: unpacked %s -> %s", zipPath.c_str(), imagePath.c_str());
+     lastErr.clear();
+     return true;
+ }
++
++std::string UnpackCache::cacheDir(void)
++{
++    struct stat st;
++    if(stat(FLOPPY_STORAGE_READY, &st) == 0) {             // the storage is mounted
++        mkdir(FLOPPY_DISKS_DIR, 0775);
++        if(isDir(FLOPPY_DISKS_DIR)) return FLOPPY_DISKS_DIR;
++    }
++    return UNPACK_RAM_DIR;
++}
++
++void UnpackCache::noteSaved(const std::string &imagePath)
++{
++    std::string disks = FLOPPY_DISKS_DIR "/";
++    if(imagePath.compare(0, disks.length(), disks) == 0) {      // an unpacked zip: a save disk now
++        size_t slash = imagePath.find('/', disks.length());
++        if(slash == std::string::npos) return;
++        std::string marker = imagePath.substr(0, slash) + "/" UNPACK_WRITTEN_MARKER;
++        struct stat st;
++        if(stat(marker.c_str(), &st) == 0) return;
++        FILE *f = fopen(marker.c_str(), "w");
++        if(f) { fclose(f); ownTree(marker); Debug::out(LOG_INFO, "UnpackCache: %s has saves now: kept", imagePath.c_str()); }
++        return;
++    }
++
++    // an image file elsewhere on the storage, saved in place: list it once
++    if(imagePath.compare(0, strlen(FLOPPY_STORAGE_ROOT), FLOPPY_STORAGE_ROOT) != 0) return;
++    struct stat st;
++    if(stat(FLOPPY_STORAGE_READY, &st) != 0) return;
++    FILE *f = fopen(FLOPPY_WRITTEN_LIST, "r");
++    if(f) {
++        char line[PATH_MAX + 2];
++        while(fgets(line, sizeof(line), f)) {
++            line[strcspn(line, "\r\n")] = 0;
++            if(imagePath == line) { fclose(f); return; }
++        }
++        fclose(f);
++    }
++    mkdir(FLOPPY_DISKS_DIR, 0775);
++    f = fopen(FLOPPY_WRITTEN_LIST, "a");
++    if(f) { fprintf(f, "%s\n", imagePath.c_str()); fclose(f); }
++}
+diff --git a/ce_main_app/floppy/unpackcache.h b/ce_main_app/floppy/unpackcache.h
+index 436d09f8..6e6af904 100644
+--- a/ce_main_app/floppy/unpackcache.h
++++ b/ce_main_app/floppy/unpackcache.h
+@@ -1,12 +1,27 @@
+ #ifndef _UNPACKCACHE_H_
+ #define _UNPACKCACHE_H_
+ 
+-// Zipped floppy images are unpacked on insert into a small RAM disk (a 16 MB
+-// tmpfs at UNPACK_CACHE_DIR, mounted by the image; created as a plain folder
+-// otherwise). One folder per zip (named from its path, size and time), kept
+-// after eject: inserting the same zip again reuses it. When space runs out,
+-// the least recently inserted folders are deleted first; a folder an
+-// inserted image comes from is never deleted (its saves go there).
++// Zipped floppy images are unpacked on insert into FLOPPY_DISKS_DIR on the
++// CosmosEx's own storage (the SD card: faster than a floppy, and the ST's
++// saves survive a power-off), or into UNPACK_RAM_DIR when the storage isn't
++// mounted. One folder per disk, named "<file name>-<hash>": the hash of the
++// original file's contents (SHA-256, 16 hex digits), so the same disk finds
++// its folder whatever its path, name or source (downloaded again, from
++// another list, moved, restored from a backup). Kept after eject: inserting
++// the same disk again uses it, with what the ST wrote to it.
++//
++// The same for plain .st/.msa images from the floppy library (a download
++// folder: isLibraryImage): copied into such a folder on insert, so the ST's
++// saves go to the copy and are found again for that disk; the download
++// stays as it came. Image files elsewhere (your own, on USB, the shared
++// drive, translated folders) are written in place, as before.
++//
++// A folder the ST has written to gets UNPACK_WRITTEN_MARKER and is kept for
++// good (a save disk: it goes into the backup, ce-backup). The others are
++// a cache: above UNPACK_STORAGE_BUDGET (or when the RAM disk is full) the
++// least recently inserted go first; a folder an inserted image comes from
++// is never deleted. Image files on the storage itself are saved in place;
++// those the ST wrote to are listed in FLOPPY_WRITTEN_LIST (for the backup).
+ //
+ // Replaces the single /tmp/zipedfloppy folder, which was emptied on every
+ // zip insert, so the saves of a zipped disk in one slot were lost when a zip
+@@ -17,10 +32,16 @@
+ #include <string>
+ #include <vector>
+ 
+-#ifndef UNPACK_CACHE_DIR
+-#define UNPACK_CACHE_DIR    "/run/ce-floppy"
++#ifndef FLOPPY_DISKS_DIR
++#define FLOPPY_DISKS_DIR        "/storage/floppy_disks"
++#define FLOPPY_STORAGE_ROOT     "/storage/"
++#define FLOPPY_STORAGE_READY    "/storage/.ce-storage-ready"
+ #endif
+-#define UNPACK_DONE_MARKER  ".ce-unpacked"
++#define UNPACK_RAM_DIR          "/run/ce-floppy"
++#define UNPACK_STORAGE_BUDGET   (128LL * 1024 * 1024)   // unwritten unpacked disks on the storage
++#define FLOPPY_WRITTEN_LIST     FLOPPY_DISKS_DIR "/.written.list"
++#define UNPACK_DONE_MARKER      ".ce-unpacked"
++#define UNPACK_WRITTEN_MARKER   ".ce-written"
+ 
+ class UnpackCache
+ {
+@@ -30,6 +51,13 @@ public:
+     // folders are kept). False with a reason in error.
+     static bool getImage(const std::string &zipPath, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error);
+ 
++    // A plain image from the library: its copy in a disk folder (made on the
++    // first insert), with the ST's saves
++    static bool getPlainImage(const std::string &path, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error);
++
++    // an image from the floppy library's downloads (not the user's own file)
++    static bool isLibraryImage(const std::string &path);
++
+     // Last problem, for the web UI ("" if the last insert worked)
+     static std::string lastError(void);
+ 
+@@ -39,7 +67,16 @@ public:
+     static bool findFirstImage(const std::string &dir, std::string &imagePath, int depth = 0);     // first .st / .msa (top level first)
+     static bool copyFileSafely(const std::string &src, const std::string &dst);        // dst.tmp, fsync, rename
+ 
++    // after the ST's writes were saved to an image (FloppyImage*::save): mark
++    // its unpack folder as a save disk, or list an image file on the storage
++    static void noteSaved(const std::string &imagePath);
++
++    // where zips are unpacked now (FLOPPY_DISKS_DIR, or UNPACK_RAM_DIR)
++    static std::string cacheDir(void);
++
+ private:
++    static bool prepare(const std::string &src, bool zip, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error);
++    static std::string contentHash(const std::string &path);
+     static void cleanupOnce(void);
+     static std::string lastErr;
+ };
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 95658eb9..0b182f06 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -13,6 +13,8 @@
+ #include <sys/stat.h>
+ #include <sys/statvfs.h>
+ #include <sys/wait.h>
++#include <ctype.h>
++#include <time.h>
+ 
+ #include "lib/cjson-code-58/cJSON.h"
+ #include "debug.h"
+@@ -26,9 +28,9 @@ static bool toolAvailable(void)
+ }
+ 
+ // run the tool and collect what it prints (key=value lines)
+-static bool runTool(const char *args, std::string &out)
++static bool runToolAt(const char *tool, const char *args, std::string &out)
+ {
+-    std::string cmd = std::string(SYSUPDATE_TOOL " ") + args + " 2>/dev/null";
++    std::string cmd = std::string(tool) + " " + args + " 2>/dev/null";
+     FILE *p = popen(cmd.c_str(), "r");
+     if(!p) return false;
+     char buf[1024];
+@@ -37,6 +39,11 @@ static bool runTool(const char *args, std::string &out)
+     return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+ }
+ 
++static bool runTool(const char *args, std::string &out)
++{
++    return runToolAt(SYSUPDATE_TOOL, args, out);
++}
++
+ static std::string valueOf(const std::string &kv, const char *key)
+ {
+     std::string k = std::string(key) + "=";
+@@ -52,7 +59,7 @@ static std::string valueOf(const std::string &kv, const char *key)
+ 
+ // start the tool and don't wait: it outlives this request (and restarts the
+ // CosmosEx). Double fork, so no zombie; no inherited sockets.
+-static bool startTool(const std::string &args)
++static bool startToolAt(const char *tool, const std::string &args)
+ {
+     pid_t pid = fork();
+     if(pid < 0) return false;
+@@ -64,16 +71,21 @@ static bool startTool(const std::string &args)
+         int nul = open("/dev/null", O_RDWR);
+         if(nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); if(nul > 2) close(nul); }
+         signal(SIGPIPE, SIG_DFL);
+-        std::string cmd = std::string(SYSUPDATE_TOOL " ") + args;
++        std::string cmd = std::string(tool) + " " + args;
+         execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *) NULL);
+         _exit(127);
+     }
+     int st;
+     waitpid(pid, &st, 0);
+-    Debug::out(LOG_INFO, "SystemResource: started ce-sysupdate %s", args.c_str());
++    Debug::out(LOG_INFO, "SystemResource: started %s %s", tool, args.c_str());
+     return true;
+ }
+ 
++static bool startTool(const std::string &args)
++{
++    return startToolAt(SYSUPDATE_TOOL, args);
++}
++
+ static bool isBusy(void)
+ {
+     std::string out;
+@@ -223,6 +235,17 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     size_t q = what.find('?');
+     if(q != std::string::npos) what.erase(q);
+     while(!what.empty() && what[0] == '/') what.erase(0, 1);
++    if(what.compare(0, 6, "backup") == 0) {
++        what.erase(0, 6);
++        while(!what.empty() && what[0] == '/') what.erase(0, 1);
++        const char *bm = req_info->request_method;
++        if(access(BACKUP_TOOL, X_OK) != 0) { sendError(conn, 404, "Backups aren't available on this system."); return true; }
++        if(strcmp(bm, "GET") == 0 && what.empty())          { backupInfo(conn); return true; }
++        if(strcmp(bm, "GET") == 0 && what == "download")    { backupDownload(conn, req_info); return true; }
++        if(strcmp(bm, "POST") == 0 && what == "restore")    { backupRestore(conn); return true; }
++        sendError(conn, 405, "GET /api/v1/system/backup[/download] or POST /api/v1/system/backup/restore");
++        return true;
++    }
+     if(what.compare(0, 6, "update") != 0) { sendError(conn, 404, "unknown resource"); return true; }
+     what.erase(0, 6);
+     while(!what.empty() && what[0] == '/') what.erase(0, 1);
+@@ -267,3 +290,131 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     sendError(conn, 404, "unknown action");
+     return true;
+ }
++
++/* ---------------------------------------------------------------- backup */
++
++void SystemResource::backupInfo(mg_connection *conn)
++{
++    std::string out;
++    runToolAt(BACKUP_TOOL, "info", out);
++    cJSON *root = cJSON_CreateObject();
++    cJSON *restore = NULL;
++    size_t pos = 0;
++    while(pos < out.length()) {
++        size_t end = out.find('\n', pos);
++        if(end == std::string::npos) end = out.length();
++        std::string line = out.substr(pos, end - pos);
++        pos = end + 1;
++        size_t eq = line.find('=');
++        if(eq == std::string::npos || eq == 0) continue;
++        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
++        cJSON *obj = root;
++        if(k.compare(0, 8, "restore_") == 0) {
++            if(!restore) { restore = cJSON_CreateObject(); cJSON_AddItemToObject(root, "restore", restore); }
++            obj = restore;
++            k.erase(0, 8);
++        }
++        bool number = k.length() > 2 && (k.compare(k.length() - 2, 2, "KB") == 0 || k.compare(k.length() - 2, 2, "MB") == 0);
++        if(number || k == "saveDisks" || k == "sshKeys" || k == "hddImages") cJSON_AddNumberToObject(obj, k.c_str(), atof(v.c_str()));
++        else if(v == "yes" || v == "no") cJSON_AddBoolToObject(obj, k.c_str(), v == "yes");
++        else cJSON_AddStringToObject(obj, k.c_str(), v.c_str());
++    }
++    sendJson(conn, root);
++}
++
++// made while it's sent (chunked: the size isn't known before)
++void SystemResource::backupDownload(mg_connection *conn, mg_request_info *req_info)
++{
++    const char *qs = req_info->query_string ? req_info->query_string : "";
++    char v[8];
++    std::string args = "create";
++    if(mg_get_var(qs, strlen(qs), "translated", v, sizeof(v)) > 0 && v[0] == '1') args += " --translated";
++    if(mg_get_var(qs, strlen(qs), "downloads", v, sizeof(v)) > 0 && v[0] == '1') args += " --downloads";
++
++    std::string host;
++    char hn[64];
++    if(gethostname(hn, sizeof(hn)) == 0) { hn[sizeof(hn) - 1] = 0; host = hn; }
++    for(size_t i=0; i<host.length(); i++) if(!isalnum((unsigned char) host[i]) && host[i] != '-') host[i] = '_';
++    time_t now = time(NULL);
++    struct tm tmv;
++    localtime_r(&now, &tmv);
++    char name[128];
++    snprintf(name, sizeof(name), "cosmosex-backup-%s-%04d%02d%02d-%02d%02d.tar.gz", host.empty() ? "cosmosex" : host.c_str(),
++             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
++
++    std::string cmd = std::string(BACKUP_TOOL " ") + args + " 2>/dev/null";
++    FILE *p = popen(cmd.c_str(), "r");
++    if(!p) { sendError(conn, 500, "Couldn't make the backup."); return; }
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nCache-Control: no-cache\r\n"
++                    "Content-Disposition: attachment; filename=\"%s\"\r\nTransfer-Encoding: chunked\r\n\r\n", name);
++    static __thread char buf[65536];
++    size_t n;
++    long long total = 0;
++    bool ok = true;
++    while((n = fread(buf, 1, sizeof(buf), p)) > 0) {
++        char head[16];
++        int hl = snprintf(head, sizeof(head), "%lx\r\n", (unsigned long) n);
++        if(mg_write(conn, head, hl) != hl || mg_write(conn, buf, n) != (int) n || mg_write(conn, "\r\n", 2) != 2) { ok = false; break; }
++        total += n;
++    }
++    if(!ok) while(fread(buf, 1, sizeof(buf), p) > 0) { }     // let the tool finish
++    pclose(p);
++    if(ok) mg_write(conn, "0\r\n\r\n", 5);
++    Debug::out(LOG_INFO, "SystemResource: backup %s sent (%lld bytes%s)", name, total, ok ? "" : ", cut short");
++}
++
++bool SystemResource::receiveFile(mg_connection *conn, const char *tool, long long maxMB, const std::string &fileName, std::string &path)
++{
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/octet-stream", 24) != 0) { sendError(conn, 415, "Content-Type must be application/octet-stream"); return false; }
++    const char *len = mg_get_header(conn, "Content-Length");
++    long long total = len ? atoll(len) : -1;
++    if(total <= 0) { sendError(conn, 411, "Content-Length needed"); return false; }
++    if(total > maxMB * 1024 * 1024) { sendError(conn, 413, "That file is too large."); return false; }
++
++    std::string dir;
++    runToolAt(tool, "workdir", dir);
++    while(!dir.empty() && (dir[dir.length() - 1] == '\n' || dir[dir.length() - 1] == ' ')) dir.erase(dir.length() - 1);
++    struct statvfs fs;
++    if(dir.empty() || dir[0] != '/' || statvfs(dir.c_str(), &fs) != 0) { sendError(conn, 500, "No place for the upload."); return false; }
++    unsigned long long freeBytes = (unsigned long long) fs.f_bavail * fs.f_frsize;
++    // room for the file and for unpacking it next to it
++    if((unsigned long long) total * 3 + 16ULL * 1024 * 1024 > freeBytes) {
++        char b[200];
++        snprintf(b, sizeof(b), "Not enough room: %llu MB free in %s.", freeBytes / 1048576, dir.c_str());
++        sendError(conn, 413, b);
++        return false;
++    }
++    path = dir + "/" + fileName;
++    FILE *f = fopen(path.c_str(), "wb");
++    if(!f) { sendError(conn, 500, std::string("Can't write ") + path + ": " + strerror(errno)); return false; }
++    static __thread char buf[65536];
++    long long got = 0;
++    bool ok = true;
++    while(got < total) {
++        int r = mg_read(conn, buf, sizeof(buf));
++        if(r <= 0) break;
++        if(fwrite(buf, 1, r, f) != (size_t) r) { ok = false; break; }
++        got += r;
++    }
++    if(fflush(f) != 0 || fsync(fileno(f)) != 0) ok = false;
++    fclose(f);
++    if(!ok || got != total) {
++        unlink(path.c_str());
++        sendError(conn, 400, ok ? "The upload was cut short." : "Writing the upload failed (full?).");
++        return false;
++    }
++    return true;
++}
++
++void SystemResource::backupRestore(mg_connection *conn)
++{
++    if(pthread_mutex_trylock(&uploadMutex) != 0) { sendError(conn, 409, "Another upload is running."); return; }
++    std::string path;
++    if(!receiveFile(conn, BACKUP_TOOL, BACKUP_MAX_MB, "restore.tar.gz", path)) { pthread_mutex_unlock(&uploadMutex); return; }
++    bool started = startToolAt(BACKUP_TOOL, "restore '" + path + "' delete");
++    pthread_mutex_unlock(&uploadMutex);
++    if(!started) { unlink(path.c_str()); sendError(conn, 500, "Couldn't start the restore."); return; }
++    usleep(500 * 1000);
++    backupInfo(conn);
++}
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index b685a83f..ad3d0cb1 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -20,12 +20,20 @@
+ //   POST /api/v1/system/update/back       ... or restart into the old one
+ //   POST /api/v1/system/update/previous   restart into the system installed before
+ //
+-// The POSTs other than upload need Content-Type application/json (a page on
++//   GET  /api/v1/system/backup            what a backup holds (sizes), the last restore
++//   GET  /api/v1/system/backup/download?translated=1&downloads=1
++//                                         a backup (.tar.gz), made by BACKUP_TOOL as it's sent
++//   POST /api/v1/system/backup/restore    the body is a backup (application/octet-stream):
++//                                         restored, then the CosmosEx restarts
++//
++// The POSTs other than the uploads need Content-Type application/json (a page on
+ // another site can't send that without asking first). Without the tool every
+ // request answers "available": false.
+ 
+ #define SYSUPDATE_TOOL      "/usr/sbin/ce-sysupdate"
+ #define SYSUPDATE_MAX_MB    2048            // largest upload
++#define BACKUP_TOOL         "/usr/sbin/ce-backup"
++#define BACKUP_MAX_MB       4096            // largest backup upload
+ 
+ class SystemResource : public IApiResource {
+ public:
+@@ -38,6 +46,11 @@ private:
+     void sendError(mg_connection *conn, int code, const std::string &message);
+     void sendStatus(mg_connection *conn);
+     void upload(mg_connection *conn);
++    void backupInfo(mg_connection *conn);
++    void backupDownload(mg_connection *conn, mg_request_info *req_info);
++    void backupRestore(mg_connection *conn);
++    // receive the body into <tool's workdir>/<name>; false: answered with an error
++    bool receiveFile(mg_connection *conn, const char *tool, long long maxMB, const std::string &name, std::string &path);
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

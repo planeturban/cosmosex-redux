@@ -1,0 +1,400 @@
+From 71ab62df849d6eef7ba517d65abc2da7c37db0fd Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:52:26 +0100
+Subject: [PATCH] ce_main_app: system updates from the web interface
+
+/api/v1/system/update: the state of the image's update tool
+(/usr/sbin/ce-sysupdate), and actions: check for the newest published
+image, install it, install an uploaded image (.img or .img.xz, the body of
+the request), keep or leave a new system being tried, start the previous
+one. The tool does the work (A/B root partitions, tryboot); the app only
+starts it and reports.
+---
+ .../webserver/api/resource/systemresource.cpp | 269 ++++++++++++++++++
+ .../webserver/api/resource/systemresource.h   |  43 +++
+ .../webserver/api/router/apiv1router.cpp      |   8 +
+ .../webserver/api/router/apiv1router.h        |   2 +
+ 4 files changed, 322 insertions(+)
+ create mode 100644 ce_main_app/webserver/api/resource/systemresource.cpp
+ create mode 100644 ce_main_app/webserver/api/resource/systemresource.h
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+new file mode 100644
+index 00000000..95658eb9
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -0,0 +1,269 @@
++// /api/v1/system/update: system updates through SYSUPDATE_TOOL (see systemresource.h).
++
++#include <string>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <unistd.h>
++#include <pthread.h>
++#include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <sys/wait.h>
++
++#include "lib/cjson-code-58/cJSON.h"
++#include "debug.h"
++#include "systemresource.h"
++
++static pthread_mutex_t uploadMutex = PTHREAD_MUTEX_INITIALIZER;     // one upload at a time
++
++static bool toolAvailable(void)
++{
++    return access(SYSUPDATE_TOOL, X_OK) == 0;
++}
++
++// run the tool and collect what it prints (key=value lines)
++static bool runTool(const char *args, std::string &out)
++{
++    std::string cmd = std::string(SYSUPDATE_TOOL " ") + args + " 2>/dev/null";
++    FILE *p = popen(cmd.c_str(), "r");
++    if(!p) return false;
++    char buf[1024];
++    while(fgets(buf, sizeof(buf), p)) out += buf;
++    int rc = pclose(p);
++    return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
++}
++
++static std::string valueOf(const std::string &kv, const char *key)
++{
++    std::string k = std::string(key) + "=";
++    size_t pos = 0;
++    while(pos < kv.length()) {
++        size_t end = kv.find('\n', pos);
++        if(end == std::string::npos) end = kv.length();
++        if(kv.compare(pos, k.length(), k) == 0) return kv.substr(pos + k.length(), end - pos - k.length());
++        pos = end + 1;
++    }
++    return "";
++}
++
++// start the tool and don't wait: it outlives this request (and restarts the
++// CosmosEx). Double fork, so no zombie; no inherited sockets.
++static bool startTool(const std::string &args)
++{
++    pid_t pid = fork();
++    if(pid < 0) return false;
++    if(pid == 0) {
++        setsid();
++        if(fork() != 0) _exit(0);
++        long maxFd = sysconf(_SC_OPEN_MAX);
++        for(long fd = 3; fd < (maxFd > 0 ? maxFd : 1024); fd++) close(fd);
++        int nul = open("/dev/null", O_RDWR);
++        if(nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); if(nul > 2) close(nul); }
++        signal(SIGPIPE, SIG_DFL);
++        std::string cmd = std::string(SYSUPDATE_TOOL " ") + args;
++        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *) NULL);
++        _exit(127);
++    }
++    int st;
++    waitpid(pid, &st, 0);
++    Debug::out(LOG_INFO, "SystemResource: started ce-sysupdate %s", args.c_str());
++    return true;
++}
++
++static bool isBusy(void)
++{
++    std::string out;
++    runTool("status", out);
++    return valueOf(out, "busy") == "yes";
++}
++
++SystemResource::SystemResource()
++{
++}
++
++SystemResource::~SystemResource()
++{
++}
++
++void SystemResource::sendJson(mg_connection *conn, cJSON *root, int code)
++{
++    char *json = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    std::string s = json ? json : "{}";
++    free(json);
++    const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 404) ? "Not Found" :
++                       (code == 405) ? "Method Not Allowed" : (code == 409) ? "Conflict" : (code == 413) ? "Payload Too Large" :
++                       (code == 415) ? "Unsupported Media Type" : (code == 502) ? "Bad Gateway" : "Error";
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) s.length());
++    mg_write(conn, s.c_str(), s.length());
++}
++
++void SystemResource::sendError(mg_connection *conn, int code, const std::string &message)
++{
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "status", "error");
++    cJSON_AddStringToObject(root, "error", message.c_str());
++    sendJson(conn, root, code);
++}
++
++// the tool's status lines as JSON: numbers as numbers, yes/no as booleans
++void SystemResource::sendStatus(mg_connection *conn)
++{
++    cJSON *root = cJSON_CreateObject();
++    if(!toolAvailable()) {
++        cJSON_AddBoolToObject(root, "available", false);
++        sendJson(conn, root);
++        return;
++    }
++    cJSON_AddBoolToObject(root, "available", true);
++    std::string out;
++    runTool("status", out);
++    cJSON *latest = NULL;
++    size_t pos = 0;
++    while(pos < out.length()) {
++        size_t end = out.find('\n', pos);
++        if(end == std::string::npos) end = out.length();
++        std::string line = out.substr(pos, end - pos);
++        pos = end + 1;
++        size_t eq = line.find('=');
++        if(eq == std::string::npos || eq == 0) continue;
++        std::string k = line.substr(0, eq), v = line.substr(eq + 1);
++        cJSON *obj = root;
++        if(k.compare(0, 7, "latest_") == 0) {                   // latest_version -> latest.version
++            if(!latest) { latest = cJSON_CreateObject(); cJSON_AddItemToObject(root, "latest", latest); }
++            obj = latest;
++            k.erase(0, 7);
++        }
++        if(k == "progress" || k == "size" || k == "workdirFreeMB") cJSON_AddNumberToObject(obj, k.c_str(), atof(v.c_str()));
++        else if(v == "yes" || v == "no") cJSON_AddBoolToObject(obj, k.c_str(), v == "yes");
++        else cJSON_AddStringToObject(obj, k.c_str(), v.c_str());
++    }
++    sendJson(conn, root);
++}
++
++void SystemResource::upload(mg_connection *conn)
++{
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/octet-stream", 24) != 0) {
++        sendError(conn, 415, "Content-Type must be application/octet-stream");
++        return;
++    }
++    const char *len = mg_get_header(conn, "Content-Length");
++    long long total = len ? atoll(len) : -1;
++    if(total <= 0) { sendError(conn, 411, "Content-Length needed"); return; }
++    if(total > (long long) SYSUPDATE_MAX_MB * 1024 * 1024) { sendError(conn, 413, "That's too large for a CosmosEx image."); return; }
++
++    const char *name = mg_get_header(conn, "X-File-Name");
++    std::string n = name ? name : "";
++    bool xz = n.length() > 3 && strcasecmp(n.c_str() + n.length() - 3, ".xz") == 0;
++
++    if(pthread_mutex_trylock(&uploadMutex) != 0) { sendError(conn, 409, "Another upload is running."); return; }
++    if(isBusy()) { pthread_mutex_unlock(&uploadMutex); sendError(conn, 409, "An update is running."); return; }
++
++    std::string dir;
++    runTool("workdir", dir);
++    while(!dir.empty() && (dir[dir.length() - 1] == '\n' || dir[dir.length() - 1] == ' ')) dir.erase(dir.length() - 1);
++    struct statvfs fs;
++    if(dir.empty() || dir[0] != '/' || statvfs(dir.c_str(), &fs) != 0) {
++        pthread_mutex_unlock(&uploadMutex);
++        sendError(conn, 500, "No place for the upload.");
++        return;
++    }
++    unsigned long long freeBytes = (unsigned long long) fs.f_bavail * fs.f_frsize;
++    if((unsigned long long) total + 16ULL * 1024 * 1024 > freeBytes) {
++        pthread_mutex_unlock(&uploadMutex);
++        char b[200];
++        snprintf(b, sizeof(b), "Not enough room for the upload: %llu MB free in %s, %lld MB needed.", freeBytes / 1048576, dir.c_str(), total / 1048576);
++        sendError(conn, 413, b);
++        return;
++    }
++
++    std::string path = dir + (xz ? "/upload.img.xz" : "/upload.img");
++    unlink((dir + "/upload.img").c_str());
++    unlink((dir + "/upload.img.xz").c_str());
++    FILE *f = fopen(path.c_str(), "wb");
++    if(!f) {
++        pthread_mutex_unlock(&uploadMutex);
++        sendError(conn, 500, std::string("Can't write ") + path + ": " + strerror(errno));
++        return;
++    }
++    Debug::out(LOG_INFO, "SystemResource: receiving %s (%lld bytes) to %s", n.c_str(), total, path.c_str());
++    static char buf[65536];
++    long long got = 0;
++    bool ok = true;
++    while(got < total) {
++        int r = mg_read(conn, buf, sizeof(buf));
++        if(r <= 0) break;
++        if(fwrite(buf, 1, r, f) != (size_t) r) { ok = false; break; }
++        got += r;
++    }
++    if(fflush(f) != 0 || fsync(fileno(f)) != 0) ok = false;
++    fclose(f);
++    if(!ok || got != total) {
++        unlink(path.c_str());
++        pthread_mutex_unlock(&uploadMutex);
++        sendError(conn, 400, ok ? "The upload was cut short." : "Writing the upload failed (full?).");
++        return;
++    }
++    bool started = startTool("install '" + path + "' delete");
++    pthread_mutex_unlock(&uploadMutex);
++    if(!started) { unlink(path.c_str()); sendError(conn, 500, "Couldn't start the update."); return; }
++    usleep(300 * 1000);                     // the tool has set its state
++    sendStatus(conn);
++}
++
++bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
++{
++    std::string what = sResourceInfo;
++    size_t q = what.find('?');
++    if(q != std::string::npos) what.erase(q);
++    while(!what.empty() && what[0] == '/') what.erase(0, 1);
++    if(what.compare(0, 6, "update") != 0) { sendError(conn, 404, "unknown resource"); return true; }
++    what.erase(0, 6);
++    while(!what.empty() && what[0] == '/') what.erase(0, 1);
++
++    const char *m = req_info->request_method;
++    if(strcmp(m, "GET") == 0) {
++        if(!what.empty()) { sendError(conn, 404, "unknown resource"); return true; }
++        sendStatus(conn);
++        return true;
++    }
++    if(strcmp(m, "POST") != 0 || what.empty()) {
++        sendError(conn, 405, "GET /api/v1/system/update or POST /api/v1/system/update/<action>");
++        return true;
++    }
++    if(!toolAvailable()) { sendError(conn, 404, "System updates aren't available on this system."); return true; }
++
++    if(what == "upload") { upload(conn); return true; }
++
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/json", 16) != 0) {
++        sendError(conn, 415, "Content-Type must be application/json");
++        return true;
++    }
++    char drain[256];
++    while(mg_read(conn, drain, sizeof(drain)) > 0) { }      // the body isn't used
++
++    if(what == "check") {
++        std::string out;
++        runTool("check", out);
++        std::string err = valueOf(out, "error");
++        if(!err.empty()) { sendError(conn, 502, err); return true; }
++        sendStatus(conn);
++        return true;
++    }
++    if(what == "online" || what == "keep" || what == "back" || what == "previous") {
++        if(what == "online" && isBusy()) { sendError(conn, 409, "An update is running."); return true; }
++        if(!startTool(what)) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
++        usleep(300 * 1000);
++        sendStatus(conn);
++        return true;
++    }
++    sendError(conn, 404, "unknown action");
++    return true;
++}
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+new file mode 100644
+index 00000000..b685a83f
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -0,0 +1,43 @@
++#ifndef SYSTEMRESOURCE_H
++#define SYSTEMRESOURCE_H
++
++#include <string>
++
++#include "../../CivetServer.h"
++
++#include "iapiresource.h"
++
++// System updates for the web interface, done by the image's SYSUPDATE_TOOL
++// (Buildroot image: /usr/sbin/ce-sysupdate, A/B root partitions; see there).
++//
++//   GET  /api/v1/system/update            state: version, slot, progress, newest published ...
++//   POST /api/v1/system/update/check      look for the newest published image (waits for it)
++//   POST /api/v1/system/update/online     download and install it (runs on; poll GET)
++//   POST /api/v1/system/update/upload     the body is an SD card image (.img or .img.xz),
++//                                         Content-Type application/octet-stream,
++//                                         X-File-Name: its name; installed like online
++//   POST /api/v1/system/update/keep       while trying a new system: keep it
++//   POST /api/v1/system/update/back       ... or restart into the old one
++//   POST /api/v1/system/update/previous   restart into the system installed before
++//
++// The POSTs other than upload need Content-Type application/json (a page on
++// another site can't send that without asking first). Without the tool every
++// request answers "available": false.
++
++#define SYSUPDATE_TOOL      "/usr/sbin/ce-sysupdate"
++#define SYSUPDATE_MAX_MB    2048            // largest upload
++
++class SystemResource : public IApiResource {
++public:
++    SystemResource();
++    virtual ~SystemResource();
++    bool dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo="" );
++
++private:
++    void sendJson(mg_connection *conn, struct cJSON *root, int code = 200);
++    void sendError(mg_connection *conn, int code, const std::string &message);
++    void sendStatus(mg_connection *conn);
++    void upload(mg_connection *conn);
++};
++
++#endif
+diff --git a/ce_main_app/webserver/api/router/apiv1router.cpp b/ce_main_app/webserver/api/router/apiv1router.cpp
+index 1bcdc339..b0a3c858 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.cpp
++++ b/ce_main_app/webserver/api/router/apiv1router.cpp
+@@ -22,6 +22,7 @@ ApiV1Router::ApiV1Router(VirtualKeyboardService* pxVKbdService,VirtualMouseServi
+     pxStatus=new StatusResource();
+     pxLibrary=new LibraryResource(pxFloppyService);
+     pxSettings=new SettingsResource();
++    pxSystem=new SystemResource();
+ }
+ 
+ ApiV1Router::~ApiV1Router()
+@@ -35,6 +36,7 @@ ApiV1Router::~ApiV1Router()
+     delete pxStatus;
+     delete pxLibrary;
+     delete pxSettings;
++    delete pxSystem;
+     pxStatus=NULL;
+     pxLibrary=NULL;
+     pxMouse=NULL;
+@@ -116,6 +118,12 @@ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+         // list files and their pictures for the web UI (LibraryResource)
+         bool processed=pxLibrary->dispatch(conn,req_info,sResource);
+         return processed;
++    } else if( sResource.substr(0,7)=="system/" )
++    {
++        std::string sResourceInfo=sResource;
++        sResourceInfo.erase(0,7);
++        bool processed=pxSystem->dispatch(conn,req_info,sResourceInfo);
++        return processed;
+     } else if( sResource=="status" )
+     {
+         bool processed=pxStatus->dispatch(conn,req_info);
+diff --git a/ce_main_app/webserver/api/router/apiv1router.h b/ce_main_app/webserver/api/router/apiv1router.h
+index 850cb61b..5440699d 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.h
++++ b/ce_main_app/webserver/api/router/apiv1router.h
+@@ -15,6 +15,7 @@
+ #include "../resource/statusresource.h"
+ #include "../resource/libraryresource.h"
+ #include "../resource/settingsresource.h"
++#include "../resource/systemresource.h"
+ 
+ class ApiV1Router: public CivetHandler
+ {
+@@ -34,6 +35,7 @@ private:
+     StatusResource *pxStatus;
+     LibraryResource *pxLibrary;
+     SettingsResource *pxSettings;
++    SystemResource *pxSystem;
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

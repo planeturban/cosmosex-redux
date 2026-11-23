@@ -1,0 +1,29 @@
+From 28b7a6f705547e9e04604249cb4463bc1d3e3fc0 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 21:50:52 +0200
+Subject: [PATCH 2/2] ce_main_app: don't list -l libraries as make
+ prerequisites
+
+GNU make resolves -lNAME prerequisites in the build host's library
+directories, which fails when cross-compiling (e.g. -lcurl isn't on the
+host). The linker still gets LDLIBS on the link command line.
+---
+ ce_main_app/makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ce_main_app/makefile b/ce_main_app/makefile
+index fd9b0e60..764ffac8 100644
+--- a/ce_main_app/makefile
++++ b/ce_main_app/makefile
+@@ -147,7 +147,7 @@ WEBCOMPONENTS = $(WEB_CSS_PATH)/combined.css.gz \
+ 
+ all:	$(TARGET) $(WEBCOMPONENTS)
+ 
+-$(TARGET): $(OBJS) $(HDRS) $(LDLIBS)
++$(TARGET): $(OBJS) $(HDRS)
+ 	$(CXX_LINK) $(CFLAGS) $(OBJS) $(LDFLAGS) -o $@ $(LDLIBS)
+ #	$(STRIP) -s $@
+ 
+-- 
+2.54.0 (Apple Git-157)
+

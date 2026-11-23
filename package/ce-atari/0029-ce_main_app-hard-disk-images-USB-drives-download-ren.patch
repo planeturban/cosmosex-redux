@@ -1,0 +1,277 @@
+From 274185e1f62bcaef2741d1a3fe2a2f219e32dc62 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:59:45 +0100
+Subject: [PATCH] ce_main_app: hard disk images: USB drives, download, rename,
+ delete
+
+The hddimage section also lists image files (.img .hd .hdd .ima .raw) in
+the top folder of each USB drive, and says which image is attached. New
+in its PUT: {"delete": path} and {"rename": {path, name}} for images in
+/storage/hdd_images (with their notes; delete refuses the attached image,
+rename keeps it attached). GET /api/v1/settings/hddimage/download?path=
+sends a listed image as a file.
+---
+ .../api/resource/settingsresource.cpp         | 191 ++++++++++++++++++
+ .../webserver/api/resource/settingsresource.h |   6 +-
+ 2 files changed, 196 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 235fb28c..018d4a11 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -163,6 +163,77 @@ static bool getLetter(cJSON *o, const char *key, char &letter, std::string &msg)
+     return true;
+ }
+ 
++// Hard disk images the web interface lists, downloads, renames and deletes:
++// the files in HDD_IMAGES_DIR (not the notes), and image files in the top
++// folder of a USB drive (/mnt/<drive>/, not the shared drive: a network
++// folder isn't safe for an image the ST writes to).
++static bool hasImageExt(const std::string &name)
++{
++    static const char *ext[] = { ".img", ".hd", ".hdd", ".ima", ".raw", NULL };
++    for(int i=0; ext[i]; i++) {
++        size_t n = strlen(ext[i]);
++        if(name.length() > n && strcasecmp(name.c_str() + name.length() - n, ext[i]) == 0) return true;
++    }
++    return false;
++}
++
++// the USB drives' mount points: /mnt/<x> that are mount points
++static std::vector<std::string> usbMounts(void)
++{
++    std::vector<std::string> out;
++    struct stat mnt;
++    if(stat("/mnt", &mnt) != 0) return out;
++    DIR *d = opendir("/mnt");
++    if(!d) return out;
++    struct dirent *de;
++    while((de = readdir(d)) != NULL) {
++        std::string n = de->d_name;
++        if(n[0] == '.' || n == "shared") continue;
++        std::string p = "/mnt/" + n;
++        struct stat st;
++        if(stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && st.st_dev != mnt.st_dev) out.push_back(p);
++    }
++    closedir(d);
++    std::sort(out.begin(), out.end());
++    return out;
++}
++
++// where: "storage" (HDD_IMAGES_DIR) or "usb"; false: not an image we handle
++static bool listedImage(const std::string &path, std::string &real, std::string &where)
++{
++    char r[PATH_MAX];
++    if(path.empty() || path[0] != '/' || !realpath(path.c_str(), r)) return false;
++    real = r;
++    struct stat st;
++    if(stat(r, &st) != 0 || !S_ISREG(st.st_mode)) return false;
++    size_t slash = real.find_last_of('/');
++    std::string dir = real.substr(0, slash), name = real.substr(slash + 1);
++    if(name.empty() || name[0] == '.') return false;
++    if(dir == HDD_IMAGES_DIR) {
++        if(name.length() > 5 && strcasecmp(name.c_str() + name.length() - 5, ".json") == 0) return false;
++        where = "storage";
++        return true;
++    }
++    std::vector<std::string> m = usbMounts();
++    if(hasImageExt(name) && std::find(m.begin(), m.end(), dir) != m.end()) { where = "usb"; return true; }
++    return false;
++}
++
++// the attached image's path (HDDIMAGE without " RO")
++static std::string attachedImage(Settings &s, bool *readOnly)
++{
++    std::string img = s.getString("HDDIMAGE", "");
++    while(!img.empty() && (img[img.length() - 1] == '\n' || img[img.length() - 1] == ' ')) img.erase(img.length() - 1);
++    bool ro = false;
++    size_t sp = img.find_last_of(' ');
++    if(sp != std::string::npos) {
++        std::string end = img.substr(sp + 1);
++        if(end == "RO" || end == "READONLY" || end == "READ_ONLY") { ro = true; img.erase(sp); }
++    }
++    if(readOnly) *readOnly = ro;
++    return img;
++}
++
+ /* -------------------------------------------------------------- sections */
+ 
+ // Notes about a hard disk image in HDD_IMAGES_DIR: <image>.json next to it,
+@@ -399,9 +470,41 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+             cJSON_AddStringToObject(o, "path", full.c_str());
+             cJSON_AddNumberToObject(o, "sizeMB", (double) (st.st_size / (1024 * 1024)));
+             cJSON_AddStringToObject(o, "notes", imageNotes(names[i]).c_str());
++            cJSON_AddStringToObject(o, "where", "storage");
++            cJSON_AddBoolToObject(o, "attached", full == img);
+             cJSON_AddItemToArray(imgs, o);
+         }
+         cJSON_AddItemToObject(out, "images", imgs);
++
++        // image files in the top folder of each USB drive (no notes: the
++        // drive may be read-only or move to another computer)
++        cJSON *usb = cJSON_CreateArray();
++        std::vector<std::string> mounts = usbMounts();
++        for(size_t m=0; m<mounts.size(); m++) {
++            DIR *ud = opendir(mounts[m].c_str());
++            if(!ud) continue;
++            std::vector<std::string> un;
++            struct dirent *ue;
++            while((ue = readdir(ud)) != NULL && un.size() < 100) {
++                if(ue->d_name[0] != '.' && hasImageExt(ue->d_name)) un.push_back(ue->d_name);
++            }
++            closedir(ud);
++            std::sort(un.begin(), un.end());
++            for(size_t i=0; i<un.size(); i++) {
++                std::string full = mounts[m] + "/" + un[i];
++                struct stat st;
++                if(stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
++                cJSON *o = cJSON_CreateObject();
++                cJSON_AddStringToObject(o, "name", un[i].c_str());
++                cJSON_AddStringToObject(o, "path", full.c_str());
++                cJSON_AddNumberToObject(o, "sizeMB", (double) (st.st_size / (1024 * 1024)));
++                cJSON_AddStringToObject(o, "where", "usb");
++                cJSON_AddStringToObject(o, "drive", mounts[m].c_str());
++                cJSON_AddBoolToObject(o, "attached", full == img);
++                cJSON_AddItemToArray(usb, o);
++            }
++        }
++        cJSON_AddItemToObject(out, "usbImages", usb);
+         return true;
+     }
+ 
+@@ -766,6 +869,58 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+     }
+ 
+     if(name == "hddimage") {                                // onHddImageSave(), without the usb/shared shortcuts
++        // {"delete": "<path>"}: an image in HDD_IMAGES_DIR (and its notes); not the attached one
++        cJSON *del = cJSON_GetObjectItem(in, "delete");
++        if(del) {
++            std::string real, where;
++            if(del->type != cJSON_String || !del->valuestring || !listedImage(del->valuestring, real, where) || where != "storage") {
++                msg = "Only images in " HDD_IMAGES_DIR " can be deleted here.";
++                return false;
++            }
++            if(real == attachedImage(s, NULL)) { msg = "That image is attached: detach it first."; return false; }
++            std::string name = real.substr(real.find_last_of('/') + 1);
++            if(unlink(real.c_str()) != 0) { msg = "Couldn't delete " + name + ": " + strerror(errno) + "."; return false; }
++            unlink((real + ".json").c_str());
++            Debug::out(LOG_INFO, "SettingsResource: deleted HDD image %s", real.c_str());
++            Utils::forceSync();
++            return true;
++        }
++
++        // {"rename": {"path": "<path>", "name": "new name"}}: an image in HDD_IMAGES_DIR, with its notes
++        cJSON *ren = cJSON_GetObjectItem(in, "rename");
++        if(ren) {
++            cJSON *jp = cJSON_GetObjectItem(ren, "path"), *jn = cJSON_GetObjectItem(ren, "name");
++            std::string real, where;
++            if(ren->type != cJSON_Object || !jp || jp->type != cJSON_String || !listedImage(jp->valuestring, real, where) || where != "storage") {
++                msg = "Only images in " HDD_IMAGES_DIR " can be renamed here.";
++                return false;
++            }
++            std::string name = (jn && jn->type == cJSON_String && jn->valuestring) ? jn->valuestring : "";
++            while(!name.empty() && name[name.length() - 1] == ' ') name.erase(name.length() - 1);
++            while(!name.empty() && name[0] == ' ') name.erase(0, 1);
++            bool okName = !name.empty() && name.length() <= 64 && name[0] != '.' && !isNotesFile(name);
++            for(size_t i=0; okName && i<name.length(); i++) {
++                char c = name[i];
++                if(!isalnum((unsigned char) c) && c != '.' && c != '_' && c != '-' && c != ' ') okName = false;
++            }
++            if(!okName) { msg = "The name may have letters, digits, spaces and . _ - (at most 64, not starting with a dot, not .json)."; return false; }
++            std::string to = std::string(HDD_IMAGES_DIR "/") + name;
++            if(to == real) return true;
++            struct stat st;
++            if(lstat(to.c_str(), &st) == 0) { msg = "There's already a file called " + name + "."; return false; }
++            if(rename(real.c_str(), to.c_str()) != 0) { msg = std::string("Couldn't rename: ") + strerror(errno) + "."; return false; }
++            rename((real + ".json").c_str(), (to + ".json").c_str());       // the notes, if any
++            bool ro = false;
++            if(attachedImage(s, &ro) == real) {                             // attached: follow it
++                std::string v = to + (ro ? " RO" : "");
++                s.setString("HDDIMAGE", v.c_str());
++                reload(SETTINGSUSER_ACSI);
++            }
++            Debug::out(LOG_INFO, "SettingsResource: renamed HDD image %s to %s", real.c_str(), to.c_str());
++            Utils::forceSync();
++            return true;
++        }
++
+         // {"create": {"name": "games", "sizeMB": 1024}}: only make a new blank image
+         cJSON *create = cJSON_GetObjectItem(in, "create");
+         if(create) {
+@@ -864,6 +1019,37 @@ void SettingsResource::sendError(mg_connection *conn, int code, const char *mess
+     sendJson(conn, root, code);
+ }
+ 
++// GET /api/v1/settings/hddimage/download?path=<image>: the file itself
++void SettingsResource::downloadImage(mg_connection *conn, mg_request_info *req_info)
++{
++    char path[PATH_MAX];
++    const char *qs = req_info->query_string ? req_info->query_string : "";
++    std::string real, where;
++    if(mg_get_var(qs, strlen(qs), "path", path, sizeof(path)) <= 0 || !listedImage(path, real, where)) {
++        sendError(conn, 404, "no such image");
++        return;
++    }
++    int fd = open(real.c_str(), O_RDONLY);
++    struct stat st;
++    if(fd < 0 || fstat(fd, &st) != 0) {
++        if(fd >= 0) close(fd);
++        sendError(conn, 500, "can't read the image");
++        return;
++    }
++    std::string name = real.substr(real.find_last_of('/') + 1);
++    for(size_t i=0; i<name.length(); i++) if(name[i] == '"' || name[i] == '\\' || (unsigned char) name[i] < 32) name[i] = '_';
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-cache\r\n"
++                    "Content-Disposition: attachment; filename=\"%s\"\r\nContent-Length: %lld\r\n\r\n",
++              name.c_str(), (long long) st.st_size);
++    Debug::out(LOG_INFO, "SettingsResource: sending HDD image %s (%lld bytes)", real.c_str(), (long long) st.st_size);
++    static __thread char buf[65536];
++    ssize_t n;
++    while((n = read(fd, buf, sizeof(buf))) > 0) {
++        if(mg_write(conn, buf, n) != n) break;          // the browser went away
++    }
++    close(fd);
++}
++
+ bool SettingsResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
+ {
+     std::string section = sResourceInfo;
+@@ -871,6 +1057,11 @@ bool SettingsResource::dispatch(mg_connection *conn, mg_request_info *req_info,
+     if(q != std::string::npos) section.erase(q);
+     while(!section.empty() && section[0] == '/') section.erase(0, 1);
+ 
++    if(section == "hddimage/download" && strcmp(req_info->request_method, "GET") == 0) {
++        downloadImage(conn, req_info);
++        return true;
++    }
++
+     bool known = section.empty();
+     for(int i=0; i<SECTION_COUNT; i++) {
+         if(section == SECTIONS[i]) known = true;
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+index 956f11e6..e81addd9 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.h
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -19,7 +19,10 @@ struct cJSON;
+ // "password" and reported as "passwordSet").
+ // hddimage also takes {"create": {"name": "games", "sizeMB": 1024}}: a new
+ // blank image in /storage/hdd_images (".img" added to a name without a dot),
+-// nothing else changed.
++// nothing else changed. Also {"delete": "<path>"} and {"rename": {"path",
++// "name"}} for images in that folder (not the attached one for delete), and
++// GET /api/v1/settings/hddimage/download?path=<image> for the file; the
++// section lists the images there and in USB drives' top folders.
+ // Secrets are never returned: the shared drive password and the Wi-Fi key
+ // are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
+ // null) to keep them, send "" to clear.
+@@ -34,6 +37,7 @@ private:
+     // false + message: invalid input, nothing saved
+     bool saveSection(const std::string &name, cJSON *in, std::string &message, std::string &warning);
+ 
++    void downloadImage(mg_connection *conn, mg_request_info *req_info);
+     void sendJson(mg_connection *conn, cJSON *root, int code = 200);
+     void sendError(mg_connection *conn, int code, const char *message);
+ };
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,56 @@
+# Built in rather than modules: BusyBox mount only tries filesystems already
+# listed in /proc/filesystems, and the app mounts USB drives with plain
+# "mount -v /dev/sdXN /mnt/sdXN".
+CONFIG_FAT_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_EXFAT_FS=y
+CONFIG_NTFS3_FS=y
+CONFIG_EXT4_FS=y
+CONFIG_USB_STORAGE=y
+# Pi 3 B+ Ethernet
+CONFIG_USB_LAN78XX=y
+
+# Boot time: not used by the CosmosEx (measured with initcall_debug; kernel
+# tracing alone took about a third of the kernel's boot time)
+# CONFIG_FTRACE is not set
+# CONFIG_KPROBES is not set
+# CONFIG_SOUND is not set
+# CONFIG_MEDIA_SUPPORT is not set
+# CONFIG_BT is not set
+# The HDMI console uses the firmware framebuffer (no vc4-kms overlay)
+# CONFIG_DRM_VC4 is not set
+# The Pi 3 has no PCIe (bcm2711_defconfig serves Pi 4/5/CM4 too). Removes all
+# PCI device drivers: PCIe network cards (e.g. Intel igb), NVMe, and more.
+# CONFIG_PCI is not set
+
+# /proc/config.gz, for ce-report and for checking what the kernel has
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+# QEMU only: the emulated network card (-device usb-net) is USB CDC Ethernet.
+# Never loaded on the CosmosEx.
+CONFIG_USB_USBNET=m
+CONFIG_USB_NET_CDCETHER=m
+
+# ce-preinit mounts the /etc overlay before anything loads modules
+CONFIG_OVERLAY_FS=y
+
+# /storage over SMB (Windows / macOS file sharing): the kernel's SMB3 server ksmbd,
+# with ksmbd-tools (S60storageshare, /usr/sbin/ce-storageshare)
+CONFIG_SMB_SERVER=m
+# Firewall for the SMB server: only the computers allowed in Storage sharing may
+# connect (ksmbd's own "hosts allow" matches exact addresses only); ce-storageshare
+# loads the rules with nft
+CONFIG_NF_TABLES=m
+CONFIG_NF_TABLES_INET=y
+CONFIG_NF_TABLES_IPV4=y
+CONFIG_NF_TABLES_IPV6=y
+
+# Look inside hard disk images (ce-hdinspect): Atari AHDI/ICD root sectors
+# (GEM/BGM/XGM partitions) besides PC (MBR) partition tables
+CONFIG_PARTITION_ADVANCED=y
+CONFIG_ATARI_PARTITION=y
+# FUSE: ce-gemdosfs (big GEMDOS partitions, byte-swapped images)
+CONFIG_FUSE_FS=y
+CONFIG_MSDOS_PARTITION=y

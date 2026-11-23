@@ -1,0 +1,17 @@
+#!/bin/sh
+# /storage shared over NFS and SMB: /usr/sbin/ce-storageshare, settings in
+# /etc/ce-storageshare.conf (web interface: Config > Storage sharing).
+case "$1" in
+	start)
+		( /usr/sbin/ce-storageshare start ) > /dev/null 2>&1 &     # doesn't hold up the boot
+		;;
+	stop|restart|reload)
+		[ "$1" = reload ] && set -- apply
+		[ "$1" = restart ] && /usr/sbin/ce-storageshare stop && set -- start
+		/usr/sbin/ce-storageshare "$1"
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+		;;
+esac

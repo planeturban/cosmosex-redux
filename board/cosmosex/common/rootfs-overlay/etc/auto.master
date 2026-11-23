@@ -1,0 +1,3 @@
+# CosmosEx: the shared drive (/mnt/shared) only. The map is generated from
+# the CosmosEx settings by /usr/libexec/ce-shared-mount.
+/- /run/autofs/auto.cosmosex

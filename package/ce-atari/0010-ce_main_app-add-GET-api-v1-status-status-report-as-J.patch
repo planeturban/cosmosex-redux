@@ -1,0 +1,428 @@
+From 930e692649cebfee7c3abe310cfec3c9b228014e Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:12:52 +0100
+Subject: [PATCH] ce_main_app: add GET /api/v1/status (status report as JSON)
+
+The web UI redesign's Overview page needs the device status in a
+machine-readable form. /api/v1/status returns the same information as
+the /app/status/ report as JSON: hardware and interface type, component
+versions, live chip/interface alive signs, ACSI/SCSI IDs and their
+media, translated drives (with free space), input devices (by kernel
+device name), network interfaces and floppy slots.
+
+Built with cJSON, so strings are escaped. Read-only; no existing
+endpoint changes.
+---
+ .../webserver/api/resource/statusresource.cpp | 319 ++++++++++++++++++
+ .../webserver/api/resource/statusresource.h   |  19 ++
+ .../webserver/api/router/apiv1router.cpp      |   7 +
+ .../webserver/api/router/apiv1router.h        |   2 +
+ 4 files changed, 347 insertions(+)
+ create mode 100644 ce_main_app/webserver/api/resource/statusresource.cpp
+ create mode 100644 ce_main_app/webserver/api/resource/statusresource.h
+
+diff --git a/ce_main_app/webserver/api/resource/statusresource.cpp b/ce_main_app/webserver/api/resource/statusresource.cpp
+new file mode 100644
+index 00000000..a24f1ad2
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/statusresource.cpp
+@@ -0,0 +1,319 @@
++// GET /api/v1/status: the device status report as JSON (web UI Overview).
++//
++// {
++//   "hw":       {"version":2, "interface":"ACSI", "rpi":"Raspberry Pi 3 Model B Plus Rev 1.3",
++//                "rpi_revision":"a020d3", "uptime_s":8040, "hostname":"cosmosex", "time":"2026-11-14 14:20:00"},
++//   "versions": {"app":"2019-08-15", "hans":"2017-04-13", "franz":"2019-07-09", "xilinx":"..."},
++//   "chips":    {"hans":{"ok":true, "ago_s":0, "sign":"command"}, "franz":..., "hdd_if":...,
++//                "floppy_if":..., "ikbd_st":..., "ikbd_usb":...},
++//   "acsi":     [{"id":0, "mode":"off|sd|raw|translated", "media":"..."}, ...8],
++//   "drives":   [{"letter":"C:", "source":"USB drive - device: /dev/sda1", "path":"/mnt/sda1",
++//                 "free_mb":9800, "total_mb":15000}, ...],
++//   "usb_mount":"translated|raw",
++//   "inputs":   {"keyboard":"Logitech USB Receiver"|null, "mouse":..., "joy1":..., "joy2":...,
++//                "virtual_keyboard":bool, "virtual_mouse":bool},
++//   "network":  {"eth0":{"up":true, "ip":"192.168.1.42", "dhcp":true}, "wlan0":{"up":false, "ip":null, "dhcp":true}},
++//   "floppy":   {"active":0|null, "slots":["A.st", null, null]}
++// }
++//
++// "ok" for a chip/interface: an alive sign was ever received (as in the
++// HTML report); "ago_s" is the time since the last one (null = never).
++
++#include "statusresource.h"
++
++#include <string>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <sys/statvfs.h>
++#include <linux/input.h>
++
++#include "lib/cjson-code-58/cJSON.h"
++#include "debug.h"
++#include "global.h"
++#include "utils.h"
++#include "update.h"
++#include "periodicthread.h"
++#include "settings.h"
++#include "statusreport.h"
++#include "translated/translateddisk.h"
++#include "ikbd/ikbd.h"
++#include "floppy/imagesilo.h"
++#include "native/scsi.h"
++#include "config/netsettings.h"
++
++extern THwConfig     hwConfig;
++extern RPiConfig     rpiConfig;
++extern SharedObjects shared;
++
++StatusResource::StatusResource()
++{
++}
++
++StatusResource::~StatusResource()
++{
++}
++
++static cJSON *versionToJson(Version &v)
++{
++    char str[32];
++    memset(str, 0, sizeof(str));
++    v.toString(str);
++    if(str[0] == 0 || v.getYear() <= 0) {
++        return cJSON_CreateNull();
++    }
++    return cJSON_CreateString(str);
++}
++
++static cJSON *aliveToJson(volatile TStatus &status, const char *sign)
++{
++    cJSON *o = cJSON_CreateObject();
++    if(status.aliveTime == 0) {
++        cJSON_AddFalseToObject(o, "ok");
++        cJSON_AddNullToObject(o, "ago_s");
++    } else {
++        DWORD diffMs = Utils::getCurrentMs() - status.aliveTime;
++        cJSON_AddTrueToObject(o, "ok");
++        cJSON_AddNumberToObject(o, "ago_s", (int) (diffMs / 1000));
++    }
++    cJSON_AddStringToObject(o, "sign", sign);
++    return o;
++}
++
++static const char *aliveSignName(int aliveSign)
++{
++    switch(aliveSign) {
++        case ALIVE_FWINFO:      return "FW info";
++        case ALIVE_CMD:         return "command";
++        case ALIVE_RW:          return "read or write";
++        case ALIVE_READ:        return "read";
++        case ALIVE_WRITE:       return "write";
++        case ALIVE_IKBD_CMD:    return "IKBD command";
++        case ALIVE_KEYDOWN:     return "key pressed";
++        case ALIVE_MOUSEVENT:   return "mouse";
++        case ALIVE_JOYEVENT:    return "joystick";
++        default:                return "nothing";
++    }
++}
++
++// Name of an input device as the kernel reports it, e.g. "Logitech USB Receiver"
++static cJSON *inputToJson(int type)
++{
++    if(ikbdDevs[type].fd <= 0) {
++        return cJSON_CreateNull();
++    }
++    char name[128];
++    memset(name, 0, sizeof(name));
++    if(ioctl(ikbdDevs[type].fd, EVIOCGNAME(sizeof(name) - 1), name) < 0 || name[0] == 0) {
++        return cJSON_CreateString(ikbdDevs[type].devPath);
++    }
++    return cJSON_CreateString(name);
++}
++
++static cJSON *netToJson(const BYTE *p, bool dhcp)
++{
++    cJSON *o = cJSON_CreateObject();
++    bool up = !(p[0] == 0 || (p[1] == 0 && p[2] == 0 && p[3] == 0 && p[4] == 0));
++    cJSON_AddBoolToObject(o, "up", up);
++    if(up) {
++        char ip[20];
++        snprintf(ip, sizeof(ip), "%d.%d.%d.%d", (int)p[1], (int)p[2], (int)p[3], (int)p[4]);
++        cJSON_AddStringToObject(o, "ip", ip);
++    } else {
++        cJSON_AddNullToObject(o, "ip");
++    }
++    cJSON_AddBoolToObject(o, "dhcp", dhcp);
++    return o;
++}
++
++static void buildStatus(cJSON *root)
++{
++    char str[256];
++
++    //------------------
++    cJSON *hw = cJSON_CreateObject();
++    cJSON_AddNumberToObject(hw, "version", hwConfig.version);
++    cJSON_AddStringToObject(hw, "interface", (hwConfig.hddIface == HDD_IF_ACSI) ? "ACSI" : "SCSI");
++    cJSON_AddStringToObject(hw, "rpi", rpiConfig.model);
++    cJSON_AddStringToObject(hw, "rpi_revision", rpiConfig.revision);
++
++    double uptime = 0;
++    FILE *f = fopen("/proc/uptime", "r");
++    if(f) {
++        if(fscanf(f, "%lf", &uptime) != 1) {
++            uptime = 0;
++        }
++        fclose(f);
++    }
++    cJSON_AddNumberToObject(hw, "uptime_s", (int) uptime);
++
++    memset(str, 0, sizeof(str));
++    gethostname(str, sizeof(str) - 1);
++    cJSON_AddStringToObject(hw, "hostname", str);
++
++    time_t t = time(NULL);
++    struct tm tm = *localtime(&t);
++    snprintf(str, sizeof(str), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
++    cJSON_AddStringToObject(hw, "time", str);
++    cJSON_AddItemToObject(root, "hw", hw);
++
++    //------------------
++    cJSON *ver = cJSON_CreateObject();
++    Version::getAppVersion(str);
++    cJSON_AddStringToObject(ver, "app", str);
++    cJSON_AddItemToObject(ver, "hans",   versionToJson(Update::versions.current.hans));
++    cJSON_AddItemToObject(ver, "franz",  versionToJson(Update::versions.current.franz));
++    cJSON_AddItemToObject(ver, "xilinx", versionToJson(Update::versions.current.xilinx));
++    cJSON_AddItemToObject(root, "versions", ver);
++
++    //------------------
++    cJSON *chips = cJSON_CreateObject();
++    cJSON_AddItemToObject(chips, "hans",      aliveToJson(statuses.hans,    aliveSignName(statuses.hans.aliveSign)));
++    cJSON_AddItemToObject(chips, "franz",     aliveToJson(statuses.franz,   aliveSignName(statuses.franz.aliveSign)));
++    cJSON_AddItemToObject(chips, "hdd_if",    aliveToJson(statuses.hdd,     aliveSignName(statuses.hdd.aliveSign)));
++    cJSON_AddItemToObject(chips, "floppy_if", aliveToJson(statuses.fdd,     aliveSignName(statuses.fdd.aliveSign)));
++    cJSON_AddItemToObject(chips, "ikbd_st",   aliveToJson(statuses.ikbdSt,  aliveSignName(statuses.ikbdSt.aliveSign)));
++    cJSON_AddItemToObject(chips, "ikbd_usb",  aliveToJson(statuses.ikbdUsb, aliveSignName(statuses.ikbdUsb.aliveSign)));
++    cJSON_AddItemToObject(root, "chips", chips);
++
++    //------------------
++    Settings s;
++    AcsiIDinfo aii;
++    s.loadAcsiIDs(&aii);
++
++    cJSON *acsi = cJSON_CreateArray();
++    for(int i=0; i<8; i++) {
++        cJSON *o = cJSON_CreateObject();
++        cJSON_AddNumberToObject(o, "id", i);
++
++        const char *mode;
++        switch(aii.acsiIDdevType[i]) {
++            case DEVTYPE_SD:            mode = "sd";            break;
++            case DEVTYPE_RAW:           mode = "raw";           break;
++            case DEVTYPE_TRANSLATED:    mode = "translated";    break;
++            default:                    mode = "off";           break;
++        }
++        cJSON_AddStringToObject(o, "mode", mode);
++
++        TScsiConf *media = shared.scsi ? shared.scsi->getDevAttachedMedia(i) : NULL;
++        if(media && media->hostSourceType != SOURCETYPE_NONE) {
++            std::string desc;
++            switch(media->hostSourceType) {
++                case SOURCETYPE_IMAGE:                  desc = "HDD image";             break;
++                case SOURCETYPE_IMAGE_TRANSLATEDBOOT:   desc = "translated boot image"; break;
++                case SOURCETYPE_DEVICE:                 desc = "device";                break;
++                case SOURCETYPE_SD_CARD:                desc = "SD card";               break;
++                default:                                desc = "unknown";               break;
++            }
++            if(!media->hostPath.empty()) {
++                desc += ": ";
++                desc += media->hostPath;
++            }
++            if(media->accessType == SCSI_ACCESSTYPE_READ_ONLY) {
++                desc += " (read-only)";
++            }
++            cJSON_AddStringToObject(o, "media", desc.c_str());
++        } else {
++            cJSON_AddNullToObject(o, "media");
++        }
++        cJSON_AddItemToArray(acsi, o);
++    }
++    cJSON_AddItemToObject(root, "acsi", acsi);
++
++    //------------------
++    cJSON *drives = cJSON_CreateArray();
++    TranslatedDisk *translated = TranslatedDisk::getInstance();
++    if(translated) {
++        for(int i=2; i<MAX_DRIVES; i++) {
++            if(!translated->driveIsEnabled(i)) {
++                continue;
++            }
++            cJSON *o = cJSON_CreateObject();
++            snprintf(str, sizeof(str), "%c:", 'A' + i);
++            cJSON_AddStringToObject(o, "letter", str);
++
++            std::string report;
++            translated->driveGetReport(i, report);
++            cJSON_AddStringToObject(o, "source", report.c_str());
++
++            const char *path = translated->driveGetHostPath(i);
++            cJSON_AddStringToObject(o, "path", path ? path : "");
++
++            struct statvfs sv;
++            if(path && path[0] && statvfs(path, &sv) == 0) {
++                cJSON_AddNumberToObject(o, "free_mb",  (double) ((unsigned long long) sv.f_bavail * sv.f_frsize / (1024 * 1024)));
++                cJSON_AddNumberToObject(o, "total_mb", (double) ((unsigned long long) sv.f_blocks * sv.f_frsize / (1024 * 1024)));
++            } else {
++                cJSON_AddNullToObject(o, "free_mb");
++                cJSON_AddNullToObject(o, "total_mb");
++            }
++            cJSON_AddItemToArray(drives, o);
++        }
++    }
++    cJSON_AddItemToObject(root, "drives", drives);
++    cJSON_AddStringToObject(root, "usb_mount", shared.mountRawNotTrans ? "raw" : "translated");
++
++    //------------------
++    cJSON *inputs = cJSON_CreateObject();
++    cJSON_AddItemToObject(inputs, "keyboard", inputToJson(INTYPE_KEYBOARD));
++    cJSON_AddItemToObject(inputs, "mouse",    inputToJson(INTYPE_MOUSE));
++    cJSON_AddItemToObject(inputs, "joy1",     inputToJson(INTYPE_JOYSTICK1));
++    cJSON_AddItemToObject(inputs, "joy2",     inputToJson(INTYPE_JOYSTICK2));
++    cJSON_AddBoolToObject(inputs, "virtual_keyboard", ikbdDevs[INTYPE_VDEVKEYBOARD].fd > 0);
++    cJSON_AddBoolToObject(inputs, "virtual_mouse",    ikbdDevs[INTYPE_VDEVMOUSE].fd > 0);
++    cJSON_AddItemToObject(root, "inputs", inputs);
++
++    //------------------
++    BYTE ipaddrs[10];
++    Utils::getIpAdds(ipaddrs);
++    NetworkSettings ns;
++    ns.load();
++
++    cJSON *net = cJSON_CreateObject();
++    cJSON_AddItemToObject(net, "eth0",  netToJson(ipaddrs,     ns.eth0.dhcpNotStatic));
++    cJSON_AddItemToObject(net, "wlan0", netToJson(ipaddrs + 5, ns.wlan0.dhcpNotStatic));
++    cJSON_AddBoolToObject(net, "wifi_enabled", ns.wlan0.isEnabled);
++    cJSON_AddItemToObject(root, "network", net);
++
++    //------------------
++    cJSON *floppy = cJSON_CreateObject();
++    int active = ImageSilo::getFloppyImageSelectedId();
++    if(active >= 0) {
++        cJSON_AddNumberToObject(floppy, "active", active);
++    } else {
++        cJSON_AddNullToObject(floppy, "active");
++    }
++    cJSON *slots = cJSON_CreateArray();
++    for(int i=0; i<3; i++) {
++        SiloSlotSimple *slot = ImageSilo::getFloppyImageSimple(i);
++        if(slot && slot->imageFile.length() > 0) {
++            cJSON_AddItemToArray(slots, cJSON_CreateString(slot->imageFile.c_str()));
++        } else {
++            cJSON_AddItemToArray(slots, cJSON_CreateNull());
++        }
++    }
++    cJSON_AddItemToObject(floppy, "slots", slots);
++    cJSON_AddItemToObject(root, "floppy", floppy);
++}
++
++bool StatusResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo /*=""*/ )
++{
++    if(strcmp(req_info->request_method, "GET") != 0) {
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
++        return true;
++    }
++
++    cJSON *root = cJSON_CreateObject();
++    buildStatus(root);
++    char *json = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++
++    std::string sJson = json ? json : "{}";
++    free(json);
++
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n");
++    mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) sJson.length());
++    mg_write(conn, sJson.c_str(), sJson.length());
++    return true;
++}
+diff --git a/ce_main_app/webserver/api/resource/statusresource.h b/ce_main_app/webserver/api/resource/statusresource.h
+new file mode 100644
+index 00000000..043cfb5b
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/statusresource.h
+@@ -0,0 +1,19 @@
++#ifndef STATUSRESOURCE_H
++#define	STATUSRESOURCE_H
++
++#include <string>
++
++#include "../../CivetServer.h"
++
++#include "iapiresource.h"
++
++// GET /api/v1/status: the device status report (as /app/status/) as JSON,
++// for the web UI's Overview page.
++class StatusResource : public IApiResource {
++public:
++    StatusResource();
++    virtual ~StatusResource();
++    bool dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo="" );
++};
++
++#endif
+diff --git a/ce_main_app/webserver/api/router/apiv1router.cpp b/ce_main_app/webserver/api/router/apiv1router.cpp
+index c00cf33e..606d8710 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.cpp
++++ b/ce_main_app/webserver/api/router/apiv1router.cpp
+@@ -18,6 +18,7 @@ ApiV1Router::ApiV1Router(VirtualKeyboardService* pxVKbdService,VirtualMouseServi
+     pxFloppy=new FloppyResource(pxFloppyService);
+     pxDownload=new DownloadResource(pxFloppyService);
+     pxConfig=new ConfigResource();
++    pxStatus=new StatusResource();
+ }
+ 
+ ApiV1Router::~ApiV1Router()
+@@ -28,6 +29,8 @@ ApiV1Router::~ApiV1Router()
+     delete pxFloppy;
+     delete pxConfig;
+     delete pxDownload;
++    delete pxStatus;
++    pxStatus=NULL;
+     pxMouse=NULL;
+     pxKeyboard=NULL;
+     pxFloppy=NULL;
+@@ -85,6 +88,10 @@ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+         sResourceInfo.erase(0,7);
+         bool processed=pxConfig->dispatch(conn,req_info,sResourceInfo);
+         return processed;
++    } else if( sResource=="status" )
++    {
++        bool processed=pxStatus->dispatch(conn,req_info);
++        return processed;
+     } else if( sResource.substr(0,8)=="download" )
+     {
+         std::string sResourceInfo=sResource;
+diff --git a/ce_main_app/webserver/api/router/apiv1router.h b/ce_main_app/webserver/api/router/apiv1router.h
+index 5f0230c2..cf5906d1 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.h
++++ b/ce_main_app/webserver/api/router/apiv1router.h
+@@ -12,6 +12,7 @@
+ #include "../resource/floppyresource.h"
+ #include "../resource/configresource.h"
+ #include "../resource/downloadresource.h"
++#include "../resource/statusresource.h"
+ 
+ class ApiV1Router: public CivetHandler
+ {
+@@ -27,6 +28,7 @@ private:
+     FloppyResource *pxFloppy;
+     ConfigResource *pxConfig;
+ 	DownloadResource *pxDownload;
++    StatusResource *pxStatus;
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,217 @@
+From e37d1e82065ea86fc1723d204ec838db8a98f4b5 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:21:21 +0100
+Subject: [PATCH] ce_main_app: add, make and delete files in hard disk images
+ (Look inside)
+
+POST /api/v1/settings/hddimage/inspectwrite?op=put&path=&part=&dir=&name=
+[&overwrite=1] with the file as the body (application/octet-stream, at
+most 64 MB), op=mkdir (&dir=&name=), op=rm (&file=: a file, or a folder
+with what's in it). Done by /usr/sbin/ce-hdinspect: only images the ST has
+on no ID, opened writable for that one change; FAT (GEMDOS) names become
+8.3 in capitals. The body goes straight to the tool's stdin (no copy); a
+name already there answers 409 with "exists".
+
+Attaching an image while a change is written into it is refused
+(/run/ce-hdinspect/writing).
+---
+ .../api/resource/settingsresource.cpp         | 124 +++++++++++++++++-
+ .../webserver/api/resource/settingsresource.h |   4 +-
+ 2 files changed, 123 insertions(+), 5 deletions(-)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 42c66b3c..a21108f6 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -1074,6 +1074,16 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+             msg = "The image must be on a USB drive, the shared drive or /storage (a path under /mnt/ or /storage/).";
+             return false;
+         }
++        // being changed in Look inside (ce-hdinspect names it while it writes)
++        {
++            char w[PATH_MAX] = "";
++            FILE *wf = fopen("/run/ce-hdinspect/writing", "r");
++            if(wf) {
++                if(fgets(w, sizeof(w), wf)) w[strcspn(w, "\n")] = 0;
++                fclose(wf);
++            }
++            if(w[0] && strcmp(w, real) == 0) { msg = "A change is being written into this image (Look inside): try again in a moment."; return false; }
++        }
+         path = real;
+         if(!S_ISREG(st.st_mode))               { msg = "That's not a regular file."; return false; }
+         if(path.find("/mnt/shared/") == 0) warning = "An HDD image on the network isn't safe: a dropped connection can corrupt it.";
+@@ -1147,25 +1157,50 @@ void SettingsResource::sendError(mg_connection *conn, int code, const char *mess
+ // run a program without a shell (arguments from requests can't become
+ // commands); its stdout into out (at most maxOut bytes), or as a chunked
+ // response to conn. Returns the exit status (-1: couldn't run).
+-static int runArgv(const std::vector<std::string> &args, std::string *out, size_t maxOut, mg_connection *stream)
++// bodyFrom: the request body (bodyLen bytes) goes to the program's stdin
++// (all of it is read from the connection, also when the program stops early)
++static int runArgv(const std::vector<std::string> &args, std::string *out, size_t maxOut, mg_connection *stream,
++                   mg_connection *bodyFrom = NULL, long long bodyLen = 0)
+ {
+     std::vector<char *> argv;                   // made before fork: the child mustn't allocate (other threads)
+     for(size_t i = 0; i < args.size(); i++) argv.push_back((char *) args[i].c_str());
+     argv.push_back(NULL);
+-    int fds[2];
++    int fds[2], ins[2] = { -1, -1 };
+     if(pipe(fds) != 0) return -1;
++    if(bodyFrom && pipe(ins) != 0) { close(fds[0]); close(fds[1]); return -1; }
+     pid_t pid = fork();
+-    if(pid < 0) { close(fds[0]); close(fds[1]); return -1; }
++    if(pid < 0) { close(fds[0]); close(fds[1]); if(ins[0] >= 0) { close(ins[0]); close(ins[1]); } return -1; }
+     if(pid == 0) {
+         dup2(fds[1], 1);
+         int nul = open("/dev/null", O_RDWR);
+-        if(nul >= 0) { dup2(nul, 0); dup2(nul, 2); }
++        if(nul >= 0) { dup2(ins[0] >= 0 ? ins[0] : nul, 0); dup2(nul, 2); }
+         long maxFd = sysconf(_SC_OPEN_MAX);
+         for(long fd = 3; fd < (maxFd > 0 ? maxFd : 1024); fd++) close(fd);
+         execv(argv[0], &argv[0]);
+         _exit(127);
+     }
+     close(fds[1]);
++    if(bodyFrom) {
++        // the program says little until it has read everything (its output
++        // fits the pipe), so writing all of the body first can't deadlock
++        close(ins[0]);
++        std::vector<char> inv(65536);                    // per request: requests run in parallel
++        char *inBuf = &inv[0];
++        long long got = 0;
++        bool feeding = true;
++        while(got < bodyLen) {
++            int r = mg_read(bodyFrom, inBuf, (size_t) std::min<long long>((long long) inv.size(), bodyLen - got));
++            if(r <= 0) break;
++            got += r;
++            for(int w = 0; feeding && w < r; ) {
++                ssize_t n = write(ins[1], inBuf + w, r - w);
++                if(n < 0 && errno == EINTR) continue;
++                if(n <= 0) { feeding = false; break; }       // it stopped reading (EPIPE: SIGPIPE is ignored)
++                w += n;
++            }
++        }
++        close(ins[1]);
++    }
+     std::vector<char> buf(65536);
+     ssize_t n;
+     bool ok = true;
+@@ -1310,6 +1345,83 @@ void SettingsResource::inspectImage(mg_connection *conn, mg_request_info *req_in
+     sendJson(conn, root);
+ }
+ 
++// POST /api/v1/settings/hddimage/inspectwrite?op=put&path=&part=&dir=&name=[&overwrite=1]
++//      body: the file (application/octet-stream, at most HDINSPECT_PUT_MAX_MB)
++// POST ...?op=mkdir&path=&part=&dir=&name=       a folder
++// POST ...?op=rm&path=&part=&file=                a file or a folder (with what's in it)
++// Only images the ST has on no ID (ce-hdinspect checks); FAT names become 8.3.
++#define HDINSPECT_PUT_MAX_MB    64
++
++void SettingsResource::inspectWrite(mg_connection *conn, mg_request_info *req_info)
++{
++    const char *qs = req_info->query_string ? req_info->query_string : "";
++    char path[PATH_MAX], part[8] = "", op[16] = "", dir[PATH_MAX] = "", name[256] = "", file[PATH_MAX] = "", over[8] = "";
++    std::string real, kind;
++    mg_get_var(qs, strlen(qs), "op", op, sizeof(op));
++    bool put = strcmp(op, "put") == 0;
++    long long total = 0;
++    if(put) {
++        const char *ctype = mg_get_header(conn, "Content-Type");
++        if(!ctype || strncasecmp(ctype, "application/octet-stream", 24) != 0) { sendError(conn, 415, "Content-Type must be application/octet-stream"); return; }
++        const char *len = mg_get_header(conn, "Content-Length");
++        total = len ? atoll(len) : -1;
++        if(total < 0) { sendError(conn, 411, "Content-Length needed"); return; }
++        if(total > (long long) HDINSPECT_PUT_MAX_MB * 1024 * 1024) {
++            char b[160];
++            snprintf(b, sizeof(b), "That's too large to upload into an image here (at most %d MB): copy it to a translated drive instead.", HDINSPECT_PUT_MAX_MB);
++            sendError(conn, 413, b);
++            return;
++        }
++    }
++    if(mg_get_var(qs, strlen(qs), "path", path, sizeof(path)) <= 0 || !listedImage(path, real, kind)) { sendError(conn, 404, "no such image"); return; }
++    mg_get_var(qs, strlen(qs), "part", part, sizeof(part));
++    mg_get_var(qs, strlen(qs), "dir", dir, sizeof(dir));
++    mg_get_var(qs, strlen(qs), "name", name, sizeof(name));
++    mg_get_var(qs, strlen(qs), "file", file, sizeof(file));
++    mg_get_var(qs, strlen(qs), "overwrite", over, sizeof(over));
++    if(!part[0]) { sendError(conn, 400, "which partition?"); return; }
++    for(const char *c = part; *c; c++) if(*c < '0' || *c > '9') { sendError(conn, 400, "bad partition"); return; }
++
++    std::vector<std::string> args;
++    args.push_back(HDINSPECT_TOOL);
++    char size[32];
++    snprintf(size, sizeof(size), "%lld", total);
++    if(put || strcmp(op, "mkdir") == 0) {
++        if(!name[0]) { sendError(conn, 400, "which name?"); return; }
++        args.push_back(op); args.push_back(real); args.push_back(part); args.push_back(dir[0] ? dir : "/"); args.push_back(name);
++        if(put) { args.push_back(size); if(over[0] == '1') args.push_back("overwrite"); }
++    } else if(strcmp(op, "rm") == 0) {
++        if(!file[0]) { sendError(conn, 400, "which file?"); return; }
++        args.push_back("rm"); args.push_back(real); args.push_back(part); args.push_back(file);
++    } else {
++        sendError(conn, 400, "op: put, mkdir or rm");
++        return;
++    }
++
++    std::string out;
++    int rc = runArgv(args, &out, 1 << 16, NULL, put ? conn : NULL, total);
++    std::string err = lineValue(out, "error"), exists = lineValue(out, "exists");
++    if(rc != 0) {
++        if(!exists.empty()) {
++            cJSON *e = cJSON_CreateObject();
++            cJSON_AddStringToObject(e, "error", err.c_str());
++            cJSON_AddStringToObject(e, "exists", exists.c_str());
++            sendJson(conn, e, 409);
++        } else {
++            sendError(conn, 400, err.empty() ? "can't change the image" : err.c_str());
++        }
++        return;
++    }
++    Debug::out(LOG_INFO, "SettingsResource: %s in %s (partition %s): %s", op, real.c_str(), part, put || op[0] == 'm' ? name : file);
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddBoolToObject(root, "ok", true);
++    std::string n = lineValue(out, "name"), d = lineValue(out, "deleted");
++    if(!n.empty()) cJSON_AddStringToObject(root, "name", n.c_str());
++    if(!d.empty()) cJSON_AddStringToObject(root, "deleted", d.c_str());
++    if(put) cJSON_AddNumberToObject(root, "size", (double) total);
++    sendJson(conn, root);
++}
++
+ // GET /api/v1/settings/hddimage/download?path=<image>: the file itself
+ void SettingsResource::downloadImage(mg_connection *conn, mg_request_info *req_info)
+ {
+@@ -1353,6 +1465,10 @@ bool SettingsResource::dispatch(mg_connection *conn, mg_request_info *req_info,
+         downloadImage(conn, req_info);
+         return true;
+     }
++    if(section == "hddimage/inspectwrite" && strcmp(req_info->request_method, "POST") == 0) {
++        inspectWrite(conn, req_info);
++        return true;
++    }
+     if((section == "hddimage/inspect" || section == "hddimage/inspectfile") && strcmp(req_info->request_method, "GET") == 0) {
+         inspectImage(conn, req_info, section == "hddimage/inspectfile");
+         return true;
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+index 6f1dcd29..46c738a6 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.h
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -24,7 +24,8 @@ struct cJSON;
+ // GET /api/v1/settings/hddimage/download?path=<image> for the file; the
+ // section lists the images there and in USB drives' top folders.
+ // GET .../hddimage/inspect?path=[&part=&dir=] and .../inspectfile?path=&part=&file=
+-// look inside an image (partitions, folders, files; /usr/sbin/ce-hdinspect).
++// look inside an image (partitions, folders, files; /usr/sbin/ce-hdinspect);
++// POST .../hddimage/inspectwrite?op=put|mkdir|rm changes one (not attached).
+ // Secrets are never returned: the shared drive password and the Wi-Fi key
+ // are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
+ // null) to keep them, send "" to clear.
+@@ -41,6 +42,7 @@ private:
+ 
+     void downloadImage(mg_connection *conn, mg_request_info *req_info);
+     void inspectImage(mg_connection *conn, mg_request_info *req_info, bool file);
++    void inspectWrite(mg_connection *conn, mg_request_info *req_info);
+     void sendJson(mg_connection *conn, cJSON *root, int code = 200);
+     void sendError(mg_connection *conn, int code, const char *message);
+ };
+-- 
+2.54.0 (Apple Git-157)
+

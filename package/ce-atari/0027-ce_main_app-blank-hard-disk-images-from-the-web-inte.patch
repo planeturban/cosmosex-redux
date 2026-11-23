@@ -1,0 +1,151 @@
+From e382c402b8f181926e0890de182d33540418ae13 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:42:20 +0100
+Subject: [PATCH] ce_main_app: blank hard disk images from the web interface
+
+PUT /api/v1/settings/hddimage {"create": {"name", "sizeMB"}} makes a new
+image of zeros in /storage/hdd_images, like mkfile: the space reserved
+with posix_fallocate (quick on ext4), owned by user pi, never replacing a
+file, and only with 64 MB left free.
+
+Also: the check that an image is under /storage/ compared 4 characters.
+---
+ .../api/resource/settingsresource.cpp         | 86 ++++++++++++++++++-
+ .../webserver/api/resource/settingsresource.h |  3 +
+ 2 files changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index dde7784a..235fb28c 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -14,6 +14,8 @@
+ #include <strings.h>
+ #include <ctype.h>
+ #include <sys/stat.h>
++#include <sys/statvfs.h>
++#include <fcntl.h>
+ #include <dirent.h>
+ #include <unistd.h>
+ #include <errno.h>
+@@ -406,6 +408,76 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+     return false;
+ }
+ 
++// A new blank hard disk image in HDD_IMAGES_DIR, like "mkfile 1024m": all
++// zeros, the space reserved (posix_fallocate: quick on ext4, and the image
++// can't run out of room later). Owned by user pi like the folder's other
++// files, so it can be changed over SMB and NFS. Never replaces a file.
++#define HDD_CREATE_MAX_MB   (64 * 1024)
++#define HDD_KEEP_FREE_MB    64              // left free on the storage
++
++static bool createBlankImage(cJSON *create, std::string &msg, std::string &created)
++{
++    cJSON *jn = cJSON_GetObjectItem(create, "name");
++    cJSON *js = cJSON_GetObjectItem(create, "sizeMB");
++    std::string name = (jn && jn->type == cJSON_String && jn->valuestring) ? jn->valuestring : "";
++    while(!name.empty() && name[name.length() - 1] == ' ') name.erase(name.length() - 1);
++    while(!name.empty() && name[0] == ' ') name.erase(0, 1);
++    if(name.empty() || name.length() > 64 || name[0] == '.') {
++        msg = "Give the image a name (at most 64 characters, not starting with a dot).";
++        return false;
++    }
++    for(size_t i=0; i<name.length(); i++) {
++        char c = name[i];
++        if(!isalnum((unsigned char) c) && c != '.' && c != '_' && c != '-' && c != ' ') {
++            msg = "The name may have letters, digits, spaces and . _ - only.";
++            return false;
++        }
++    }
++    if(name.find('.') == std::string::npos) name += ".img";
++    if(isNotesFile(name)) { msg = "The name can't end in .json (that's for the notes)."; return false; }
++
++    if(!js || js->type != cJSON_Number || js->valuedouble < 1 || js->valuedouble > HDD_CREATE_MAX_MB || js->valuedouble != (double) (long) js->valuedouble) {
++        msg = "The size must be a whole number of MB, 1 to 65536.";
++        return false;
++    }
++    long sizeMB = (long) js->valuedouble;
++
++    std::string full = std::string(HDD_IMAGES_DIR "/") + name;
++    struct stat st;
++    if(lstat(full.c_str(), &st) == 0) { msg = "There's already a file called " + name + "."; return false; }
++
++    struct statvfs fs;
++    if(statvfs(HDD_IMAGES_DIR, &fs) != 0) { msg = HDD_IMAGES_DIR " isn't there (is the CosmosEx's storage mounted?)."; return false; }
++    unsigned long long freeMB = ((unsigned long long) fs.f_bavail * fs.f_frsize) / (1024 * 1024);
++    if((unsigned long long) sizeMB + HDD_KEEP_FREE_MB > freeMB) {
++        char b[160];
++        snprintf(b, sizeof(b), "Not enough room: %llu MB free on the storage, %ld MB needed (and %d MB kept free).", freeMB, sizeMB, HDD_KEEP_FREE_MB);
++        msg = b;
++        return false;
++    }
++
++    int fd = open(full.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0664);
++    if(fd < 0) {
++        msg = (errno == EEXIST) ? "There's already a file called " + name + "." : "Couldn't create " + name + ": " + strerror(errno) + ".";
++        return false;
++    }
++    off_t bytes = (off_t) sizeMB * 1024 * 1024;
++    int rc = posix_fallocate(fd, 0, bytes);
++    if(rc == EOPNOTSUPP || rc == EINVAL) rc = (ftruncate(fd, bytes) == 0) ? 0 : errno;     // not ext4: a sparse file
++    if(rc != 0) {
++        close(fd);
++        unlink(full.c_str());
++        msg = "Couldn't make " + name + ": " + strerror(rc) + ".";
++        return false;
++    }
++    if(fchown(fd, 1000, 1000) != 0) { /* stays root's; the folder's group still applies */ }
++    fsync(fd);
++    close(fd);
++    Debug::out(LOG_INFO, "SettingsResource: created blank HDD image %s (%ld MB)", full.c_str(), sizeMB);
++    created = full;
++    return true;
++}
++
+ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::string &msg, std::string &warning)
+ {
+     if(name == "storageshare") {
+@@ -694,6 +766,18 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+     }
+ 
+     if(name == "hddimage") {                                // onHddImageSave(), without the usb/shared shortcuts
++        // {"create": {"name": "games", "sizeMB": 1024}}: only make a new blank image
++        cJSON *create = cJSON_GetObjectItem(in, "create");
++        if(create) {
++            std::string created;
++            if(create->type != cJSON_Object || !createBlankImage(create, msg, created)) {
++                if(msg.empty()) msg = "\"create\" must be an object.";
++                return false;
++            }
++            Utils::forceSync();
++            return true;
++        }
++
+         // notes about images in HDD_IMAGES_DIR: {"notes": {"<image file>": "text", ...}}
+         cJSON *notes = cJSON_GetObjectItem(in, "notes");
+         if(notes && notes->type == cJSON_Object) {
+@@ -726,7 +810,7 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+             // this file, and the web API has no login (stricter than the
+             // config screen, which takes any path)
+             char real[PATH_MAX];
+-            if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/storage/", 4) != 0)) {
++            if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/storage/", 9) != 0)) {
+                 msg = "The image must be on a USB drive, the shared drive or /storage (a path under /mnt/ or /storage/).";
+                 return false;
+             }
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+index 6b5ac2df..956f11e6 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.h
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -17,6 +17,9 @@ struct cJSON;
+ // Sections: acsi, translated, shared, floppy, network, ikbd, other, hddimage,
+ // storageshare (/storage over NFS and SMB, storageshare.cpp; its SMB password is set with
+ // "password" and reported as "passwordSet").
++// hddimage also takes {"create": {"name": "games", "sizeMB": 1024}}: a new
++// blank image in /storage/hdd_images (".img" added to a name without a dot),
++// nothing else changed.
+ // Secrets are never returned: the shared drive password and the Wi-Fi key
+ // are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
+ // null) to keep them, send "" to clear.
+-- 
+2.54.0 (Apple Git-157)
+

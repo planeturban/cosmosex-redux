@@ -1,0 +1,88 @@
+From 6546cb6998486128fe889e8f5f1db76eff6321b5 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:23:16 +0100
+Subject: [PATCH] ce_main_app: system update from an image on a USB stick
+
+The update status lists system images in the top folder of USB sticks
+("usbImages", from ce-sysupdate); POST /api/v1/system/update/usb
+{"path"} installs one (a .img or .img.xz under /mnt/, not the shared
+drive).
+---
+ .../webserver/api/resource/systemresource.cpp | 33 ++++++++++++++++++-
+ .../webserver/api/resource/systemresource.h   |  1 +
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 09c7be08..bfb098b4 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -150,6 +150,16 @@ void SystemResource::sendStatus(mg_connection *conn)
+         if(eq == std::string::npos || eq == 0) continue;
+         std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+         cJSON *obj = root;
++        if(k == "usb") {                                        // images on USB sticks: path|size MB
++            cJSON *arr = cJSON_GetObjectItem(root, "usbImages");
++            if(!arr) { arr = cJSON_CreateArray(); cJSON_AddItemToObject(root, "usbImages", arr); }
++            size_t bar = v.rfind('|');
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddStringToObject(o, "path", v.substr(0, bar).c_str());
++            cJSON_AddNumberToObject(o, "sizeMB", bar == std::string::npos ? 0 : atof(v.substr(bar + 1).c_str()));
++            cJSON_AddItemToArray(arr, o);
++            continue;
++        }
+         if(k.compare(0, 7, "latest_") == 0) {                   // latest_version -> latest.version
+             if(!latest) { latest = cJSON_CreateObject(); cJSON_AddItemToObject(root, "latest", latest); }
+             obj = latest;
+@@ -273,8 +283,10 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         sendError(conn, 415, "Content-Type must be application/json");
+         return true;
+     }
++    std::string body;                                       // small JSON (only "usb" uses it)
+     char drain[256];
+-    while(mg_read(conn, drain, sizeof(drain)) > 0) { }      // the body isn't used
++    int dn;
++    while((dn = mg_read(conn, drain, sizeof(drain))) > 0) if(body.length() < 4096) body.append(drain, dn);
+ 
+     if(what == "check") {
+         std::string out;
+@@ -284,6 +296,25 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         sendStatus(conn);
+         return true;
+     }
++    if(what == "usb") {                                     // {"path": an image on a USB stick}
++        cJSON *in = cJSON_Parse(body.c_str());
++        cJSON *jp = in ? cJSON_GetObjectItem(in, "path") : NULL;
++        std::string path = (jp && jp->type == cJSON_String && jp->valuestring) ? jp->valuestring : "";
++        if(in) cJSON_Delete(in);
++        char real[PATH_MAX];
++        bool okName = path.length() > 4 && (path.compare(path.length() - 4, 4, ".img") == 0 ||
++                      (path.length() > 7 && path.compare(path.length() - 7, 7, ".img.xz") == 0));
++        if(!okName || path.find("..") != std::string::npos || path.find('\'') != std::string::npos || !realpath(path.c_str(), real) ||
++           strncmp(real, "/mnt/", 5) != 0 || strncmp(real, "/mnt/shared/", 12) == 0) {
++            sendError(conn, 400, "Not a system image on a USB stick.");
++            return true;
++        }
++        if(isBusy()) { sendError(conn, 409, "An update is running."); return true; }
++        if(!startTool(std::string("install '") + real + "'")) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
++        usleep(300 * 1000);
++        sendStatus(conn);
++        return true;
++    }
+     if(what == "online" || what == "keep" || what == "back" || what == "previous") {
+         if(what == "online" && isBusy()) { sendError(conn, 409, "An update is running."); return true; }
+         if(!startTool(what)) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index ac124b86..18d17ed0 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -16,6 +16,7 @@
+ //   POST /api/v1/system/update/upload     the body is an SD card image (.img or .img.xz),
+ //                                         Content-Type application/octet-stream,
+ //                                         X-File-Name: its name; installed like online
++//   POST /api/v1/system/update/usb        {"path"}: an image on a USB stick (status: usbImages)
+ //   POST /api/v1/system/update/keep       while trying a new system: keep it
+ //   POST /api/v1/system/update/back       ... or restart into the old one
+ //   POST /api/v1/system/update/previous   restart into the system installed before
+-- 
+2.54.0 (Apple Git-157)
+

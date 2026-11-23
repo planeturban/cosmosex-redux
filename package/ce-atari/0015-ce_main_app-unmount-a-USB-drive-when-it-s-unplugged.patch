@@ -1,0 +1,53 @@
+From 44b95e5117ba33db9ef091da1541904f3d394858 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:44:49 +0100
+Subject: [PATCH 15/16] ce_main_app: unmount a USB drive when it's unplugged
+
+When a USB drive was pulled out, the app detached it from the Atari but
+left it mounted until a reboot: the stale mount kept the kernel's device
+name busy, so the next stick became sdb, sdc, ... Now the app also asks
+the mounter to unmount it; if a file on it is still open, the unmount
+is done lazily (MNT_DETACH), as the device is gone anyway.
+---
+ ce_main_app/devfinder.cpp | 9 +++++++++
+ ce_main_app/mounter.cpp   | 4 ++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/ce_main_app/devfinder.cpp b/ce_main_app/devfinder.cpp
+index fc23c14c..249af74b 100644
+--- a/ce_main_app/devfinder.cpp
++++ b/ce_main_app/devfinder.cpp
+@@ -334,6 +334,15 @@ void DevFinder::onDevDetached(std::string devName)
+ 	    for (it = ret.first; it != ret.second; ++it) {					// now go through the list of device - host_path pairs and unmount them
+ 		    std::string hostPath = it->second;							// retrieve just the host path
+ 		    translated->detachFromHostPath(hostPath);		    // now try to detach this from translated drives
++
++            // The drive is gone: unmount it too (before, it stayed mounted until
++            // a reboot, and the next stick got the next name: sdb, sdc, ...)
++            if(hostPath.find("/mnt/") == 0 && hostPath != "/mnt/shared") {
++                TMounterRequest tmr;
++                tmr.action      = MOUNTER_ACTION_UMOUNT;
++                tmr.mountDir    = hostPath;
++                Mounter::add(tmr);
++            }
+     	}
+         translated->mutexUnlock();
+     }
+diff --git a/ce_main_app/mounter.cpp b/ce_main_app/mounter.cpp
+index f9b15dce..7d262e3d 100644
+--- a/ce_main_app/mounter.cpp
++++ b/ce_main_app/mounter.cpp
+@@ -456,6 +456,10 @@ bool Mounter::tryUnmount(const char *mountDir)
+ 
+     Debug::out(LOG_DEBUG, "Mounter::tryUnmount - umount(\"%s\")", mountDir);
+     if(umount(mountDir) < 0) {
++        if(errno == EBUSY && umount2(mountDir, MNT_DETACH) == 0) {     // still in use (e.g. a file open on a removed drive): detach now, the kernel finishes when it's closed
++            Debug::out(LOG_DEBUG, "Mounter::tryUnmount - busy, detached lazily\n");
++            return true;
++        }
+         Debug::out(LOG_ERROR, "Mounter::tryUnmount - umount failed : %s", strerror(errno));
+         return false;
+     } else {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,3 @@
+# The app uses /dev/serial0 for IKBD, the flash scripts /dev/ttyAMA0. With
+# dtoverlay=disable-bt both are the PL011 on GPIO14/15 (as on Raspbian).
+KERNEL=="ttyAMA0", SYMLINK+="serial0", GROUP="dialout", MODE="0660"

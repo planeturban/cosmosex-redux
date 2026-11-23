@@ -1,0 +1,176 @@
+#!/bin/sh
+#
+# Start CosmosEx, as early in boot as possible.
+#
+# Normal boot: start the cesuper.sh supervisor directly; it starts the app.
+# When chips need flashing (firmware version changed, doflash.txt, or a
+# FW_FLASH_* request), go the stock way instead (releases: initd_cosmosex,
+# cosmosex.service): /ce/ce_start.sh runs check_and_flash_chips.sh, then
+# starts cesuper.sh, which starts the app.
+#
+# The stock way also runs "cosmosex hwinfo" on every boot to catch a Xilinx
+# HW/FW mismatch. The app checks that itself on every start (it then writes
+# the Xilinx update script and exits, and cesuper.sh runs it), so skipping it
+# on normal boots saves a full chip reset and query.
+#
+# Naming: not "cosmosex", because ce_update.sh deletes /etc/init.d/cosmosex,
+# and not containing "cosmosex" at all, because ce_start.sh/ce_stop.sh decide
+# whether the app runs with "ps -A | grep cosmosex".
+
+SEED=/usr/share/cosmosex/ce
+CE=/ce
+BOOT=/boot
+LOG=/var/log/ceapp-init.log
+
+log() {
+	echo "ceapp: $*"
+	echo "$(date '+%F %T') [$(cut -d' ' -f1 /proc/uptime)s] $*" >> "$LOG"
+}
+
+seed_ce() {
+	if [ ! -x "$CE/app/cosmosex" ]; then
+		log "first boot: copying $SEED to $CE"
+		mkdir -p "$CE"
+		cp -a "$SEED/." "$CE/"
+	fi
+
+	# The release's Pi binaries are built for Raspbian Stretch (its glibc and
+	# libraries) and don't run on this image, 32-bit or 64-bit.
+	# ce_update.sh (patched) puts the image's builds back after an update;
+	# this repairs anything an interrupted or manual update left behind.
+	# check_for_update.sh too: the image's says "no online update" (patch 0002);
+	# and the ST's driver CE_DD.PRG (built with the image's patches).
+	for f in app/cosmosex update/flash_stm32 update/flash_xilinx ce_update.sh update/check_for_update.sh \
+		app/configdrive/drivers/ce_dd.prg; do
+		if ! cmp -s "$SEED/$f" "$CE/$f"; then
+			cp -f "$SEED/$f" "$CE/$f.new" && mv -f "$CE/$f.new" "$CE/$f"
+			log "restored $f from the image"
+		fi
+	done
+
+	# All CosmosEx units already carry the shipped chip firmware, so record it
+	# as current instead of letting check_and_flash_chips.sh flash every chip
+	# (it flashes whenever a .current file is missing). To force a flash, put
+	# doflash.txt on the boot partition.
+	for chip in hans franz; do
+		if [ ! -e "$CE/update/$chip.current" ]; then
+			cp "$CE/update/$chip.version" "$CE/update/$chip.current"
+			log "seeded $chip.current ($(cat "$CE/update/$chip.current"))"
+		fi
+	done
+
+	# check_and_flash_chips.sh compares xilinx.current with xilinx_used.version,
+	# a symlink update_xilinx.sh creates after detecting the chip type. While
+	# that symlink is missing, the script's expected version defaults to 1.
+	if [ ! -e "$CE/update/xilinx.current" ] && [ ! -e "$CE/update/xilinx_used.version" ]; then
+		echo 1 > "$CE/update/xilinx.current"
+		log "seeded xilinx.current"
+	fi
+	sync
+}
+
+# Same decision as update/check_and_flash_chips.sh (same files and defaults).
+read_or() {
+	if [ -f "$1" ]; then cat "$1"; else echo "$2"; fi
+}
+
+needs_flash() {
+	[ -f /tmp/FW_FLASH_ALL ] && return 0
+	[ -f /tmp/FW_FLASH_XILINX ] && return 0
+	[ "$(read_or "$CE/update/hans.version" 1)" != "$(read_or "$CE/update/hans.current" 0)" ] && return 0
+	[ "$(read_or "$CE/update/franz.version" 1)" != "$(read_or "$CE/update/franz.current" 0)" ] && return 0
+	[ "$(read_or "$CE/update/xilinx_used.version" 1)" != "$(read_or "$CE/update/xilinx.current" 0)" ] && return 0
+	return 1
+}
+
+finish_doflash() {
+	if mount -o remount,rw "$BOOT"; then
+		cp /tmp/doflash.log "$BOOT/doflash.log"
+		mv "$BOOT/doflash.txt" "$BOOT/doflash.done"
+		sync
+		mount -o remount,ro "$BOOT"
+	else
+		log "could not remount $BOOT read-write; doflash.txt left in place"
+	fi
+	cat /tmp/doflash.log >> "$LOG"
+	log "doflash finished, log in $BOOT/doflash.log"
+}
+
+start() {
+	log "init start"
+	# Files the app makes are group-writable: on /storage (setgid, group pi) the
+	# computers that use it over NFS (mapped to the user pi) can change them
+	umask 002
+	# Boot marker for ce-boottime (ce.log keeps entries from earlier boots)
+	echo "===== ceapp: boot, init start at $(cut -d' ' -f1 /proc/uptime)s =====" >> /var/log/ce.log
+	seed_ce
+
+	# udev adds this link too, but the app opens /dev/serial0 once at start,
+	# before udev runs.
+	[ -e /dev/serial0 ] || ln -s ttyAMA0 /dev/serial0
+
+	# Secrets readable by root only: the settings (shared drive password,
+	# web password hash) and the Wi-Fi password (the app writes it 600 now;
+	# also cards set up before)
+	mkdir -p "$CE/settings" && chmod 700 "$CE/settings"
+	chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null
+
+	# Zipped floppy images are unpacked to /storage/floppy_disks (the app's
+	# unpack cache, patch 0030), or to /run/ce-floppy (RAM) without /storage
+
+	# The config drive (the Atari's drive with ce_conf.tos and the drivers):
+	# the app copies it to /tmp/configdrive at each start. /tmp is RAM, up to
+	# half of it: the Atari saw ~480 MB free there, and what it writes there
+	# uses the Pi's memory. Its own small RAM disk instead (the app's
+	# "rm -rf" then only empties it; the mount stays across app restarts).
+	if ! mountpoint -q /tmp/configdrive; then
+		mkdir -p /tmp/configdrive
+		mount -t tmpfs -o size=8m,mode=755,nosuid,nodev configdrive /tmp/configdrive
+	fi
+
+	rm -f "$CE/update/doupdate.sh"      # as ce_start.sh does
+
+	if [ -f /data/ce-flash/request ] && [ -x /usr/sbin/ce-flash ]; then
+		# chips to flash, asked for in the web interface: flash them, then
+		# start the app (ce-flash keeps the request until it's done)
+		log "flashing $(sed -n 's/^chips=//p' /data/ce-flash/request) (asked for in the web interface)"
+		( /usr/sbin/ce-flash boot > /dev/null 2>&1
+		  log "flash: $(sed -n 's/^message=//p' /data/ce-flash/last)"
+		  "$CE/cesuper.sh" > /dev/null 2>&1 ) &
+	elif [ -f "$BOOT/doflash.txt" ]; then
+		log "doflash.txt found: flashing all chips"
+		touch /tmp/FW_FLASH_ALL
+		( "$CE/ce_start.sh" nosystemctl > /tmp/doflash.log 2>&1; finish_doflash ) &
+	elif needs_flash; then
+		log "chip firmware differs from the recorded version: starting via ce_start.sh"
+		"$CE/ce_start.sh" nosystemctl > /dev/null 2>&1 &
+	else
+		# cesuper.sh starts the app on its first check, right away. (Starting
+		# both here could race: cesuper might not see the app yet and start a
+		# second one.)
+		log "starting CosmosEx"
+		"$CE/cesuper.sh" > /dev/null 2>&1 &
+	fi
+}
+
+stop() {
+	log "stopping CosmosEx"
+	"$CE/ce_stop.sh" nosystemctl
+}
+
+case "$1" in
+start)
+	start
+	;;
+stop)
+	stop
+	;;
+restart)
+	stop
+	start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac

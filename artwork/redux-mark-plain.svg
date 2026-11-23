@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="CosmosEx redux">
+  <g>
+    <circle cx="100" cy="100" r="61" fill="#000000"/>
+    <path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(0)" fill="#FFFFFF"/>
+    <path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(72)" fill="#FFFFFF"/>
+    <path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(144)" fill="#FFFFFF"/>
+    <path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(216)" fill="#FFFFFF"/>
+    <path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(288)" fill="#FFFFFF"/>
+    <circle cx="100" cy="100" r="9" fill="#FFFFFF"/>
+    <path d="M121.22 20.79 A82 82 0 0 1 171.72 60.25" fill="none" stroke="#3FA650" stroke-width="13"/>
+    <path d="M160.35 66.55 L183.09 53.94 L180.99 87.17 Z" fill="#3FA650" stroke="#3FA650" stroke-width="1.5"/>
+    <path d="M179.21 121.22 A82 82 0 0 1 139.75 171.72" fill="none" stroke="#E3D23B" stroke-width="13"/>
+    <path d="M133.45 160.35 L146.06 183.09 L112.83 180.99 Z" fill="#E3D23B" stroke="#E3D23B" stroke-width="1.5"/>
+    <path d="M78.78 179.21 A82 82 0 0 1 28.28 139.75" fill="none" stroke="#4A90D9" stroke-width="13"/>
+    <path d="M39.65 133.45 L16.91 146.06 L19.01 112.83 Z" fill="#4A90D9" stroke="#4A90D9" stroke-width="1.5"/>
+    <path d="M20.79 78.78 A82 82 0 0 1 60.25 28.28" fill="none" stroke="#E8679A" stroke-width="13"/>
+    <path d="M66.55 39.65 L53.94 16.91 L87.17 19.01 Z" fill="#E8679A" stroke="#E8679A" stroke-width="1.5"/>
+  </g>
+</svg>

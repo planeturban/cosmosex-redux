@@ -1,0 +1,7 @@
+# CosmosEx: turn off Wi-Fi power saving when wlan0 appears. With it on
+# (brcmfmac's default) replies are delayed by up to a few hundred ms, which
+# makes the web UI's remote mouse/keyboard and screencast laggy; the Pi
+# can also become unreachable from the network.
+if [ "$interface" = wlan0 ] && [ "$reason" = PREINIT ]; then
+	iw dev wlan0 set power_save off 2>/dev/null
+fi

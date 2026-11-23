@@ -1,0 +1,307 @@
+#!/bin/sh
+# Backup and restore of the user's settings and data, so a card can be
+# written fresh (or replaced) and everything brought back.
+#
+#   ce-backup info                          what a backup holds (key=value, for the web interface)
+#   ce-backup create [--translated] [--downloads] [--secrets]
+#                                           a backup as .tar.gz on stdout; without
+#                                           --secrets the passwords and keys are left
+#                                           out (see SECRETS below); with it, the web
+#                                           interface encrypts the file (the app)
+#   ce-backup restore <file> [delete]       put a backup back, then restart
+#   ce-backup status                        the last restore's state
+#
+# In a backup (paths as on the CosmosEx):
+#   data/ce/settings/        every CosmosEx setting (incl. the web login password, library sources)
+#   data/etc/upper/          changed system settings: network, Wi-Fi, hostname, sharing, SMB password
+#   data/ssh/                the CosmosEx's SSH identity (host keys)
+#   data/home/               home folders
+#   boot/*.pub, authorized_keys   the SSH keys for user ce (from the boot partition)
+#   storage/floppy_disks/    save disks: zipped floppies the ST wrote to (unpacked)
+#   storage/...              other floppy images on /storage the ST wrote to (floppy_disks/.written.list)
+#   storage/hdd_images/*.json   the notes about hard disk images
+#   with --translated: storage/translated_*/   files of the translated drives on /storage
+#   with --downloads:  storage/img_download/   downloaded floppy images
+# Not in it: hard disk images (too big: copy them yourself), logs, caches,
+# the system itself.
+#
+# SECRETS, only with --secrets: the Wi-Fi password (wpa_supplicant.conf; a
+# copy without it is in data/ce-backup/), the shared drive password and the
+# web password hash (settings), the SMB password database, the SSH host keys.
+# A restore without them keeps the ones this CosmosEx has, and says which
+# ones are missing.
+
+STATE=/data/ce-backup
+RUN=/run/ce-backup
+LOCK=/run/ce-backup.lock
+DISKS=/storage/floppy_disks
+FORMAT="cosmosex-backup 1"
+
+mkdir -p "$STATE" "$RUN"
+
+log() {
+	echo "backup: $*" >&2
+	logger -t backup "$*" 2>/dev/null
+}
+
+set_state() {
+	{
+		echo "state=$1"
+		echo "message=$2"
+		echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+	} > "$STATE/status.tmp" && mv -f "$STATE/status.tmp" "$STATE/status"
+	[ -n "$2" ] && log "$1: $2"
+}
+
+storage_ok() { [ -e /storage/.ce-storage-ready ]; }
+
+kb() { du -sk "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
+
+# the backup's file list (relative to /), one per line
+files() {
+	cd / || return
+	# settings
+	if [ -n "$SECRETS" ]; then
+		[ -d data/ce/settings ] && find data/ce/settings -type f
+	else
+		[ -d data/ce/settings ] && find data/ce/settings -type f ! -name SHARED_PASSWORD ! -name WEBUI_PWHASH
+	fi
+	# /etc changes: real files only (not the overlay's deletion markers)
+	if [ -n "$SECRETS" ]; then
+		[ -d data/etc/upper ] && find data/etc/upper -type f
+		[ -d data/ssh ] && find data/ssh -type f
+	else
+		[ -d data/etc/upper ] && find data/etc/upper -type f ! -path '*/ksmbd/ksmbdpwd.db' ! -path '*/wpa_supplicant/wpa_supplicant.conf'
+		# the Wi-Fi network without its password
+		[ -f data/ce-backup/wpa_supplicant.conf ] && echo data/ce-backup/wpa_supplicant.conf
+	fi
+	[ -d data/home ] && find data/home -type f ! -name '.ash_history'
+	for f in boot/*.pub boot/authorized_keys; do [ -f "$f" ] && echo "$f"; done
+	if storage_ok; then
+		# save disks: unpacked zips the ST wrote to
+		for d in storage/floppy_disks/*/; do
+			[ -e "$d.ce-written" ] && find "${d%/}" -type f
+		done
+		# floppy images saved in place
+		if [ -f "$DISKS/.written.list" ]; then
+			while IFS= read -r p; do
+				case "$p" in /storage/*) [ -f "$p" ] && echo "${p#/}" ;; esac
+			done < "$DISKS/.written.list"
+			echo "storage/floppy_disks/.written.list"
+		fi
+		[ -d storage/hdd_images ] && find storage/hdd_images -maxdepth 1 -type f -name '*.json'
+		if [ -n "$TRANSLATED" ]; then
+			for d in storage/translated_?; do [ -d "$d" ] && find "$d" \( -type f -o -type d -empty \); done
+		fi
+		[ -n "$DOWNLOADS" ] && [ -d storage/img_download ] && find storage/img_download -type f
+	fi
+}
+
+do_info() {
+	echo "hostname=$(hostname)"
+	echo "version=$(cat /etc/cosmosex-version 2>/dev/null)"
+	echo "settingsKB=$(kb /data/ce/settings /data/etc/upper /data/ssh /data/home)"
+	echo "sshKeys=$(cat /boot/*.pub /boot/authorized_keys 2>/dev/null | grep -cE '^(ssh-|ecdsa-|sk-)')"
+	if storage_ok; then
+		echo "storage=yes"
+		n=0; k=0
+		for d in "$DISKS"/*/; do
+			[ -e "$d.ce-written" ] || continue
+			n=$((n + 1)); k=$((k + $(kb "$d")))
+		done
+		if [ -f "$DISKS/.written.list" ]; then
+			while IFS= read -r p; do
+				[ -f "$p" ] && n=$((n + 1)) && k=$((k + $(kb "$p")))
+			done < "$DISKS/.written.list"
+		fi
+		echo "saveDisks=$n"
+		echo "saveDisksKB=$k"
+		echo "translatedKB=$(kb /storage/translated_?)"
+		echo "translatedDrives=$(ls -d /storage/translated_? 2>/dev/null | sed 's#.*_##' | tr -d '\n')"
+		echo "downloadsKB=$(kb /storage/img_download)"
+		echo "hddImages=$(find /storage/hdd_images -maxdepth 1 -type f ! -name '*.json' ! -name '.*' 2>/dev/null | wc -l)"
+		echo "hddImagesMB=$(( $(find /storage/hdd_images -maxdepth 1 -type f ! -name '*.json' ! -name '.*' -exec du -sk {} + 2>/dev/null | awk '{ s += $1 } END { print s + 0 }') / 1024 ))"
+	else
+		echo "storage=no"
+	fi
+	if [ -f "$STATE/status" ]; then
+		sed -n 's/^\(state\|message\|time\)=/restore_\1=/p' "$STATE/status"
+	fi
+}
+
+do_create() {
+	for a in "$@"; do
+		case "$a" in
+			--translated) TRANSLATED=1 ;;
+			--downloads) DOWNLOADS=1 ;;
+			--secrets) SECRETS=1 ;;
+		esac
+	done
+	rm -f "$STATE/wpa_supplicant.conf"
+	if [ -z "$SECRETS" ] && [ -f /etc/wpa_supplicant/wpa_supplicant.conf ]; then
+		grep -v '^[[:space:]]*psk=' /etc/wpa_supplicant/wpa_supplicant.conf > "$STATE/wpa_supplicant.conf"
+		chmod 600 "$STATE/wpa_supplicant.conf"
+	fi
+	files > "$RUN/files" 2>/dev/null
+	# with every folder above them (their owner and mode come back too: a
+	# restore mustn't leave e.g. ~/.ssh root-owned or group-writable), then
+	# tar without recursion: exactly these
+	awk -F/ '{ p = $1; if (NF > 1) print p; for (i = 2; i < NF; i++) { p = p "/" $i; print p } }' "$RUN/files" | sort -u > "$RUN/list"
+	cat "$RUN/files" >> "$RUN/list"
+	{
+		echo "format=$FORMAT"
+		echo "hostname=$(hostname)"
+		echo "version=$(cat /etc/cosmosex-version 2>/dev/null)"
+		echo "variant=$(cat /etc/cosmosex-variant 2>/dev/null)"
+		echo "date=$(date '+%Y-%m-%d %H:%M:%S')"
+		echo "translated=${TRANSLATED:+yes}"
+		echo "downloads=${DOWNLOADS:+yes}"
+		echo "secrets=${SECRETS:+yes}"
+		echo "files=$(wc -l < "$RUN/files")"
+	} > "$STATE/manifest.txt"
+	echo "data/ce-backup/manifest.txt" >> "$RUN/list"
+	log "backup made: $(wc -l < "$RUN/files") files"
+	tar -c -f - -C / --no-recursion -T "$RUN/list" 2>/dev/null | gzip -c
+}
+
+# --- restore ------------------------------------------------------------------
+
+workdir() {
+	if storage_ok; then echo /storage/.ce-restore; else echo "$STATE/work"; fi
+}
+
+fail() {
+	set_state failed "$*"
+	[ -n "$W" ] && rm -rf "$W/x"
+	[ -n "$DELETE_AFTER" ] && rm -f "$DELETE_AFTER"
+	exit 1
+}
+
+# a path the backup may contain
+allowed() {
+	case "$1" in
+		*..*) return 1 ;;
+		data/ce-backup/manifest.txt|data/ce-backup/wpa_supplicant.conf) return 0 ;;
+		data/ce/settings/*|data/etc/upper/*|data/ssh/*|data/home/*) return 0 ;;
+		boot/*.pub|boot/authorized_keys) return 0 ;;
+		storage/hdd_images/*.json) return 0 ;;
+		storage/hdd_images/*|storage/.*) return 1 ;;
+		storage/?*) return 0 ;;
+	esac
+	return 1
+}
+
+do_restore() {
+	f=$1
+	umask 022                    # folders made here: not group-writable (the app runs with 002)
+	exec 9> "$LOCK"
+	flock -n 9 || { echo "busy: a restore is running"; exit 2; }
+	[ -f "$f" ] || fail "No such file: $f"
+	W=$(workdir)
+	set_state checking "Checking the backup"
+
+	# every entry: a file or folder at an allowed place
+	gzip -dc "$f" 2>/dev/null | tar -tvf - > "$RUN/toc" 2>/dev/null && [ -s "$RUN/toc" ] || fail "That isn't a CosmosEx backup (not a .tar.gz, or damaged)."
+	bad=$(awk '{ t = substr($1, 1, 1); if (t != "-" && t != "d") print "type " t ": " $NF }' "$RUN/toc" | head -n 1)
+	[ -z "$bad" ] || fail "The backup holds something other than files and folders ($bad); not used."
+	gzip -dc "$f" 2>/dev/null | tar -tf - 2>/dev/null | sed 's#^\./##' > "$RUN/names"
+	while IFS= read -r n; do
+		n=${n%/}
+		[ -z "$n" ] && continue
+		case "$n" in data|data/ce|data/etc|storage|boot|data/ce-backup|data/ce/settings|data/etc/upper|data/ssh|data/home) continue ;; esac
+		allowed "$n" || fail "The backup holds a file at a place it can't be restored to ($n); not used."
+	done < "$RUN/names"
+	grep -qx 'data/ce-backup/manifest.txt' "$RUN/names" || fail "That isn't a CosmosEx backup (no manifest)."
+
+	# unpack it apart first
+	rm -rf "$W/x"; mkdir -p "$W/x"
+	gzip -dc "$f" 2>/dev/null | tar -xf - -C "$W/x" 2>/dev/null || fail "Unpacking the backup failed (full?)."
+	grep -qx "format=$FORMAT" "$W/x/data/ce-backup/manifest.txt" 2>/dev/null || fail "That backup's format isn't known to this system."
+	from=$(sed -n 's/^hostname=//p' "$W/x/data/ce-backup/manifest.txt")
+	when=$(sed -n 's/^date=//p' "$W/x/data/ce-backup/manifest.txt")
+	[ -n "$(find "$W/x" ! -type f ! -type d | head -n 1)" ] && fail "The backup holds links or devices; not used."
+
+	set_state restoring "Restoring the backup of $from ($when)"
+	# the app (the web server) answers the page that started this first: a
+	# small backup gets here within its half second (seen on a Pi 3)
+	sleep 3
+	/etc/init.d/S00ceapp stop > /dev/null 2>&1          # the app doesn't write settings meanwhile
+	sleep 1
+
+	X=$W/x
+	if [ -d "$X/data/ce/settings" ]; then
+		rm -rf /data/ce/settings.before-restore
+		mv /data/ce/settings /data/ce/settings.before-restore 2>/dev/null
+		mkdir -p /data/ce/settings && cp -a "$X/data/ce/settings/." /data/ce/settings/ ||
+			{ rm -rf /data/ce/settings; mv /data/ce/settings.before-restore /data/ce/settings; fail "Restoring the settings failed; the old ones are back."; }
+	fi
+	# /etc through the overlay (never into its upper folder directly)
+	# a backup without secrets: keep this CosmosEx's (settings, SMB, SSH, Wi-Fi)
+	missing=
+	if grep -qx 'secrets=' "$X/data/ce-backup/manifest.txt"; then     # (older backups: no such line, secrets in)
+		for k in SHARED_PASSWORD WEBUI_PWHASH; do
+			if [ -f "/data/ce/settings.before-restore/$k" ]; then
+				cp -a "/data/ce/settings.before-restore/$k" /data/ce/settings/
+			else
+				case $k in
+					SHARED_PASSWORD) [ "$(cat /data/ce/settings/SHARED_ENABLED 2>/dev/null)" = 1 ] && [ -n "$(cat /data/ce/settings/SHARED_USERNAME 2>/dev/null)" ] &&
+						missing="$missing, the shared drive password" ;;
+					WEBUI_PWHASH) missing="$missing, the web password (it's the default now)" ;;
+				esac
+			fi
+		done
+		grep -q '^SMB_GUEST=no' /etc/ce-storageshare.conf 2>/dev/null && [ ! -s /etc/ksmbd/ksmbdpwd.db ] && missing="$missing, the SMB password"
+		# Wi-Fi: the backup's network; its password from this CosmosEx if it's the same network
+		if [ -f "$X/data/ce-backup/wpa_supplicant.conf" ]; then
+			new_ssid=$(sed -n 's/^[[:space:]]*ssid=//p' "$X/data/ce-backup/wpa_supplicant.conf" | head -n 1)
+			old_ssid=$(sed -n 's/^[[:space:]]*ssid=//p' /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null | head -n 1)
+			if [ -n "$new_ssid" ] && [ "$new_ssid" = "$old_ssid" ] && grep -q '^[[:space:]]*psk=' /etc/wpa_supplicant/wpa_supplicant.conf; then
+				:   # same network, password already here: keep the file
+			else
+				mkdir -p /etc/wpa_supplicant
+				cp "$X/data/ce-backup/wpa_supplicant.conf" /etc/wpa_supplicant/wpa_supplicant.conf
+				chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+				[ -n "$new_ssid" ] && missing="$missing, the Wi-Fi password (network $new_ssid)"
+			fi
+		fi
+	fi
+	[ -d "$X/data/etc/upper" ] && cp -a "$X/data/etc/upper/." /etc/
+	[ -d "$X/data/ssh" ] && cp -a "$X/data/ssh/." /data/ssh/ && chmod 700 /data/ssh
+	[ -d "$X/data/home" ] && cp -a "$X/data/home/." /data/home/
+	# whatever the backup said: homes and SSH as dropbear wants them
+	for u in pi ce; do
+		[ -d "/data/home/$u" ] || continue
+		chown -R "$u:$u" "/data/home/$u"; chmod 750 "/data/home/$u"
+		[ -d "/data/home/$u/.ssh" ] && chmod 700 "/data/home/$u/.ssh"
+	done
+	find /data/etc/upper -type d -perm -g+w -exec chmod g-w {} + 2>/dev/null
+	if [ -d "$X/boot" ]; then
+		mount -o remount,rw /boot && cp "$X"/boot/* /boot/ 2>/dev/null
+		sync; mount -o remount,ro /boot
+	fi
+	if [ -d "$X/storage" ] && storage_ok; then
+		cp -a "$X/storage/." /storage/
+		chown -R 1000:1000 /storage/floppy_disks /storage/translated_? /storage/img_download 2>/dev/null
+	fi
+	rm -rf "$X"
+	[ -n "$DELETE_AFTER" ] && rm -f "$DELETE_AFTER"
+	rmdir "$W" 2>/dev/null
+	msg="Restored the backup of $from ($when). The settings before it are in /data/ce/settings.before-restore."
+	[ -n "$missing" ] && msg="$msg Not in the backup (passwords were left out), set again: ${missing#, }."
+	set_state done "$msg"
+	sync
+	sleep 1
+	reboot
+}
+
+case "$1" in
+	info)    do_info ;;
+	create)  shift; do_create "$@" ;;
+	restore) DELETE_AFTER=${3:+$2}; do_restore "$2" ;;
+	status)  cat "$STATE/status" 2>/dev/null || echo "state=idle" ;;
+	workdir) w=$(workdir); mkdir -p "$w"; echo "$w" ;;
+	*)
+		echo "usage: $0 info | create [--translated] [--downloads] | restore <file> [delete] | status | workdir"
+		exit 1
+		;;
+esac

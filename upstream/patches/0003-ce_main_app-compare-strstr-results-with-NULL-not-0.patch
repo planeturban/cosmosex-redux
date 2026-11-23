@@ -1,0 +1,164 @@
+From 606615286fe9109ff152977eaa7beca160372d85 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:10:03 +0200
+Subject: [PATCH 3/8] ce_main_app: compare strstr() results with NULL, not > 0
+
+The REST API resources test strstr(...) > 0, an ordered comparison of a
+pointer with zero. Modern C++ compilers reject it (GCC 14: error). The
+intent is "substring found", i.e. != NULL, which is what this does.
+---
+ ce_main_app/webserver/api/resource/configresource.cpp  | 10 +++++-----
+ .../webserver/api/resource/downloadresource.cpp        |  2 +-
+ ce_main_app/webserver/api/resource/floppyresource.cpp  |  6 +++---
+ ce_main_app/webserver/api/resource/kbdresource.cpp     |  8 ++++----
+ ce_main_app/webserver/api/resource/mouseresource.cpp   |  4 ++--
+ 5 files changed, 15 insertions(+), 15 deletions(-)
+
+diff --git a/ce_main_app/webserver/api/resource/configresource.cpp b/ce_main_app/webserver/api/resource/configresource.cpp
+index 4a1e6cc8..0d5198d1 100644
+--- a/ce_main_app/webserver/api/resource/configresource.cpp
++++ b/ce_main_app/webserver/api/resource/configresource.cpp
+@@ -77,7 +77,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //set loglevel
+-    if( strstr(req_info->request_method,"POST")>0 && sResourceInfo=="loglevel" ){
++    if( strstr(req_info->request_method,"POST") != NULL && sResourceInfo=="loglevel" ){
+         Debug::out(LOG_DEBUG, "/config/loglevel POST");
+ 
+         char post_data[1024], loglevel[sizeof(post_data)];
+@@ -116,7 +116,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //get configterminal screen
+-    if( strstr(req_info->request_method,"GET")>0 && sResourceInfo=="terminal" ){
++    if( strstr(req_info->request_method,"GET") != NULL && sResourceInfo=="terminal" ){
+         Debug::out(LOG_DEBUG, "/config/terminal GET");
+         
+         openFIFOsIfNeeded();
+@@ -142,7 +142,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //return config info @TODO
+-    if( strstr(req_info->request_method,"GET")>0 && sResourceInfo=="" ){
++    if( strstr(req_info->request_method,"GET") != NULL && sResourceInfo=="" ){
+         Debug::out(LOG_DEBUG, "/config GET");
+         //const char *qs = req_info->query_string;
+         mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+@@ -157,7 +157,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //return status info
+-    if( strstr(req_info->request_method,"GET")>0 && sResourceInfo=="status" ){
++    if( strstr(req_info->request_method,"GET") != NULL && sResourceInfo=="status" ){
+         Debug::out(LOG_DEBUG, "/config/status GET");
+         //const char *qs = req_info->query_string;
+         mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+@@ -172,7 +172,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //send configterminal command
+-    if( strstr(req_info->request_method,"POST")>0 && sResourceInfo=="terminal" ){
++    if( strstr(req_info->request_method,"POST") != NULL && sResourceInfo=="terminal" ){
+         Debug::out(LOG_DEBUG, "/config/terminal POST");
+ 
+         int len=0;
+diff --git a/ce_main_app/webserver/api/resource/downloadresource.cpp b/ce_main_app/webserver/api/resource/downloadresource.cpp
+index 53a72656..13849163 100644
+--- a/ce_main_app/webserver/api/resource/downloadresource.cpp
++++ b/ce_main_app/webserver/api/resource/downloadresource.cpp
+@@ -317,7 +317,7 @@ bool DownloadResource::dispatch(mg_connection *conn, mg_request_info *req_info,
+     }
+ 
+ 	// for GET methods
+-    if( strstr(req_info->request_method,"GET")>0 ) {
++    if( strstr(req_info->request_method,"GET") != NULL ) {
+         // standard header on response
+         mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+         mg_printf(conn, "Cache: no-cache\r\n");
+diff --git a/ce_main_app/webserver/api/resource/floppyresource.cpp b/ce_main_app/webserver/api/resource/floppyresource.cpp
+index 8a11bbdc..33b2f7e9 100644
+--- a/ce_main_app/webserver/api/resource/floppyresource.cpp
++++ b/ce_main_app/webserver/api/resource/floppyresource.cpp
+@@ -38,7 +38,7 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //return slot info
+-    if( strstr(req_info->request_method,"GET")>0 ){
++    if( strstr(req_info->request_method,"GET") != NULL ){
+         mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
+         mg_printf(conn, "Cache: no-cache\r\n");
+         std::ostringstream stringStream;
+@@ -71,7 +71,7 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //upload image to slot
+-    if( strstr(req_info->request_method,"POST")>0 ){
++    if( strstr(req_info->request_method,"POST") != NULL ){
+         Debug::out(LOG_DEBUG, "/floppy POST");
+ 
+         int iSlot=atoi(sResourceInfo.c_str());        
+@@ -100,7 +100,7 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+ 
+     //set current slot
+-    if( strstr(req_info->request_method,"PUT")>0 ){
++    if( strstr(req_info->request_method,"PUT") != NULL ){
+         int iSlot=atoi(sResourceInfo.c_str());
+         
+         if(iSlot == 100) {      // special case -- slot 100 == INSERT CONFIG IMAGE
+diff --git a/ce_main_app/webserver/api/resource/kbdresource.cpp b/ce_main_app/webserver/api/resource/kbdresource.cpp
+index b70ab290..31817039 100644
+--- a/ce_main_app/webserver/api/resource/kbdresource.cpp
++++ b/ce_main_app/webserver/api/resource/kbdresource.cpp
+@@ -31,13 +31,13 @@ bool KbdResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::
+     int len=0;
+     char jsonKey[1024];
+     
+-    if( strstr(req_info->request_method,"GET")>0 ){
++    if( strstr(req_info->request_method,"GET") != NULL ){
+         const char *qs = req_info->query_string;
+         //this guarentees jsonkey to be 0-terminated
+         len=mg_get_var(qs, strlen(qs == NULL ? "" : qs), "key", jsonKey, sizeof(jsonKey));
+     }
+      
+-    if( strstr(req_info->request_method,"POST")>0 ){
++    if( strstr(req_info->request_method,"POST") != NULL ){
+         //raw read, not automaticly 0-terminated
+         len = mg_read(conn, jsonKey, sizeof(jsonKey)-1);
+         jsonKey[len]=0; 
+@@ -72,10 +72,10 @@ bool KbdResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::
+                 return true;
+             }
+             int iValue=-1;
+-            if( strstr(pcState,"down")>0 ){
++            if( strstr(pcState,"down") != NULL ){
+                 iValue=1;
+             }
+-            if( strstr(pcState,"up")>0 ){
++            if( strstr(pcState,"up") != NULL ){
+                 iValue=0;
+             }
+             if( iValue==-1 ){
+diff --git a/ce_main_app/webserver/api/resource/mouseresource.cpp b/ce_main_app/webserver/api/resource/mouseresource.cpp
+index bd3a94d1..1edfba26 100644
+--- a/ce_main_app/webserver/api/resource/mouseresource.cpp
++++ b/ce_main_app/webserver/api/resource/mouseresource.cpp
+@@ -31,12 +31,12 @@ bool MouseResource::dispatch(mg_connection *conn, mg_request_info *req_info, std
+     int len=0;
+     char jsonMouseRel[1024];
+     
+-    if( strstr(req_info->request_method,"GET")>0 ){
++    if( strstr(req_info->request_method,"GET") != NULL ){
+         const char *qs = req_info->query_string;
+         len=mg_get_var(qs, strlen(qs == NULL ? "" : qs), "rel", jsonMouseRel, sizeof(jsonMouseRel));
+     }
+      
+-    if( strstr(req_info->request_method,"POST")>0 ){
++    if( strstr(req_info->request_method,"POST") != NULL ){
+         len = mg_read(conn, jsonMouseRel, sizeof(jsonMouseRel)-1);
+         jsonMouseRel[len]=0; 
+     }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,416 @@
+From 5dccb8edcec5e37be052082e7afe94804d54fab4 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:48:51 +0100
+Subject: [PATCH] ce_main_app: settings API section for /pi sharing (NFS and
+ SMB)
+
+GET/PUT /api/v1/settings/pishare: whether /pi is shared over NFS and SMB,
+read-write or read-only, which computers may connect (addresses,
+networks a.b.c.d/n, host names or *; at most 16), NFS file ownership
+(all clients as the user pi, or their own user ids), SMB guest access
+or the user pi with a password (set with "password", reported as
+"passwordSet", never returned), the SMB workgroup; plus whether the
+servers run and what NFS shares now. Settings go to /etc/ce-pishare.conf
+(temp file, sync, rename) and are applied with the image's
+/usr/sbin/ce-pishare; without that tool the section says "available":
+false. Image-specific (Buildroot image).
+---
+ .../webserver/api/resource/pishare.cpp        | 299 ++++++++++++++++++
+ ce_main_app/webserver/api/resource/pishare.h  |  19 ++
+ .../api/resource/settingsresource.cpp         |  11 +-
+ .../webserver/api/resource/settingsresource.h |   4 +-
+ 4 files changed, 331 insertions(+), 2 deletions(-)
+ create mode 100644 ce_main_app/webserver/api/resource/pishare.cpp
+ create mode 100644 ce_main_app/webserver/api/resource/pishare.h
+
+diff --git a/ce_main_app/webserver/api/resource/pishare.cpp b/ce_main_app/webserver/api/resource/pishare.cpp
+new file mode 100644
+index 00000000..f9bd0ce5
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/pishare.cpp
+@@ -0,0 +1,299 @@
++// /pi sharing settings (see pishare.h)
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <unistd.h>
++#include <sys/wait.h>
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include "lib/cjson-code-58/cJSON.h"
++#include "debug.h"
++#include "pishare.h"
++
++#define PISHARE_MAX_CLIENTS 16
++
++typedef std::map<std::string, std::string> KeyValues;
++
++// KEY=value / KEY="a b" lines; comments (#) and anything else ignored
++static void readConf(KeyValues &kv)
++{
++    FILE *f = fopen(PISHARE_CONF, "r");
++    if(!f) return;
++    char line[1024];
++    while(fgets(line, sizeof(line), f)) {
++        char *eq = strchr(line, '=');
++        if(line[0] == '#' || !eq) continue;
++        std::string key(line, eq - line);
++        std::string val = eq + 1;
++        if(!val.empty() && val[0] == '"') {
++            size_t end = val.find('"', 1);
++            val = val.substr(1, end == std::string::npos ? std::string::npos : end - 1);
++        } else {
++            size_t end = val.find_first_of(" \t#\r\n");
++            if(end != std::string::npos) val.erase(end);
++        }
++        kv[key] = val;
++    }
++    fclose(f);
++}
++
++static std::string get(KeyValues &kv, const char *key, const char *def)
++{
++    KeyValues::iterator it = kv.find(key);
++    return it == kv.end() ? def : it->second;
++}
++
++static void split(const std::string &s, std::vector<std::string> &out)
++{
++    out.clear();
++    size_t i = 0;
++    while(i < s.length()) {
++        while(i < s.length() && (s[i] == ' ' || s[i] == ',' || s[i] == '\t' || s[i] == '\n')) i++;
++        size_t j = i;
++        while(j < s.length() && s[j] != ' ' && s[j] != ',' && s[j] != '\t' && s[j] != '\n') j++;
++        if(j > i) out.push_back(s.substr(i, j - i));
++        i = j;
++    }
++}
++
++// who may connect: an IPv4 address, a network (a.b.c.d/n), a host name, or *
++static bool validClient(const std::string &c, bool hostNames)
++{
++    if(c == "*") return true;
++    if(c.empty() || c.length() > 253) return false;
++
++    unsigned a, b, cc, d, n;
++    char rest;
++    if(sscanf(c.c_str(), "%u.%u.%u.%u/%u%c", &a, &b, &cc, &d, &n, &rest) == 5) {
++        return a < 256 && b < 256 && cc < 256 && d < 256 && n <= 32;
++    }
++    if(sscanf(c.c_str(), "%u.%u.%u.%u%c", &a, &b, &cc, &d, &rest) == 4) {
++        return a < 256 && b < 256 && cc < 256 && d < 256;
++    }
++    if(!hostNames) return false;                        // SMB: enforced by a firewall, addresses only
++    for(size_t i=0; i<c.length(); i++) {                // host name
++        char ch = c[i];
++        if(!isalnum((unsigned char) ch) && ch != '-' && ch != '.') return false;
++    }
++    return isalnum((unsigned char) c[0]);
++}
++
++static void addClients(cJSON *o, const std::string &list)
++{
++    std::vector<std::string> v;
++    split(list, v);
++    cJSON *arr = cJSON_CreateArray();
++    for(size_t i=0; i<v.size(); i++) cJSON_AddItemToArray(arr, cJSON_CreateString(v[i].c_str()));
++    cJSON_AddItemToObject(o, "clients", arr);
++}
++
++static bool toolAvailable(void)
++{
++    return access(PISHARE_TOOL, X_OK) == 0;
++}
++
++static void readStatus(KeyValues &st)
++{
++    FILE *p = popen(PISHARE_TOOL " status 2>/dev/null", "r");
++    if(!p) return;
++    char line[2048];
++    while(fgets(line, sizeof(line), p)) {
++        char *eq = strchr(line, '=');
++        if(!eq) continue;
++        std::string val = eq + 1;
++        while(!val.empty() && (val[val.length() - 1] == '\n' || val[val.length() - 1] == '\r')) val.erase(val.length() - 1);
++        st[std::string(line, eq - line)] = val;
++    }
++    pclose(p);
++}
++
++bool pishareBuild(cJSON *out)
++{
++    bool avail = toolAvailable();
++    cJSON_AddBoolToObject(out, "available", avail);
++    if(!avail) return true;
++
++    KeyValues kv, st;
++    readConf(kv);
++    readStatus(st);
++
++    cJSON *nfs = cJSON_CreateObject();
++    cJSON_AddBoolToObject(nfs,   "enabled", get(kv, "NFS", "yes") == "yes");
++    cJSON_AddStringToObject(nfs, "access",  get(kv, "NFS_ACCESS", "rw").c_str());
++    cJSON_AddStringToObject(nfs, "map",     get(kv, "NFS_MAP", "pi").c_str());
++    addClients(nfs, get(kv, "NFS_CLIENTS", ""));
++    cJSON_AddBoolToObject(nfs,   "manual",  get(kv, "NFS_MANUAL", "no") == "yes");
++    cJSON_AddBoolToObject(nfs,   "running", st["nfs_running"] == "yes");
++    cJSON_AddStringToObject(nfs, "exports", st["exports"].c_str());
++    cJSON_AddItemToObject(out, "nfs", nfs);
++
++    cJSON *smb = cJSON_CreateObject();
++    cJSON_AddBoolToObject(smb,   "enabled",     get(kv, "SMB", "yes") == "yes");
++    cJSON_AddStringToObject(smb, "access",      get(kv, "SMB_ACCESS", "rw").c_str());
++    cJSON_AddBoolToObject(smb,   "guest",       get(kv, "SMB_GUEST", "yes") == "yes");
++    addClients(smb, get(kv, "SMB_CLIENTS", ""));
++    cJSON_AddStringToObject(smb, "workgroup",   get(kv, "SMB_WORKGROUP", "WORKGROUP").c_str());
++    cJSON_AddBoolToObject(smb,   "passwordSet", st["smb_password_set"] == "yes");   // the password itself is never sent
++    cJSON_AddBoolToObject(smb,   "running",     st["smb_running"] == "yes");
++    cJSON_AddItemToObject(out, "smb", smb);
++
++    cJSON_AddBoolToObject(out, "piMounted", st["pi_mounted"] == "yes");
++    char host[256] = "";
++    gethostname(host, sizeof(host) - 1);
++    cJSON_AddStringToObject(out, "hostname", host);
++    return true;
++}
++
++static bool getBoolItem(cJSON *o, const char *key, bool &v)
++{
++    cJSON *i = o ? cJSON_GetObjectItem(o, key) : NULL;
++    if(!i) return false;
++    if(i->type == cJSON_True)  { v = true;  return true; }
++    if(i->type == cJSON_False) { v = false; return true; }
++    return false;
++}
++
++static bool getStringItem(cJSON *o, const char *key, std::string &v)
++{
++    cJSON *i = o ? cJSON_GetObjectItem(o, key) : NULL;
++    if(!i || i->type != cJSON_String || !i->valuestring) return false;
++    v = i->valuestring;
++    return true;
++}
++
++// clients from the request: an array of strings; joined with spaces
++static bool getClients(cJSON *o, std::string &joined, std::string &msg, const char *what, bool hostNames)
++{
++    cJSON *arr = o ? cJSON_GetObjectItem(o, "clients") : NULL;
++    if(!arr) return true;                       // not given: keep
++    if(arr->type != cJSON_Array) { msg = std::string(what) + ": clients must be a list"; return false; }
++    joined.clear();
++    int n = 0;
++    for(cJSON *c = arr->child; c; c = c->next) {
++        if(c->type != cJSON_String || !c->valuestring) { msg = std::string(what) + ": clients must be text"; return false; }
++        std::vector<std::string> parts;
++        split(c->valuestring, parts);
++        for(size_t i=0; i<parts.size(); i++) {
++            if(!validClient(parts[i], hostNames)) {
++                msg = std::string(what) + ": \"" + parts[i] + "\" isn't an address, a network (e.g. 192.168.1.0/24)" + (hostNames ? ", a host name" : "") + " or *.";
++                return false;
++            }
++            if(++n > PISHARE_MAX_CLIENTS) { msg = std::string(what) + ": at most 16 entries."; return false; }
++            joined += (joined.empty() ? "" : " ") + parts[i];
++        }
++    }
++    return true;
++}
++
++static bool runTool(const char *args, const std::string *stdinText)
++{
++    std::string cmd = std::string(PISHARE_TOOL " ") + args + " > /dev/null 2>&1";
++    FILE *p = popen(cmd.c_str(), stdinText ? "w" : "r");
++    if(!p) return false;
++    if(stdinText) fprintf(p, "%s\n", stdinText->c_str());
++    int rc = pclose(p);
++    return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
++}
++
++bool pishareSave(cJSON *in, std::string &msg)
++{
++    if(!toolAvailable()) {
++        msg = "/pi sharing isn't available on this system.";
++        return false;
++    }
++
++    KeyValues kv;
++    readConf(kv);
++    std::string nfsOn = get(kv, "NFS", "yes"), nfsAccess = get(kv, "NFS_ACCESS", "rw"), nfsMap = get(kv, "NFS_MAP", "pi");
++    std::string nfsClients = get(kv, "NFS_CLIENTS", ""), nfsManual = get(kv, "NFS_MANUAL", "no");
++    std::string smbOn = get(kv, "SMB", "yes"), smbAccess = get(kv, "SMB_ACCESS", "rw"), smbGuest = get(kv, "SMB_GUEST", "yes");
++    std::string smbClients = get(kv, "SMB_CLIENTS", ""), smbWorkgroup = get(kv, "SMB_WORKGROUP", "WORKGROUP");
++
++    cJSON *nfs = cJSON_GetObjectItem(in, "nfs");
++    cJSON *smb = cJSON_GetObjectItem(in, "smb");
++    bool b;
++    std::string s;
++
++    if(nfs) {
++        if(getBoolItem(nfs, "enabled", b)) nfsOn = b ? "yes" : "no";
++        if(getStringItem(nfs, "access", s)) {
++            if(s != "rw" && s != "ro") { msg = "NFS access: rw or ro."; return false; }
++            nfsAccess = s;
++        }
++        if(getStringItem(nfs, "map", s)) {
++            if(s != "pi" && s != "users") { msg = "NFS users: pi or users."; return false; }
++            nfsMap = s;
++        }
++        if(!getClients(nfs, nfsClients, msg, "NFS", true)) return false;
++        if(getBoolItem(nfs, "manual", b)) nfsManual = b ? "yes" : "no";
++        if(nfsOn == "yes" && nfsManual != "yes" && nfsClients.empty()) { msg = "NFS: add at least one computer or network that may connect (or switch NFS off)."; return false; }
++    }
++
++    std::string password;
++    bool setPassword = false;
++    if(smb) {
++        if(getBoolItem(smb, "enabled", b)) smbOn = b ? "yes" : "no";
++        if(getStringItem(smb, "access", s)) {
++            if(s != "rw" && s != "ro") { msg = "SMB access: rw or ro."; return false; }
++            smbAccess = s;
++        }
++        if(getBoolItem(smb, "guest", b)) smbGuest = b ? "yes" : "no";
++        if(!getClients(smb, smbClients, msg, "SMB", false)) return false;
++        if(getStringItem(smb, "workgroup", s)) {
++            if(s.empty() || s.length() > 15) { msg = "SMB workgroup: 1 to 15 characters."; return false; }
++            for(size_t i=0; i<s.length(); i++) {
++                if(!isalnum((unsigned char) s[i]) && s[i] != '-' && s[i] != '_') { msg = "SMB workgroup: letters, digits, - and _ only."; return false; }
++            }
++            smbWorkgroup = s;
++        }
++        cJSON *pw = cJSON_GetObjectItem(smb, "password");
++        if(pw && pw->type == cJSON_String && pw->valuestring && pw->valuestring[0]) {      // absent, null or empty: keep
++            password = pw->valuestring;
++            if(password.length() > 64) { msg = "SMB password: at most 64 characters."; return false; }
++            for(size_t i=0; i<password.length(); i++) {
++                if((unsigned char) password[i] < 0x20) { msg = "SMB password: no control characters."; return false; }
++            }
++            setPassword = true;
++        }
++        if(smbOn == "yes" && smbClients.empty()) { msg = "SMB: add at least one computer or network that may connect (or switch SMB off)."; return false; }
++    }
++
++    if(setPassword && !runTool("smb-password", &password)) {
++        msg = "Couldn't set the SMB password.";
++        return false;
++    }
++    if(smbOn == "yes" && smbGuest == "no") {
++        KeyValues st;
++        readStatus(st);
++        if(st["smb_password_set"] != "yes") { msg = "SMB with a password: set a password for the user pi first."; return false; }
++    }
++
++    // write the settings file (temp, rename)
++    std::string tmp = std::string(PISHARE_CONF) + ".tmp";
++    FILE *f = fopen(tmp.c_str(), "w");
++    if(!f) { msg = "Couldn't save the settings."; return false; }
++    fprintf(f, "# /pi sharing (ce-pishare). Edited by the web interface (Config > /pi sharing);\n");
++    fprintf(f, "# by hand: edit, then run \"sudo ce-pishare apply\".\n");
++    fprintf(f, "NFS=%s\nNFS_ACCESS=%s\nNFS_MAP=%s\nNFS_CLIENTS=\"%s\"\nNFS_MANUAL=%s\n",
++            nfsOn.c_str(), nfsAccess.c_str(), nfsMap.c_str(), nfsClients.c_str(), nfsManual.c_str());
++    fprintf(f, "SMB=%s\nSMB_ACCESS=%s\nSMB_GUEST=%s\nSMB_CLIENTS=\"%s\"\nSMB_WORKGROUP=%s\n",
++            smbOn.c_str(), smbAccess.c_str(), smbGuest.c_str(), smbClients.c_str(), smbWorkgroup.c_str());
++    bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
++    if(fclose(f) != 0) ok = false;
++    if(!ok || rename(tmp.c_str(), PISHARE_CONF) != 0) {
++        unlink(tmp.c_str());
++        msg = "Couldn't save the settings.";
++        return false;
++    }
++
++    if(!runTool("apply", NULL)) {
++        msg = "Saved, but starting the file sharing failed (see the system log).";
++        return false;
++    }
++    Debug::out(LOG_INFO, "pishare: NFS %s %s, SMB %s %s", nfsOn.c_str(), nfsAccess.c_str(), smbOn.c_str(), smbAccess.c_str());
++    return true;
++}
+diff --git a/ce_main_app/webserver/api/resource/pishare.h b/ce_main_app/webserver/api/resource/pishare.h
+new file mode 100644
+index 00000000..cfd076cb
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/pishare.h
+@@ -0,0 +1,19 @@
++#ifndef PISHARE_H
++#define PISHARE_H
++
++// /pi sharing (NFS and SMB) for GET/PUT /api/v1/settings/pishare: the settings
++// file PISHARE_CONF, applied by the image's PISHARE_TOOL (Buildroot image:
++// /usr/sbin/ce-pishare). Without the tool the section reports "available":
++// false and refuses changes.
++
++#include <string>
++
++struct cJSON;
++
++#define PISHARE_CONF    "/etc/ce-pishare.conf"
++#define PISHARE_TOOL    "/usr/sbin/ce-pishare"
++
++bool pishareBuild(cJSON *out);
++bool pishareSave(cJSON *in, std::string &msg);
++
++#endif
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index fe0cb378..1bf27012 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -20,6 +20,7 @@
+ #include "debug.h"
+ #include "global.h"
+ #include "settingsresource.h"
++#include "pishare.h"
+ #include "../../../floppy/imagelibsources.h"
+ #include "../../../floppy/imagestorage.h"
+ #include "../../../settings.h"
+@@ -40,7 +41,7 @@ extern volatile bool do_loadIkbdConfig;
+ 
+ #define SETTINGS_MAX_BODY   (16 * 1024)
+ 
+-static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage" };
++static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage", "pishare" };
+ #define SECTION_COUNT   (int) (sizeof(SECTIONS) / sizeof(SECTIONS[0]))
+ 
+ static const char *ACSI_MODES[4] = { "off", "sd", "raw", "translated" };    // index = DEVTYPE_*
+@@ -151,6 +152,10 @@ static bool getLetter(cJSON *o, const char *key, char &letter, std::string &msg)
+ 
+ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+ {
++    if(name == "pishare") {                                 // /pi over NFS and SMB (pishare.cpp)
++        return pishareBuild(out);
++    }
++
+     Settings s;
+ 
+     if(name == "acsi") {
+@@ -281,6 +286,10 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+ 
+ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::string &msg, std::string &warning)
+ {
++    if(name == "pishare") {
++        return pishareSave(in, msg);
++    }
++
+     Settings s;
+ 
+     if(name == "acsi") {                                    // onAcsiConfig_save()
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+index a4fbc9f9..6d9c5a69 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.h
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -14,7 +14,9 @@ struct cJSON;
+ //   GET /api/v1/settings              all sections
+ //   GET /api/v1/settings/<section>    one section
+ //   PUT /api/v1/settings/<section>    save one section (application/json only)
+-// Sections: acsi, translated, shared, floppy, network, ikbd, other, hddimage.
++// Sections: acsi, translated, shared, floppy, network, ikbd, other, hddimage,
++// pishare (/pi over NFS and SMB, pishare.cpp; its SMB password is set with
++// "password" and reported as "passwordSet").
+ // Secrets are never returned: the shared drive password and the Wi-Fi key
+ // are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
+ // null) to keep them, send "" to clear.
+-- 
+2.54.0 (Apple Git-157)
+

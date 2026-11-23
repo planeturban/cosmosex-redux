@@ -1,0 +1,105 @@
+#!/bin/sh
+# Flash the chips' firmware (Hans and Franz, the STM32s) with the firmware in
+# this system (/ce/update/<chip>.hex), at the next start, before the
+# CosmosEx app starts: the app talks to the chips all the time, so they're
+# flashed while it isn't running. For the web interface (the app's
+# /api/v1/system/flash).
+#
+#   ce-flash request <chip>...   flash these at the next start (hans, franz); error=... on failure
+#   ce-flash cancel              forget a request
+#   ce-flash reboot              restart now (in 2 s, so the app can answer first)
+#   ce-flash status              key=value lines (below)
+#   ce-flash boot                S00ceapp, before the app: flash what was requested
+#
+# Status: pending=<chips> (requested), hansVersion / franzVersion (the
+# firmware in this system), last=<time>, result=ok|failed, message=...
+#
+# A request stays until the flash has run, so a power cut while flashing
+# means another try at the next start (the STM32 bootloader is in ROM: a
+# half-written chip can always be flashed again); 3 tries at most.
+
+DIR=/data/ce-flash
+REQ=$DIR/request
+LAST=$DIR/last
+LOG=$DIR/flash.log
+UPD=/ce/update
+CHIPS="hans franz"
+
+mkdir -p "$DIR"
+
+is_chip() { case " $CHIPS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+do_request() {
+	[ $# -gt 0 ] || { echo "error=Which chips? $CHIPS"; exit 1; }
+	want=
+	for c in "$@"; do
+		is_chip "$c" || { echo "error=Unknown chip: $c (can flash: $CHIPS)"; exit 1; }
+		[ -f "$UPD/$c.hex" ] || { echo "error=This system has no firmware for $c."; exit 1; }
+		case " $want " in *" $c "*) ;; *) want="$want $c" ;; esac
+	done
+	printf 'chips=%s\ntries=0\n' "${want# }" > "$REQ.new" && mv -f "$REQ.new" "$REQ" && sync
+	echo "pending=${want# }"
+}
+
+# 20170413 -> 2017-04-13
+fwver() { sed -n '1s/^\([0-9]\{4\}\)\([0-9][0-9]\)\([0-9][0-9]\).*/\1-\2-\3/p' "$UPD/$1.version" 2>/dev/null; }
+
+val() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+do_status() {
+	[ -f "$REQ" ] && echo "pending=$(val "$REQ" chips)"
+	for c in $CHIPS; do echo "${c}Version=$(fwver "$c")"; done
+	[ -f "$LAST" ] && cat "$LAST"
+}
+
+do_boot() {
+	[ -f "$REQ" ] || return 0
+	chips=$(val "$REQ" chips)
+	tries=$(val "$REQ" tries); tries=${tries:-0}
+	if [ "$tries" -ge 3 ]; then
+		printf 'last=%s\nresult=failed\nmessage=Flashing %s didn'\''t finish in 3 starts; given up.\n' "$(date '+%F %T')" "$chips" > "$LAST"
+		rm -f "$REQ"; sync
+		return 1
+	fi
+	printf 'chips=%s\ntries=%s\n' "$chips" $((tries + 1)) > "$REQ.new" && mv -f "$REQ.new" "$REQ" && sync
+
+	port=/dev/serial0; [ -e "$port" ] || port=/dev/ttyAMA0
+	{ echo "===== $(date '+%F %T') flashing: $chips (try $((tries + 1)))"; } >> "$LOG"
+	ok=; bad=
+	for c in $chips; do
+		case "$c" in hans) sel=-x ;; franz) sel=-y ;; *) continue ;; esac
+		echo "--- $c ($(fwver "$c"))" >> "$LOG"
+		# (its progress lines, with terminal codes, left out of the log)
+		"$UPD/flash_stm32" $sel -w "$UPD/$c.hex" "$port" > "$DIR/out" 2>&1; rc=$?
+		E=$(printf '\033')
+		sed "s/$E\[[su]//g; s/Wrote address 0x[0-9a-f]* ([0-9.]*%) //g" "$DIR/out" | grep -v '^[[:space:]]*$' >> "$LOG"
+		rm -f "$DIR/out"
+		if [ $rc = 0 ]; then
+			cp -f "$UPD/$c.version" "$UPD/$c.current"     # what check_and_flash_chips.sh reads
+			ok="$ok $c"
+		else
+			bad="$bad $c"
+		fi
+	done
+	ver() { for c in $1; do case "$c" in hans) n=Hans ;; franz) n=Franz ;; esac; printf '%s %s and ' "$n" "$(fwver "$c")"; done | sed 's/ and $//'; }
+	if [ -z "$bad" ]; then
+		printf 'last=%s\nresult=ok\nmessage=%s flashed.\n' "$(date '+%F %T')" "$(ver "$ok")" > "$LAST"
+	else
+		printf 'last=%s\nresult=failed\nmessage=Flashing %s failed%s. The log: %s\n' "$(date '+%F %T')" "$(echo $bad)" \
+			"${ok:+ (flashed:$ok)}" "$LOG" > "$LAST"
+	fi
+	echo "===== $(date '+%F %T') done: ok=${ok# } failed=${bad# }" >> "$LOG"
+	# keep the log small
+	tail -n 400 "$LOG" > "$LOG.new" && mv -f "$LOG.new" "$LOG"
+	rm -f "$REQ"; sync
+	[ -z "$bad" ]
+}
+
+case "$1" in
+	request) shift; do_request "$@" ;;
+	cancel)  rm -f "$REQ"; sync ;;
+	reboot)  ( sleep 2; sync; reboot ) > /dev/null 2>&1 & ;;
+	status)  do_status ;;
+	boot)    do_boot ;;
+	*) echo "usage: $0 request <chip>... | cancel | reboot | status | boot"; exit 1 ;;
+esac

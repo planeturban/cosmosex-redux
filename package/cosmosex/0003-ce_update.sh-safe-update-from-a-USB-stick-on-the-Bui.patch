@@ -1,0 +1,162 @@
+From 040f0d7d5bd4ec3f112c32d315b6879b64f2198e Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:01:10 +0100
+Subject: [PATCH] ce_update.sh: safe update from a USB stick on the Buildroot
+ image
+
+BusyBox unzip overwrites files in place, so unzipping into /ce rewrote
+this script (and cesuper.sh) while the shell was running it: the update
+stopped with a syntax error, or worked only by luck of shell buffering.
+Unpack into /tmp/ce_usb_update and move each file into /ce by rename.
+Accept a zip with everything in one top folder (GitHub 'Download ZIP'),
+refuse one without ce_update.sh and update/, and report failures in
+/tmp/UPDATE_STATUS.
+
+Also restore the image's check_for_update.sh after an update (the
+release one would try an online update), and leave out the Raspbian
+steps (systemd/SysV service, core_freq in /boot/config.txt,
+ctrl-alt-del, auto-login), which don't apply to the image.
+---
+ ce_update.sh | 104 +++++++++++++++++++++------------------------------
+ 1 file changed, 42 insertions(+), 62 deletions(-)
+
+diff --git a/ce_update.sh b/ce_update.sh
+index 62724dd..07165b8 100755
+--- a/ce_update.sh
++++ b/ce_update.sh
+@@ -23,7 +23,7 @@ fi
+ /ce/ce_stop.sh $1 $2
+ 
+ echo " "
+-echo "Updating CosmosEx from internet, this will take a while."
++echo "Updating CosmosEx from $( cat /tmp/UPDATE_FROM_USB ), this will take a while."
+ echo "DO NOT POWER OFF THE DEVICE!!!"
+ echo " "
+ 
+@@ -41,7 +41,37 @@ if [ -f /tmp/UPDATE_FROM_USB ]; then                    # if we're doing update
+     path_to_usb_update=$( cat /tmp/UPDATE_FROM_USB )    # get content of file into variable
+     rm -f /tmp/UPDATE_FROM_USB                          # delete file so we won't do it again next time
+ 
+-    unzip -o $path_to_usb_update -d /ce                 # unzip update into /ce directory, overwrite without prompting
++    # CosmosEx Buildroot image: BusyBox unzip overwrites a file in place, and
++    # this script and cesuper.sh are running from /ce: the shell would go on
++    # reading the new file at the old offset. Unpack to a staging folder and
++    # move each file into /ce by rename (a running script keeps its old file).
++    staging=/tmp/ce_usb_update
++    rm -rf $staging
++    mkdir -p $staging
++    if ! unzip -o -q "$path_to_usb_update" -d $staging; then
++        echo "Could not unpack $path_to_usb_update"
++        echo "USB update failed: bad zip file" > /tmp/UPDATE_STATUS
++        rm -rf $staging
++        exit 1
++    fi
++    src=$staging
++    # a zip made by GitHub ('Download ZIP') has everything in one top folder
++    if [ ! -f $src/ce_update.sh ] && [ "$( ls -A $src | wc -l )" -eq 1 ]; then
++        src=$( echo $src/* )
++    fi
++    if [ ! -f $src/ce_update.sh ] || [ ! -d $src/update ]; then
++        echo "$path_to_usb_update is not a CosmosEx update (no ce_update.sh and update/ in it)"
++        echo "USB update failed: not a CosmosEx update" > /tmp/UPDATE_STATUS
++        rm -rf $staging
++        exit 1
++    fi
++    ( cd $src && find . -type f ) | while read -r f; do
++        f=${f#./}
++        mkdir -p "/ce/$( dirname "$f" )"
++        cp -f "$src/$f" "/ce/$f.new" && mv -f "/ce/$f.new" "/ce/$f"
++    done
++    rm -rf $staging
++    echo "Unpacked $path_to_usb_update into /ce"
+ else    # download update from internet, by git or wget
+     # check if got git installed
+     git --version 2> /dev/null
+@@ -89,12 +119,12 @@ else    # download update from internet, by git or wget
+ fi
+ 
+ #--------------------------
+-# CosmosEx Buildroot image: the release's Raspberry Pi binaries are 32-bit
+-# (armhf) and can't run on this 64-bit system, and the update has just
+-# replaced this script with the unpatched release version. Put back the
+-# image's own copies of both. Files are replaced by rename, so the shell
+-# running this script keeps reading the old file.
+-for f in app/cosmosex update/flash_stm32 update/flash_xilinx ce_update.sh; do
++# CosmosEx Buildroot image: the release's Raspberry Pi binaries are built for
++# Raspbian (its libraries, ARMv6) and the update has just replaced this
++# script and check_for_update.sh with the release versions (online update).
++# Put back the image's own copies. Files are replaced by rename, so a shell
++# running one of them keeps reading the old file.
++for f in app/cosmosex update/flash_stm32 update/flash_xilinx ce_update.sh update/check_for_update.sh; do
+     if [ -f "/usr/share/cosmosex/ce/$f" ]; then
+         cp -f "/usr/share/cosmosex/ce/$f" "/ce/$f.new" && mv -f "/ce/$f.new" "/ce/$f"
+     fi
+@@ -115,61 +145,11 @@ chmod +x /ce/update/*.sh
+ 
+ #--------------
+ 
+-# on jessie update SysV init script, remove systemctl service
+-if [ "$distro" = "jessie" ]; then
+-    cp "/ce/initd_cosmosex" "/etc/init.d/cosmosex"
+-    rm -f "/etc/systemd/system/cosmosex.service"
+-fi
+-
+-# on stretch remove SysV init script, update systemctl service
+-if [ "$distro" = "stretch" ]; then
+-    rm -f "/etc/init.d/cosmosex"
+-    cp "/ce/cosmosex.service" "/etc/systemd/system/cosmosex.service"
+-fi
+-
+-#------------------------
+-# now add / change the core_freq param in the boot config to avoid SPI clock issues
+-coreFreqCountAny=$( cat /boot/config.txt | grep core_freq | wc -l )
+-coreFreqCountCorrect=$( cat /boot/config.txt | grep 'core_freq=250' | wc -l )
+-
+-addCoreFreq=0           # don't add it yet
+-
+-# A) no core_freq? Add it
+-if [ "$coreFreqCountAny" -eq "0" ]; then
+-    echo "No core_freq in /boot/config.txt, adding it"
+-    addCoreFreq=1
+-fi
+-
+-# B) more than one core_freq? Remove them, then add one
+-if [ "$coreFreqCountAny" -gt "1" ]; then
+-    echo "Too many core_freq in /boot/config.txt, fixing it"
+-    addCoreFreq=1
+-fi
+-
+-# C) There is some core_freq, but it's not correct? Remove it, then add correct one
+-if [ "$coreFreqCountAny" -gt "0" ] && [ "$coreFreqCountCorrect" -eq "0" ]; then
+-    echo "core_freq in /boot/config.txt is incorrect, fixing it"
+-    addCoreFreq=1
+-fi
+-
+-# if we need to add the core_freq
+-if [ "$addCoreFreq" -gt "0" ]; then
+-    mv /boot/config.txt /boot/config.old                            # back up old
+-    cat /boot/config.old | grep -v 'core_freq' > /boot/config.txt   # create new without any core_freq directive
+-
+-    # now append the correct core_config on the end of file
+-    echo "core_freq=250" >> /boot/config.txt
+-else
+-    # we don't need to do anything for case D), where there is one core_freq there and it's correct
+-    echo "core_freq is ok in /boot/config.txt"
+-fi
+-
+ #------------------------
+-# disable ctrl-alt-del causing restart
+-ln -fs /dev/null /lib/systemd/system/ctrl-alt-del.target
+-
+-# disable auto-login
+-ln -fs /lib/systemd/system/getty@.service /etc/systemd/system/getty.target.wants/getty@tty1.service
++# CosmosEx Buildroot image: the Raspbian steps of the release (systemd/SysV
++# service, core_freq in /boot/config.txt, ctrl-alt-del and auto-login) don't
++# apply: the image starts the app from /etc/init.d/S00ceapp, its config.txt
++# already has core_freq=250, and / and /boot are read-only.
+ 
+ sync
+ 
+-- 
+2.54.0 (Apple Git-157)
+

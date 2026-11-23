@@ -1,0 +1,25 @@
+#!/bin/sh
+# Install SSH public keys for user ce from the boot partition, so they can be
+# managed from a PC: every *.pub file and the file authorized_keys in the root
+# of the boot partition (the CosmosEx volume on a PC). Rebuilt on every boot, so deleting a file there revokes
+# the key. No keys means no SSH access (root and password logins are off).
+
+KEYS=/home/ce/.ssh/authorized_keys
+
+case "$1" in
+start)
+	mkdir -p /home/ce/.ssh
+	cat /boot/*.pub /boot/authorized_keys 2>/dev/null | tr -d '\r' | grep -E '^(ssh-|ecdsa-|sk-)' > "$KEYS.new"
+	mv "$KEYS.new" "$KEYS"
+	chown -R ce:ce /home/ce/.ssh
+	chmod 700 /home/ce/.ssh
+	chmod 600 "$KEYS"
+	echo "ce-sshkeys: $(wc -l < "$KEYS") SSH key(s) installed for ce"
+	;;
+stop|restart)
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac

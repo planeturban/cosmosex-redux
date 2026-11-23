@@ -1,0 +1,50 @@
+From 5a1b53391c42162c592d560c71b2414e2c7fbde8 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:10:03 +0200
+Subject: [PATCH 2/8] ce_main_app: add missing time.h and pthread.h includes
+
+debug.cpp and acsicommand/dateacsicommand.cpp use localtime() and struct
+tm, floppy/mfmcachedimage.cpp uses pthread_mutex_lock()/unlock(), without
+including the headers that declare them. Older toolchains pulled them in
+indirectly; GCC 14 with current glibc doesn't, so the build fails.
+---
+ ce_main_app/acsicommand/dateacsicommand.cpp | 1 +
+ ce_main_app/debug.cpp                       | 1 +
+ ce_main_app/floppy/mfmcachedimage.cpp       | 1 +
+ 3 files changed, 3 insertions(+)
+
+diff --git a/ce_main_app/acsicommand/dateacsicommand.cpp b/ce_main_app/acsicommand/dateacsicommand.cpp
+index d8617602..9c4c843b 100644
+--- a/ce_main_app/acsicommand/dateacsicommand.cpp
++++ b/ce_main_app/acsicommand/dateacsicommand.cpp
+@@ -1,3 +1,4 @@
++#include <time.h>
+ #include "dateacsicommand.h"
+ #include "global.h"
+ #include "debug.h"
+diff --git a/ce_main_app/debug.cpp b/ce_main_app/debug.cpp
+index 25300c88..f66131f5 100644
+--- a/ce_main_app/debug.cpp
++++ b/ce_main_app/debug.cpp
+@@ -3,6 +3,7 @@
+ #include <string.h>
+ #include <stdarg.h>
+ #include <sys/time.h>
++#include <time.h>
+ 
+ #include "global.h"
+ #include "debug.h"
+diff --git a/ce_main_app/floppy/mfmcachedimage.cpp b/ce_main_app/floppy/mfmcachedimage.cpp
+index e5df442e..fcec6b25 100644
+--- a/ce_main_app/floppy/mfmcachedimage.cpp
++++ b/ce_main_app/floppy/mfmcachedimage.cpp
+@@ -1,5 +1,6 @@
+ #include <string.h>
+ #include <stdio.h>
++#include <pthread.h>
+ #include "../debug.h"
+ #include "../utils.h"
+ 
+-- 
+2.54.0 (Apple Git-157)
+

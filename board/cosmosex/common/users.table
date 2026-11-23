@@ -1,0 +1,7 @@
+# The app's CIFS mounts look up uid/gid of user "pi" and fail without it
+# (ce_main_app/mounter.cpp). uid/gid 1000 as on stock. No login.
+pi 1000 pi 1000 * /home/pi /bin/false dialout,netdev - CosmosEx CIFS owner
+# Admin user: SSH with keys from the boot partition, HDMI console login,
+# sudo without password. "*" = no password; "sudo passwd ce" sets one, after
+# which the console asks for it.
+ce 1001 ce 1001 * /home/ce /bin/sh sudo,dialout,netdev,pi - CosmosEx admin

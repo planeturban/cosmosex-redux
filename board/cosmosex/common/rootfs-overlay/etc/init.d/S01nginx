@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# nginx in front of the CosmosEx app's web server (/etc/nginx/nginx.conf).
+# Right after the app (S00ceapp), before the network is up: it listens on
+# every address, present or to come.
+
+NGINX=/usr/sbin/nginx
+PIDFILE=/run/nginx.pid
+# -e: the log for the moment before the configuration is read (the built-in
+# path is on the data partition)
+ARGS="-e /run/nginx/error.log"
+
+case "$1" in
+	start)
+		mkdir -p /run/nginx
+		chown www-data:www-data /run/nginx
+		start-stop-daemon -S -q -x "$NGINX" -p "$PIDFILE" -- $ARGS
+		;;
+	stop)
+		start-stop-daemon -K -q -x "$NGINX" -p "$PIDFILE" -o
+		;;
+	reload)
+		"$NGINX" $ARGS -s reload
+		;;
+	restart)
+		"$0" stop
+		sleep 1
+		"$0" start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+esac

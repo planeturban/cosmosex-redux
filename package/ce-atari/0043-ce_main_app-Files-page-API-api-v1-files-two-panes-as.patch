@@ -1,0 +1,618 @@
+From 9ef94bd077515fa1bda5d433f042328e93f40ee6 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:55:42 +0100
+Subject: [PATCH] ce_main_app: Files page API (/api/v1/files), two panes as
+ Midnight Commander
+
+GET places, list, read (download), zip (several files and folders, made as
+it's sent); POST write (the body as a file, streamed to the tool's stdin),
+mkdir, delete, rename. A place is /storage, a translated drive folder, a
+USB drive, the shared drive or a partition of a hard disk image. The work
+is done by the image's /usr/sbin/ce-files (run without a shell; paths kept
+inside the place, no links followed); a download's headers are sent only
+once the tool's output isn't an error report.
+
+Attaching a hard disk image first closes its session on the Files page
+(ce-hdinspect close; refused while a file in it is in use): the ST mustn't
+share an image with a mount.
+---
+ .../webserver/api/resource/filesresource.cpp  | 420 ++++++++++++++++++
+ .../webserver/api/resource/filesresource.h    |  55 +++
+ .../api/resource/settingsresource.cpp         |  17 +-
+ .../webserver/api/router/apiv1router.cpp      |   8 +
+ .../webserver/api/router/apiv1router.h        |   2 +
+ 5 files changed, 499 insertions(+), 3 deletions(-)
+ create mode 100644 ce_main_app/webserver/api/resource/filesresource.cpp
+ create mode 100644 ce_main_app/webserver/api/resource/filesresource.h
+
+diff --git a/ce_main_app/webserver/api/resource/filesresource.cpp b/ce_main_app/webserver/api/resource/filesresource.cpp
+new file mode 100644
+index 00000000..a4b83299
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/filesresource.cpp
+@@ -0,0 +1,420 @@
++// The Files page's API: each request is one run of FILES_TOOL (see filesresource.h).
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/wait.h>
++#include "lib/cjson-code-58/cJSON.h"
++#include "debug.h"
++#include "filesresource.h"
++
++FilesResource::FilesResource() { }
++FilesResource::~FilesResource() { }
++
++void FilesResource::sendJson(mg_connection *conn, cJSON *root, int code)
++{
++    char *json = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    std::string s = json ? json : "{}";
++    free(json);
++    const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 403) ? "Forbidden" : (code == 404) ? "Not Found" :
++                       (code == 405) ? "Method Not Allowed" : (code == 409) ? "Conflict" : (code == 411) ? "Length Required" :
++                       (code == 413) ? "Payload Too Large" : (code == 415) ? "Unsupported Media Type" : "Error";
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) s.length());
++    mg_write(conn, s.c_str(), s.length());
++}
++
++void FilesResource::sendError(mg_connection *conn, int code, const std::string &message)
++{
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "error", message.c_str());
++    sendJson(conn, root, code);
++}
++
++static std::string lineValue(const std::string &out, const char *key)
++{
++    std::string k = std::string(key) + "=";
++    size_t pos = 0;
++    while(pos < out.length()) {
++        size_t end = out.find('\n', pos);
++        if(end == std::string::npos) end = out.length();
++        if(out.compare(pos, k.length(), k) == 0) return out.substr(pos + k.length(), end - pos - k.length());
++        pos = end + 1;
++    }
++    return "";
++}
++
++// the tool's exit code: 1 bad request, 2 not found, 3 exists, 4 refused
++void FilesResource::sendToolError(mg_connection *conn, int rc, const std::string &out)
++{
++    std::string err = lineValue(out, "error"), exists = lineValue(out, "exists");
++    if(err.empty()) err = rc < 0 ? "The file tool isn't there." : "That didn't work.";
++    int code = rc == 2 ? 404 : rc == 3 ? 409 : rc == 4 ? 403 : 400;
++    cJSON *e = cJSON_CreateObject();
++    cJSON_AddStringToObject(e, "error", err.c_str());
++    if(!exists.empty()) cJSON_AddStringToObject(e, "exists", exists.c_str());
++    sendJson(conn, e, code);
++}
++
++// Runs the tool without a shell. bodyFrom: the request body (bodyLen bytes)
++// goes to its stdin (all of it is read, also when the tool stops early).
++// stream: its output is the response (headers sent once it's clear the
++// output isn't an error report: "error=..." with a failing exit); otherwise
++// the output is collected in out. Returns the exit code (-1: couldn't run).
++static int runTool(const std::vector<std::string> &args, std::string &out, mg_connection *bodyFrom, long long bodyLen,
++                   mg_connection *stream, const std::string &headers, bool *streamed)
++{
++    if(streamed) *streamed = false;
++    std::vector<char *> argv;                   // made before fork: the child mustn't allocate (other threads)
++    for(size_t i = 0; i < args.size(); i++) argv.push_back((char *) args[i].c_str());
++    argv.push_back(NULL);
++    int fds[2], ins[2] = { -1, -1 };
++    if(pipe(fds) != 0) return -1;
++    if(bodyFrom && pipe(ins) != 0) { close(fds[0]); close(fds[1]); return -1; }
++    pid_t pid = fork();
++    if(pid < 0) { close(fds[0]); close(fds[1]); if(ins[0] >= 0) { close(ins[0]); close(ins[1]); } return -1; }
++    if(pid == 0) {
++        dup2(fds[1], 1);
++        int nul = open("/dev/null", O_RDWR);
++        if(nul >= 0) { dup2(ins[0] >= 0 ? ins[0] : nul, 0); dup2(nul, 2); }
++        long maxFd = sysconf(_SC_OPEN_MAX);
++        for(long fd = 3; fd < (maxFd > 0 ? maxFd : 1024); fd++) close(fd);
++        execv(argv[0], &argv[0]);
++        _exit(127);
++    }
++    close(fds[1]);
++    std::vector<char> bufv(65536);
++    char *buf = &bufv[0];
++    if(bodyFrom) {
++        // the tool says little until it has read everything (it fits the
++        // pipe), so writing all of the body first can't deadlock
++        close(ins[0]);
++        long long got = 0;
++        bool feeding = true;
++        while(got < bodyLen) {
++            int r = mg_read(bodyFrom, buf, (size_t) std::min<long long>((long long) bufv.size(), bodyLen - got));
++            if(r <= 0) break;
++            got += r;
++            for(int w = 0; feeding && w < r; ) {
++                ssize_t n = ::write(ins[1], buf + w, r - w);
++                if(n < 0 && errno == EINTR) continue;
++                if(n <= 0) { feeding = false; break; }      // it stopped reading (SIGPIPE is ignored)
++                w += n;
++            }
++        }
++        close(ins[1]);
++    }
++    ssize_t n;
++    bool ok = true;
++    if(!stream) {
++        while((n = read(fds[0], buf, bufv.size())) > 0) if(out.length() < (16u << 20)) out.append(buf, n);
++    } else {
++        // the first bytes decide: an error report, or the file
++        std::string head;
++        bool eof = false;
++        while(head.length() < 6 && !eof) {
++            n = read(fds[0], buf, bufv.size());
++            if(n > 0) head.append(buf, n); else eof = true;
++        }
++        if(head.compare(0, 6, "error=") == 0) {
++            while(!eof && head.length() < 65536) {
++                n = read(fds[0], buf, bufv.size());
++                if(n > 0) head.append(buf, n); else eof = true;
++            }
++        }
++        int st = 0;
++        bool ended = false, failed = false;
++        if(eof) {                               // finished: did it fail?
++            while(waitpid(pid, &st, 0) < 0 && errno == EINTR) { }
++            ended = true;
++            failed = !WIFEXITED(st) || WEXITSTATUS(st) != 0;
++        }
++        if(ended && failed && head.compare(0, 6, "error=") == 0) {
++            out = head;
++            close(fds[0]);
++            return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
++        }
++        mg_printf(stream, "%s", headers.c_str());
++        if(streamed) *streamed = true;
++        std::string pending = head;
++        for(;;) {
++            if(!pending.empty() && ok) {
++                char hb[16];
++                int hl = snprintf(hb, sizeof(hb), "%lx\r\n", (unsigned long) pending.length());
++                if(mg_write(stream, hb, hl) != hl || mg_write(stream, pending.data(), pending.length()) != (int) pending.length()
++                   || mg_write(stream, "\r\n", 2) != 2) ok = false;
++            }
++            pending.clear();
++            if(eof) break;
++            n = read(fds[0], buf, bufv.size());
++            if(n <= 0) eof = true; else pending.assign(buf, n);
++            if(!ok && !eof) continue;           // the browser went away: let the tool finish (it gets EPIPE... or not)
++        }
++        if(ok) mg_write(stream, "0\r\n\r\n", 5);
++        close(fds[0]);
++        if(ended) return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
++        while(waitpid(pid, &st, 0) < 0 && errno == EINTR) { }
++        return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
++    }
++    close(fds[0]);
++    int st = 0;
++    while(waitpid(pid, &st, 0) < 0 && errno == EINTR) { }
++    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
++}
++
++static std::string getVar(const char *qs, const char *name, int occurrence = 0)
++{
++    std::vector<char> v(4096);
++    int n = mg_get_var2(qs, strlen(qs), name, &v[0], v.size(), occurrence);
++    return n >= 0 ? std::string(&v[0], n) : std::string();
++}
++
++static bool hasVar(const char *qs, const char *name)
++{
++    std::vector<char> v(4096);
++    return mg_get_var2(qs, strlen(qs), name, &v[0], v.size(), 0) >= 0;
++}
++
++// split "a\tb\tc" into fields
++static std::vector<std::string> fields(const std::string &line)
++{
++    std::vector<std::string> f;
++    size_t a = 0, b;
++    while((b = line.find('\t', a)) != std::string::npos) { f.push_back(line.substr(a, b - a)); a = b + 1; }
++    f.push_back(line.substr(a));
++    return f;
++}
++
++static std::vector<std::string> lines(const std::string &out)
++{
++    std::vector<std::string> l;
++    size_t pos = 0;
++    while(pos < out.length()) {
++        size_t end = out.find('\n', pos);
++        if(end == std::string::npos) end = out.length();
++        l.push_back(out.substr(pos, end - pos));
++        pos = end + 1;
++    }
++    return l;
++}
++
++void FilesResource::places(mg_connection *conn)
++{
++    std::vector<std::string> args;
++    args.push_back(FILES_TOOL); args.push_back("places");
++    std::string out;
++    int rc = runTool(args, out, NULL, 0, NULL, "", NULL);
++    if(rc != 0) { sendToolError(conn, rc, out); return; }
++    cJSON *root = cJSON_CreateObject(), *pl = cJSON_CreateArray(), *im = cJSON_CreateArray();
++    std::vector<std::string> ls = lines(out);
++    for(size_t i = 0; i < ls.size(); i++) {
++        if(ls[i].compare(0, 6, "place=") == 0) {
++            std::vector<std::string> f = fields(ls[i].substr(6));
++            if(f.size() < 6) continue;
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddStringToObject(o, "id", f[0].c_str());
++            cJSON_AddStringToObject(o, "label", f[1].c_str());
++            cJSON_AddStringToObject(o, "kind", f[2].c_str());
++            cJSON_AddNumberToObject(o, "freeKB", atof(f[3].c_str()));
++            cJSON_AddNumberToObject(o, "totalKB", atof(f[4].c_str()));
++            cJSON_AddBoolToObject(o, "writable", f[5] == "yes");
++            cJSON_AddItemToArray(pl, o);
++        } else if(ls[i].compare(0, 6, "image=") == 0) {
++            std::vector<std::string> f = fields(ls[i].substr(6));
++            if(f.size() < 2) continue;
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddStringToObject(o, "path", f[0].c_str());
++            cJSON_AddStringToObject(o, "name", f[0].substr(f[0].find_last_of('/') + 1).c_str());
++            cJSON_AddNumberToObject(o, "size", atof(f[1].c_str()));
++            cJSON_AddItemToArray(im, o);
++        }
++    }
++    cJSON_AddItemToObject(root, "places", pl);
++    cJSON_AddItemToObject(root, "images", im);
++    sendJson(conn, root);
++}
++
++void FilesResource::list(mg_connection *conn, const char *qs)
++{
++    std::string place = getVar(qs, "place"), dir = getVar(qs, "dir");
++    if(place.empty()) { sendError(conn, 400, "which place?"); return; }
++    if(dir.empty()) dir = "/";
++    std::vector<std::string> args;
++    args.push_back(FILES_TOOL); args.push_back("ls"); args.push_back(place); args.push_back(dir);
++    std::string out;
++    int rc = runTool(args, out, NULL, 0, NULL, "", NULL);
++    if(rc != 0) { sendToolError(conn, rc, out); return; }
++    cJSON *root = cJSON_CreateObject(), *entries = cJSON_CreateArray();
++    cJSON_AddStringToObject(root, "place", place.c_str());
++    cJSON_AddStringToObject(root, "dir", dir.c_str());
++    std::vector<std::string> ls = lines(out);
++    for(size_t i = 0; i < ls.size(); i++) {
++        const std::string &l = ls[i];
++        if(l.length() > 2 && l[1] == '\t') {
++            std::vector<std::string> f = fields(l);
++            if(f.size() < 4) continue;
++            const char *type = f[0] == "d" ? "folder" : f[0] == "f" ? "file" : f[0] == "l" ? "link" : "other";
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddStringToObject(o, "type", type);
++            cJSON_AddNumberToObject(o, "size", atof(f[1].c_str()));
++            cJSON_AddNumberToObject(o, "mtime", atof(f[2].c_str()));
++            cJSON_AddStringToObject(o, "name", f[3].c_str());
++            cJSON_AddItemToArray(entries, o);
++        } else if(l.compare(0, 9, "writable=") == 0) cJSON_AddBoolToObject(root, "writable", l.substr(9) == "yes");
++        else if(l.compare(0, 8, "names83=") == 0) cJSON_AddBoolToObject(root, "names83", l.substr(8) == "yes");
++        else if(l.compare(0, 7, "freeKB=") == 0) cJSON_AddNumberToObject(root, "freeKB", atof(l.substr(7).c_str()));
++        else if(l.compare(0, 8, "totalKB=") == 0) cJSON_AddNumberToObject(root, "totalKB", atof(l.substr(8).c_str()));
++        else if(l == "more=yes") cJSON_AddBoolToObject(root, "more", true);
++    }
++    cJSON_AddItemToObject(root, "entries", entries);
++    sendJson(conn, root);
++}
++
++// a download's file name: plain ASCII as filename=, the real one as filename*= (RFC 6266)
++static std::string disposition(const std::string &name)
++{
++    std::string ascii, enc;
++    for(size_t i = 0; i < name.length(); i++) {
++        unsigned char c = name[i];
++        ascii += (c < 32 || c > 126 || c == '"' || c == '\\') ? '_' : (char) c;
++        if(isalnum(c) || strchr("-._~", c)) enc += (char) c;
++        else { char b[4]; snprintf(b, sizeof(b), "%%%02X", c); enc += b; }
++    }
++    return "Content-Disposition: attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + enc + "\r\n";
++}
++
++void FilesResource::download(mg_connection *conn, const char *qs, bool zip)
++{
++    std::string place = getVar(qs, "place");
++    if(place.empty()) { sendError(conn, 400, "which place?"); return; }
++    std::vector<std::string> args;
++    args.push_back(FILES_TOOL);
++    std::string name;
++    if(zip) {
++        std::string dir = getVar(qs, "dir");
++        args.push_back("zip"); args.push_back(place); args.push_back(dir.empty() ? "/" : dir);
++        int n = 0;
++        for(int i = 0; i < 10000 && hasVar(qs, "name") ; i++) {
++            std::vector<char> v(4096);
++            int len = mg_get_var2(qs, strlen(qs), "name", &v[0], v.size(), i);
++            if(len < 0) break;
++            args.push_back(std::string(&v[0], len));
++            n++;
++        }
++        if(n == 0) { sendError(conn, 400, "which files?"); return; }
++        name = n == 1 ? args.back() + ".zip" : "files.zip";
++    } else {
++        std::string file = getVar(qs, "file");
++        if(file.empty()) { sendError(conn, 400, "which file?"); return; }
++        args.push_back("cat"); args.push_back(place); args.push_back(file);
++        name = file.substr(file.find_last_of('/') + 1);
++    }
++    std::string headers = std::string("HTTP/1.1 200 OK\r\nContent-Type: ") + (zip ? "application/zip" : "application/octet-stream") +
++                          "\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\n" + disposition(name) +
++                          "Transfer-Encoding: chunked\r\n\r\n";
++    std::string out;
++    bool streamed = false;
++    int rc = runTool(args, out, NULL, 0, conn, headers, &streamed);
++    if(!streamed) sendToolError(conn, rc, out);
++}
++
++void FilesResource::write(mg_connection *conn, const char *qs)
++{
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/octet-stream", 24) != 0) { sendError(conn, 415, "Content-Type must be application/octet-stream"); return; }
++    const char *len = mg_get_header(conn, "Content-Length");
++    long long total = len ? atoll(len) : -1;
++    if(total < 0) { sendError(conn, 411, "Content-Length needed"); return; }
++    if(total > (long long) FILES_PUT_MAX_MB * 1024 * 1024) { sendError(conn, 413, "That file is too large to upload here."); return; }
++    std::string place = getVar(qs, "place"), dir = getVar(qs, "dir"), name = getVar(qs, "name");
++    if(place.empty() || name.empty()) { sendError(conn, 400, "which place and name?"); return; }
++    char size[32];
++    snprintf(size, sizeof(size), "%lld", total);
++    std::vector<std::string> args;
++    args.push_back(FILES_TOOL); args.push_back("put"); args.push_back(place); args.push_back(dir.empty() ? "/" : dir);
++    args.push_back(name); args.push_back(size);
++    if(getVar(qs, "overwrite") == "1") args.push_back("overwrite");
++    std::string out;
++    int rc = runTool(args, out, conn, total, NULL, "", NULL);
++    if(rc != 0) { sendToolError(conn, rc, out); return; }
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "name", lineValue(out, "name").c_str());
++    cJSON_AddNumberToObject(root, "size", (double) total);
++    sendJson(conn, root);
++}
++
++static std::string jsonString(cJSON *o, const char *key)
++{
++    cJSON *v = o ? cJSON_GetObjectItem(o, key) : NULL;
++    return (v && v->type == cJSON_String && v->valuestring) ? v->valuestring : "";
++}
++
++void FilesResource::change(mg_connection *conn, const std::string &what)
++{
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/json", 16) != 0) { sendError(conn, 415, "Content-Type must be application/json"); return; }
++    std::string body;
++    char b[1024];
++    int n;
++    while((n = mg_read(conn, b, sizeof(b))) > 0) if(body.length() < (1u << 20)) body.append(b, n);
++    cJSON *in = cJSON_Parse(body.c_str());
++    if(!in) { sendError(conn, 400, "bad JSON"); return; }
++    std::string place = jsonString(in, "place"), dir = jsonString(in, "dir");
++    if(dir.empty()) dir = "/";
++    std::vector<std::string> args;
++    args.push_back(FILES_TOOL);
++    if(what == "mkdir") {
++        args.push_back("mkdir"); args.push_back(place); args.push_back(dir); args.push_back(jsonString(in, "name"));
++    } else if(what == "rename") {
++        args.push_back("rename"); args.push_back(place); args.push_back(dir); args.push_back(jsonString(in, "from")); args.push_back(jsonString(in, "to"));
++    } else {                                                // delete
++        args.push_back("rm"); args.push_back(place); args.push_back(dir);
++        cJSON *names = cJSON_GetObjectItem(in, "names");
++        int count = names && names->type == cJSON_Array ? cJSON_GetArraySize(names) : 0;
++        for(int i = 0; i < count && i < 10000; i++) {
++            cJSON *x = cJSON_GetArrayItem(names, i);
++            if(x && x->type == cJSON_String && x->valuestring) args.push_back(x->valuestring);
++        }
++        if(args.size() < 5) { cJSON_Delete(in); sendError(conn, 400, "which files?"); return; }
++    }
++    cJSON_Delete(in);
++    if(place.empty()) { sendError(conn, 400, "which place?"); return; }
++    std::string out;
++    int rc = runTool(args, out, NULL, 0, NULL, "", NULL);
++    if(rc != 0) { sendToolError(conn, rc, out); return; }
++    Debug::out(LOG_DEBUG, "FilesResource: %s in %s %s", what.c_str(), place.c_str(), dir.c_str());
++    cJSON *root = cJSON_CreateObject();
++    std::string nm = lineValue(out, "name"), del = lineValue(out, "deleted");
++    if(!nm.empty()) cJSON_AddStringToObject(root, "name", nm.c_str());
++    if(!del.empty()) cJSON_AddNumberToObject(root, "deleted", atoi(del.c_str()));
++    sendJson(conn, root);
++}
++
++bool FilesResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
++{
++    std::string what = sResourceInfo;
++    while(!what.empty() && what[0] == '/') what.erase(0, 1);
++    const char *qs = req_info->query_string ? req_info->query_string : "";
++    bool get = strcmp(req_info->request_method, "GET") == 0, post = strcmp(req_info->request_method, "POST") == 0;
++    if(access(FILES_TOOL, X_OK) != 0) { sendError(conn, 404, "The Files page isn't available on this system."); return true; }
++
++    if(get && what == "places") places(conn);
++    else if(get && what == "list") list(conn, qs);
++    else if(get && what == "read") download(conn, qs, false);
++    else if(get && what == "zip") download(conn, qs, true);
++    else if(post && what == "write") write(conn, qs);
++    else if(post && (what == "mkdir" || what == "delete" || what == "rename")) change(conn, what);
++    else if(what == "places" || what == "list" || what == "read" || what == "zip" || what == "write" || what == "mkdir" || what == "delete" || what == "rename")
++        sendError(conn, 405, "method not allowed");
++    else sendError(conn, 404, "no such files call");
++    return true;
++}
+diff --git a/ce_main_app/webserver/api/resource/filesresource.h b/ce_main_app/webserver/api/resource/filesresource.h
+new file mode 100644
+index 00000000..b99320c9
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/filesresource.h
+@@ -0,0 +1,55 @@
++#ifndef FILESRESOURCE_H
++#define FILESRESOURCE_H
++
++#include <string>
++#include <vector>
++
++#include "../../CivetServer.h"
++
++#include "iapiresource.h"
++
++// The web interface's Files page (two panes, as Midnight Commander): the
++// file work is done by the image's FILES_TOOL (Buildroot image:
++// /usr/sbin/ce-files), run without a shell for each request; a place is
++// "storage", "tr:<X>", "usb:<name>", "shared" or "img:<part>:<image>" (see
++// the tool).
++//
++//   GET  /api/v1/files/places                     {places: [{id, label, kind, freeKB, totalKB, writable}],
++//                                                  images: [{path, name, size}]}
++//   GET  /api/v1/files/list?place=&dir=           {dir, writable, names83, freeKB, totalKB,
++//                                                  entries: [{type, size, mtime, name}], more}
++//   GET  /api/v1/files/read?place=&file=          the file (a download)
++//   GET  /api/v1/files/zip?place=&dir=&name=...   those files and folders as one zip (name repeated)
++//   POST /api/v1/files/write?place=&dir=&name=[&overwrite=1]
++//                                                 the body (application/octet-stream, at most
++//                                                 FILES_PUT_MAX_MB) as a file: {name, size}
++//   POST /api/v1/files/mkdir   {place, dir, name}         {name}
++//   POST /api/v1/files/delete  {place, dir, names: []}    {deleted}
++//   POST /api/v1/files/rename  {place, dir, from, to}     {name}
++//
++// Errors: 400, 404, 409 (a name already there: {"error", "exists"}), 403
++// (read-only, or an image the ST has attached). The POSTs other than write
++// need Content-Type application/json (a page on another site can't send that
++// without asking first); write needs application/octet-stream.
++
++#define FILES_TOOL          "/usr/sbin/ce-files"
++#define FILES_PUT_MAX_MB    2048
++
++class FilesResource : public IApiResource {
++public:
++    FilesResource();
++    virtual ~FilesResource();
++    bool dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo="" );
++
++private:
++    void sendJson(mg_connection *conn, struct cJSON *root, int code = 200);
++    void sendError(mg_connection *conn, int code, const std::string &message);
++    void sendToolError(mg_connection *conn, int rc, const std::string &out);
++    void places(mg_connection *conn);
++    void list(mg_connection *conn, const char *qs);
++    void download(mg_connection *conn, const char *qs, bool zip);
++    void write(mg_connection *conn, const char *qs);
++    void change(mg_connection *conn, const std::string &what);
++};
++
++#endif
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index a21108f6..7735af0a 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -199,6 +199,10 @@ static std::vector<std::string> usbMounts(void)
+     return out;
+ }
+ 
++#define HDINSPECT_TOOL  "/usr/sbin/ce-hdinspect"
++static int runArgv(const std::vector<std::string> &args, std::string *out, size_t maxOut, mg_connection *stream,
++                   mg_connection *bodyFrom = NULL, long long bodyLen = 0);
++
+ // where: "storage" (HDD_IMAGES_DIR) or "usb"; false: not an image we handle
+ static bool listedImage(const std::string &path, std::string &real, std::string &where)
+ {
+@@ -1083,6 +1087,15 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+                 fclose(wf);
+             }
+             if(w[0] && strcmp(w, real) == 0) { msg = "A change is being written into this image (Look inside): try again in a moment."; return false; }
++            // open on the Files page (maybe writable): closed first, the ST
++            // mustn't share the image with a mount
++            std::vector<std::string> args;
++            args.push_back(HDINSPECT_TOOL); args.push_back("close"); args.push_back(real);
++            std::string out;
++            if(access(HDINSPECT_TOOL, X_OK) == 0 && runArgv(args, &out, 4096, NULL, NULL, 0) != 0) {
++                msg = "This image is open on the Files page and a file in it is in use: try again in a moment.";
++                return false;
++            }
+         }
+         path = real;
+         if(!S_ISREG(st.st_mode))               { msg = "That's not a regular file."; return false; }
+@@ -1152,15 +1165,13 @@ void SettingsResource::sendError(mg_connection *conn, int code, const char *mess
+ 
+ /* ----------------------------------------------- look inside an image */
+ 
+-#define HDINSPECT_TOOL  "/usr/sbin/ce-hdinspect"
+-
+ // run a program without a shell (arguments from requests can't become
+ // commands); its stdout into out (at most maxOut bytes), or as a chunked
+ // response to conn. Returns the exit status (-1: couldn't run).
+ // bodyFrom: the request body (bodyLen bytes) goes to the program's stdin
+ // (all of it is read from the connection, also when the program stops early)
+ static int runArgv(const std::vector<std::string> &args, std::string *out, size_t maxOut, mg_connection *stream,
+-                   mg_connection *bodyFrom = NULL, long long bodyLen = 0)
++                   mg_connection *bodyFrom, long long bodyLen)
+ {
+     std::vector<char *> argv;                   // made before fork: the child mustn't allocate (other threads)
+     for(size_t i = 0; i < args.size(); i++) argv.push_back((char *) args[i].c_str());
+diff --git a/ce_main_app/webserver/api/router/apiv1router.cpp b/ce_main_app/webserver/api/router/apiv1router.cpp
+index 5d21af11..e90aa2e7 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.cpp
++++ b/ce_main_app/webserver/api/router/apiv1router.cpp
+@@ -23,6 +23,7 @@ ApiV1Router::ApiV1Router(VirtualKeyboardService* pxVKbdService,VirtualMouseServi
+     pxLibrary=new LibraryResource(pxFloppyService);
+     pxSettings=new SettingsResource();
+     pxSystem=new SystemResource();
++    pxFiles=new FilesResource();
+ }
+ 
+ ApiV1Router::~ApiV1Router()
+@@ -37,6 +38,7 @@ ApiV1Router::~ApiV1Router()
+     delete pxLibrary;
+     delete pxSettings;
+     delete pxSystem;
++    delete pxFiles;
+     pxStatus=NULL;
+     pxLibrary=NULL;
+     pxMouse=NULL;
+@@ -124,6 +126,12 @@ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+         sResourceInfo.erase(0,7);
+         bool processed=pxSystem->dispatch(conn,req_info,sResourceInfo);
+         return processed;
++    } else if( sResource.substr(0,6)=="files/" )
++    {
++        std::string sResourceInfo=sResource;
++        sResourceInfo.erase(0,6);
++        bool processed=pxFiles->dispatch(conn,req_info,sResourceInfo);
++        return processed;
+     } else if( sResource=="status" )
+     {
+         bool processed=pxStatus->dispatch(conn,req_info);
+diff --git a/ce_main_app/webserver/api/router/apiv1router.h b/ce_main_app/webserver/api/router/apiv1router.h
+index 5440699d..a89189bf 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.h
++++ b/ce_main_app/webserver/api/router/apiv1router.h
+@@ -16,6 +16,7 @@
+ #include "../resource/libraryresource.h"
+ #include "../resource/settingsresource.h"
+ #include "../resource/systemresource.h"
++#include "../resource/filesresource.h"
+ 
+ class ApiV1Router: public CivetHandler
+ {
+@@ -36,6 +37,7 @@ private:
+     LibraryResource *pxLibrary;
+     SettingsResource *pxSettings;
+     SystemResource *pxSystem;
++    FilesResource *pxFiles;
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

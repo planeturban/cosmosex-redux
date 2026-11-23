@@ -1,0 +1,79 @@
+#!/bin/sh
+# Show how long this boot took to reach each stage, in seconds since the
+# kernel started. (The firmware stage before that, from power-on, isn't
+# visible from Linux: time it with a stopwatch and add it.)
+#
+#   ce-boottime           table of all stages
+#   ce-boottime --short   one line, for the HDMI banner (ce-issue)
+#
+# The times come from the kernel log, the init script's log and the uptime
+# column of the app's log, not from the clock (which is set during the boot).
+
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+
+# An app log line -> seconds since the kernel started. Its first column is
+# the system's uptime in ms (Utils::getCurrentMs). Not the date in the line:
+# the clock isn't at 1970 when the app starts (the image sets it to the last
+# known time first).
+upsecs() {
+	awk '$1 ~ /^[0-9]+$/ { printf "%.1f\n", $1 / 1000 }'
+}
+
+# --- collect --------------------------------------------------------------
+
+# The lines of a log from its last line matching $1 on, at most 3000 (what's
+# looked for comes early). Not by collecting lines in awk: the app's log is
+# up to 2 MB, and BusyBox awk appending to one string took minutes on a Pi
+# 3, holding up the boot (S99ceissue waits for the banner).
+from_last() {
+	n=$(grep -n -E "$1" "$2" 2>/dev/null | tail -n 1 | cut -d: -f1)
+	[ -n "$n" ] && sed -n "${n},$((n + 2999))p" "$2"
+}
+
+kernel=$(dmesg | sed -n 's/^\[ *\([0-9.]*\)\] Run \/sbin\/\(ce-pre\)\{0,1\}init.*/\1/p' | head -n 1 |
+	awk '{ printf "%.1f", $1 }')
+
+# This boot's part of the init log: from the last "init start" on
+init=$(from_last ' init start$' /var/log/ceapp-init.log)
+script=$(echo "$init" | sed -n 's/.*\[\([0-9.]*\)s\] init start$/\1/p')
+request=$(echo "$init" | sed -n 's/.*\[\([0-9.]*\)s\] \(starting CosmosEx\|doflash.txt found.*\|chip firmware differs.*\)$/\1/p' | head -n 1)
+flashed=$(echo "$init" | grep -qE 'doflash|firmware differs' && echo yes)
+
+# This boot's part of ce.log: after the init script's last boot marker
+celog=$(from_last '^===== ceapp: boot' /var/log/ce.log)
+running=$(echo "$celog" | grep 'CosmosEx starting' | head -n 1 | upsecs)
+# Debug-level log line, only with log level 3 (see below)
+ready=$(echo "$celog" | grep 'Got answers from both Hans and Franz' | head -n 1 | upsecs)
+
+# --- one line for the banner ----------------------------------------------
+
+if [ "$1" = --short ]; then
+	line="kernel ${kernel:-?} s,  app running ${running:-?} s"
+	[ -n "$ready" ] && line="$line,  ready $ready s"
+	[ -n "$flashed" ] && line="$line  (chips flashed)"
+	echo "$line"
+	exit 0
+fi
+
+# --- table ----------------------------------------------------------------
+
+row() {
+	printf '  %-38s %s\n' "$1" "${2:-?}"
+}
+
+echo "Boot timing (seconds since kernel start)"
+row "kernel done, init starts" "$kernel"
+row "CosmosEx init script starts" "$script"
+row "app start requested" "$request"
+[ -n "$flashed" ] && echo "    (this boot flashed chips, so it's slower)"
+row "app running" "$running"
+row "Hans and Franz answering (app ready)" "${ready:-? - needs debug log level, see below}"
+row "now" "$(cut -d' ' -f1 /proc/uptime)"
+
+if [ -z "$ready" ]; then
+	echo
+	echo "For the 'app ready' time, enable debug logging for one boot:"
+	echo "  echo ll3 | sudo tee /ce/default_args; sudo reboot"
+	echo "and afterwards switch it off again:"
+	echo "  sudo rm /ce/default_args; sudo reboot"
+fi

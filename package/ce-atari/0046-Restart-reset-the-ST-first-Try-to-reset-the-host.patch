@@ -1,0 +1,204 @@
+From 6b0f5641bad2bc80bc58c9e820ae6f0d6e0626a9 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:48:06 +0100
+Subject: [PATCH] Restart: reset the ST first (Try to reset the host)
+
+CE_DD: the VBL that asks the CosmosEx for the screenshot config once a
+second is always installed (not only with screenshots on); when the answer
+has "RS" in bytes 2, 3, the driver resets the ST (as Ctrl+Alt+Del: jump
+through the reset vector). It doesn't ask while one of its GEMDOS calls
+runs (the driver's mutex) or the DMA is in use (flock).
+
+ce_main_app: POST /api/v1/system/update/restart {"resetSt": true} sets the
+request, waits up to 2.5 s for the driver to take it, then 0.2 s, and
+restarts with the app stopped first (ce-sysupdate restart stopapp), so the
+ST doesn't find the CosmosEx while it goes down. The answer says resetSt:
+reset | noanswer. The once-a-second question isn't logged.
+---
+ ce_dd_prg/main.c                              |  5 +--
+ ce_dd_prg/screen.c                            | 27 ++++++++++++----
+ ce_main_app/global.h                          |  6 ++++
+ .../translated/translateddisk_general.cpp     | 12 ++++++-
+ .../webserver/api/resource/systemresource.cpp | 32 +++++++++++++++++++
+ 5 files changed, 73 insertions(+), 9 deletions(-)
+
+diff --git a/ce_dd_prg/main.c b/ce_dd_prg/main.c
+index 01486c65..b30785ab 100644
+--- a/ce_dd_prg/main.c
++++ b/ce_dd_prg/main.c
+@@ -236,11 +236,12 @@ int main( int argc, char* argv[] )
+     }
+ 
+     //-------------------------------------
+-    // if screenshots functionality was enabled
++    // the VBL that asks the CosmosEx once a second for a screenshot or a
++    // reset of the ST (before a CosmosEx restart): always installed
+     if(screenShots.enabled) {
+         (void) Cconws(">>> ScreenShots VBL installed. <<<\r\n" );
+-        Supexec(init_screencapture);
+     }
++    Supexec(init_screencapture);
+     Supexec(installCEPIcookie);         // install the CEPI cookie
+ 
+ 
+diff --git a/ce_dd_prg/screen.c b/ce_dd_prg/screen.c
+index 8b806127..f54cc535 100644
+--- a/ce_dd_prg/screen.c
++++ b/ce_dd_prg/screen.c
+@@ -15,14 +15,19 @@ void writeScreen(BYTE command, BYTE screenmode, BYTE *bfr, DWORD cnt);
+ 
+ extern volatile mutex mtx;
+ 
+-void screenworker(void)
++// reset the ST, as Ctrl+Alt+Del (called in supervisor mode: the VBL)
++static void resetST(void)
+ {
+-    // screenshots VBL not enabled? quit
+-    if(!screenShots.enabled) {
+-        return;
+-    }
++    __asm__ __volatile__("move.w  #0x2700,sr\n\t"
++                         "move.l  0x0004.w,a0\n\t"
++                         "jmp     (a0)\n\t" : : : "a0");
++}
+ 
+-    if( mutex_trylock(&mtx)==0 ){
++void screenworker(void)
++{
++    // (runs once a second also with screenshots off: the CosmosEx may ask
++    // for a reset of the ST before it restarts)
++    if( mutex_trylock(&mtx)==0 ){           // a GEMDOS call of the driver is running: not now
+         return;
+     }
+ 
+@@ -43,6 +48,16 @@ void screenworker(void)
+     screenShots.enabled = pDmaBuffer[0];    // 0: screenshots VBL enabled?
+     screenShots.take    = pDmaBuffer[1];    // 1: take screenshot?
+ 
++    if(pDmaBuffer[2] == 'R' && pDmaBuffer[3] == 'S') {    // 2, 3: "RS": reset the ST now (the CosmosEx restarts)
++        resetST();                          // (no return)
++    }
++
++    if(!screenShots.enabled) {              // screenshots off: nothing more
++        hdIf.forceFlock = 0;
++        mutex_unlock(&mtx);
++        return;
++    }
++
+     //-------------
+     // now take screenshot if requested
+     if(!screenShots.take) {                 // don't take screenshot? quit
+diff --git a/ce_main_app/global.h b/ce_main_app/global.h
+index 09033aa7..25e2b4b9 100644
+--- a/ce_main_app/global.h
++++ b/ce_main_app/global.h
+@@ -106,6 +106,12 @@ typedef struct {
+ 
+     volatile bool screenShotVblEnabled;
+     volatile bool doScreenShot;
++
++    // reset the ST (before a restart of the CosmosEx): the web server sets
++    // resetSt, the ST's driver (CE_DD) gets it with the screenshot config
++    // (it asks once a second) and resets; resetStSent says it got it
++    volatile bool resetSt;
++    volatile bool resetStSent;
+ } InterProcessEvents;
+ 
+ extern InterProcessEvents events;
+diff --git a/ce_main_app/translated/translateddisk_general.cpp b/ce_main_app/translated/translateddisk_general.cpp
+index 443a11f6..ca703a6b 100644
+--- a/ce_main_app/translated/translateddisk_general.cpp
++++ b/ce_main_app/translated/translateddisk_general.cpp
+@@ -547,7 +547,9 @@ void TranslatedDisk::processCommand(BYTE *cmd)
+     }
+ 
+     const char *functionName = functionCodeToName(cmd[4]);
+-    Debug::out(LOG_DEBUG, "TranslatedDisk function - %s (%02x)", functionName, cmd[4]);
++    if(cmd[4] != TRAN_CMD_SCREENSHOT_CONFIG) {          // (not the driver's question once a second)
++        Debug::out(LOG_DEBUG, "TranslatedDisk function - %s (%02x)", functionName, cmd[4]);
++    }
+     //>dataTrans->dumpDataOnce();
+ 
+     // now do all the command handling
+@@ -1601,6 +1603,14 @@ void TranslatedDisk::getScreenShotConfig(BYTE *cmd)
+     dataTrans->addDataByte(events.doScreenShot);
+     events.doScreenShot = false;                                        // unset this flag so we will send only one screenshot
+ 
++    if(events.resetSt) {                                                // bytes 2, 3: "RS": reset the ST now (the CosmosEx restarts)
++        dataTrans->addDataByte('R');
++        dataTrans->addDataByte('S');
++        events.resetSt      = false;
++        events.resetStSent  = true;
++        Debug::out(LOG_INFO, "TranslatedDisk: asked the ST to reset");
++    }
++
+     dataTrans->padDataToMul16();
+     dataTrans->setStatus(E_OK);
+ }
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 151311b2..cad0614f 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -20,6 +20,7 @@
+ #include "lib/cjson-code-58/cJSON.h"
+ #include "debug.h"
+ #include "systemresource.h"
++#include "global.h"
+ #include <openssl/evp.h>
+ #include <openssl/rand.h>
+ #include <openssl/crypto.h>
+@@ -85,6 +86,23 @@ static bool startToolAt(const char *tool, const std::string &args)
+     return true;
+ }
+ 
++// ask the ST's driver (CE_DD) to reset the ST: it asks once a second, so
++// wait up to 2.5 s for it to take the request, then 0.2 s for the reset.
++// false: no answer (no driver running: the ST off, a floppy game, a crash)
++static bool resetTheSt(void)
++{
++    events.resetStSent = false;
++    events.resetSt     = true;
++    for(int i = 0; i < 125 && !events.resetStSent; i++) usleep(20 * 1000);
++    events.resetSt     = false;
++    if(!events.resetStSent) {
++        Debug::out(LOG_INFO, "SystemResource: the ST didn't take the reset (no CE_DD answering)");
++        return false;
++    }
++    usleep(200 * 1000);
++    return true;
++}
++
+ static bool startTool(const std::string &args)
+ {
+     return startToolAt(SYSUPDATE_TOOL, args);
+@@ -295,6 +313,8 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     bool restart = !(jr && jr->type == cJSON_False);        // "restart": false -> install only (-n)
+     cJSON *js = jin ? cJSON_GetObjectItem(jin, "slot") : NULL;
+     std::string slot = (js && js->type == cJSON_String && js->valuestring) ? js->valuestring : "";
++    cJSON *jrs = jin ? cJSON_GetObjectItem(jin, "resetSt") : NULL;
++    bool resetSt = jrs && jrs->type == cJSON_True;          // restart: {"resetSt": true}: reset the ST first
+     if(jin) cJSON_Delete(jin);
+     std::string opt = restart ? "" : "-n ";
+ 
+@@ -337,6 +357,18 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+     if(what == "online" || what == "keep" || what == "back" || what == "previous" || what == "restart") {
+         if((what == "online" || what == "restart") && isBusy()) { sendError(conn, 409, "An update is running."); return true; }
++        if(what == "restart" && resetSt) {
++            // reset the ST, answer, then stop the app straight away (before
++            // the ST starts again and finds the CosmosEx: it then starts
++            // without it) and restart. The answer first: stopping the app
++            // ends this request.
++            cJSON *root = cJSON_CreateObject();
++            cJSON_AddStringToObject(root, "resetSt", resetTheSt() ? "reset" : "noanswer");
++            cJSON_AddStringToObject(root, "state", "restarting");
++            sendJson(conn, root);
++            if(!startTool("restart stopapp")) Debug::out(LOG_ERROR, "SystemResource: couldn't start the restart");
++            return true;
++        }
+         if(!startTool(what == "online" ? opt + what : what)) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
+         usleep(300 * 1000);
+         sendStatus(conn);
+-- 
+2.54.0 (Apple Git-157)
+

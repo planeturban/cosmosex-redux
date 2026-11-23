@@ -1,0 +1,20 @@
+config BR2_PACKAGE_COSMOSEX
+	bool "cosmosex"
+	depends on BR2_INSTALL_LIBSTDCPP && BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_TOOLCHAIN_USES_GLIBC
+	select BR2_PACKAGE_CE_ATARI # the Raspberry Pi binaries
+	select BR2_PACKAGE_OPENSSL
+	select BR2_PACKAGE_CA_CERTIFICATES
+	select BR2_PACKAGE_PROCPS_NG # release scripts need a ps -A that prints process names only
+	help
+	  CosmosEx Atari-side programs, chip firmware, web UI and
+	  scripts from the "stretch" branch of ce-atari-releases,
+	  installed as a seed copy of /ce, which the init script copies
+	  to /ce on first boot. The Raspberry Pi binaries come from the
+	  ce-atari package (built from source).
+
+	  https://github.com/atarijookie/ce-atari-releases
+
+
+comment "cosmosex needs a glibc toolchain with C++ and threads"
+	depends on !BR2_INSTALL_LIBSTDCPP || !BR2_TOOLCHAIN_HAS_THREADS || !BR2_TOOLCHAIN_USES_GLIBC

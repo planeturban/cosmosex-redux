@@ -1,0 +1,64 @@
+From f6ad725643f982ea0f12df4c53221282838d4fc0 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 23:38:53 +0100
+Subject: [PATCH] ce_main_app: web login timing on a monotonic clock
+
+Sessions, the wrong-password lockout and the insecure.txt check used
+time(NULL). The CosmosEx starts at 1970 and sets its clock from the
+internet a minute later: every session made before that looked 56 years
+old and was dropped (logged out right after logging in; found in QEMU).
+---
+ ce_main_app/webserver/webauth.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/ce_main_app/webserver/webauth.cpp b/ce_main_app/webserver/webauth.cpp
+index 88f17119..efd25dbd 100644
+--- a/ce_main_app/webserver/webauth.cpp
++++ b/ce_main_app/webserver/webauth.cpp
+@@ -26,6 +26,16 @@
+ #define PBKDF2_ROUNDS       20000
+ #define FAILS_MAX           10                      // wrong passwords per minute, then a minute's pause
+ 
++// seconds on a clock that doesn't jump: the CosmosEx starts at 1970 and its
++// clock is set from the internet a minute later, which made every session
++// made before that look 56 years old (logged out right after logging in)
++static time_t monoNow(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec + 1;               // never 0 (0 means "never checked")
++}
++
+ static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+ static std::map<std::string, time_t> sessions;     // token -> last use
+ static int    failCount = 0;
+@@ -120,7 +130,7 @@ bool WebAuth::insecureFile(void)
+ {
+     static time_t checked = 0;
+     static bool present = false;
+-    time_t now = time(NULL);
++    time_t now = monoNow();
+     pthread_mutex_lock(&mtx);
+     if(now - checked >= 5 || now < checked) {           // the boot partition: look every 5 s at most
+         struct stat st;
+@@ -202,7 +212,7 @@ bool WebAuth::validSession(struct mg_connection *conn, std::string *token)
+     char tok[80];
+     if(!cookies || mg_get_cookie(cookies, SESSION_COOKIE, tok, sizeof(tok)) <= 0) return false;
+ 
+-    time_t now = time(NULL);
++    time_t now = monoNow();
+     bool ok = false;
+     pthread_mutex_lock(&mtx);
+     std::map<std::string, time_t>::iterator it = sessions.find(tok);
+@@ -243,7 +253,7 @@ int WebAuth::beginRequest(struct mg_connection *conn)
+         }
+ 
+         if(what == "login" && post) {
+-            time_t now = time(NULL);
++            time_t now = monoNow();
+             pthread_mutex_lock(&mtx);
+             bool locked = now < lockedUntil;
+             pthread_mutex_unlock(&mtx);
+-- 
+2.54.0 (Apple Git-157)
+

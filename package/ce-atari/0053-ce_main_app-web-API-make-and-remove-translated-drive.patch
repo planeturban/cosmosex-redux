@@ -1,0 +1,214 @@
+From 9f5fc6b746bd9ac53b48698bf26cccb4e0db96ab Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 21:51:39 +0100
+Subject: [PATCH] ce_main_app: web API: make and remove translated drives from
+ folders
+
+/api/v1/settings/translated lists the folder drives (translated_<letter>
+in LOCAL_DRIVES_ROOT) with what they hold and why one isn't used, and
+takes {"createDrive":{"letter"}} and {"removeDrive":{"letter",
+"withFiles"}}. The translated disk scans the folders again right away.
+A removed folder is moved aside first and deleted after the translated
+disk has let go of it; a folder that isn't empty needs withFiles.
+---
+ .../api/resource/settingsresource.cpp         | 170 ++++++++++++++++++
+ 1 file changed, 170 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 6596b414..6f261497 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -344,6 +344,139 @@ static bool writeImageNotes(const std::string &imageName, const std::string &not
+     return true;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Translated drives from folders: LOCAL_DRIVES_ROOT/translated_<letter>
++// (translated/translateddisk.h). Made and removed here; the translated disk
++// scans for them again when its settings are reloaded.
++
++#define FOLDER_COUNT_MAX    20000           // entries counted in a folder drive; beyond: "more"
++
++struct FolderDrive {
++    char        letter;                     // 'C' .. 'P'
++    std::string name;                       // the folder's name as it is (translated_g or translated_G)
++};
++
++static std::vector<FolderDrive> folderDrives(void)
++{
++    std::vector<FolderDrive> out;
++    DIR *dir = opendir(LOCAL_DRIVES_ROOT);
++    if(!dir) return out;
++    struct dirent *de;
++    size_t plen = strlen(LOCAL_DRIVES_PREFIX);
++    while((de = readdir(dir)) != NULL) {
++        if(strncasecmp(de->d_name, LOCAL_DRIVES_PREFIX, plen) != 0 || strlen(de->d_name) != plen + 1) continue;
++        char l = toupper((unsigned char) de->d_name[plen]);
++        if(l < 'C' || l > 'P') continue;
++        struct stat st;
++        std::string path = std::string(LOCAL_DRIVES_ROOT "/") + de->d_name;
++        if(lstat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
++        FolderDrive f;
++        f.letter = l;
++        f.name = de->d_name;
++        out.push_back(f);
++    }
++    closedir(dir);
++    std::sort(out.begin(), out.end(), [](const FolderDrive &a, const FolderDrive &b) { return a.name < b.name; });
++    return out;
++}
++
++// what is in a folder (links not followed), at most FOLDER_COUNT_MAX entries
++static void countFolder(const std::string &path, long &files, long long &bytes, bool &more, int depth = 0)
++{
++    DIR *dir = opendir(path.c_str());
++    if(!dir) return;
++    struct dirent *de;
++    while((de = readdir(dir)) != NULL) {
++        if(strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
++        if(files >= FOLDER_COUNT_MAX) { more = true; break; }
++        std::string p = path + "/" + de->d_name;
++        struct stat st;
++        if(lstat(p.c_str(), &st) != 0) continue;
++        files++;
++        if(S_ISDIR(st.st_mode)) { if(depth < 32) countFolder(p, files, bytes, more, depth + 1); }
++        else bytes += st.st_size;
++    }
++    closedir(dir);
++}
++
++// a folder and all in it (links removed, not followed)
++static bool removeTree(const std::string &path, int depth = 0)
++{
++    DIR *dir = opendir(path.c_str());
++    if(!dir) return false;
++    bool ok = true;
++    struct dirent *de;
++    std::vector<std::string> names;
++    while((de = readdir(dir)) != NULL) {
++        if(strcmp(de->d_name, ".") != 0 && strcmp(de->d_name, "..") != 0) names.push_back(de->d_name);
++    }
++    closedir(dir);
++    for(size_t i = 0; i < names.size(); i++) {
++        std::string p = path + "/" + names[i];
++        struct stat st;
++        if(lstat(p.c_str(), &st) != 0) { ok = false; continue; }
++        if(S_ISDIR(st.st_mode)) { if(depth >= 64 || !removeTree(p, depth + 1)) ok = false; }
++        else if(unlink(p.c_str()) != 0) ok = false;
++    }
++    if(rmdir(path.c_str()) != 0) ok = false;
++    return ok;
++}
++
++static bool driveLetterOf(cJSON *o, char &letter, std::string &msg)
++{
++    cJSON *jl = o ? cJSON_GetObjectItem(o, "letter") : NULL;
++    const char *v = (jl && jl->type == cJSON_String) ? jl->valuestring : NULL;
++    if(!v || strlen(v) != 1 || toupper((unsigned char) v[0]) < 'C' || toupper((unsigned char) v[0]) > 'P') { msg = "letter: one of C to P"; return false; }
++    letter = toupper((unsigned char) v[0]);
++    return true;
++}
++
++// {"createDrive":{"letter":"G"}}
++static bool createFolderDrive(cJSON *create, Settings &s, std::string &msg)
++{
++    char letter;
++    if(!driveLetterOf(create, letter, msg)) return false;
++    if(letter == s.getChar("DRIVELETTER_SHARED", -1)) { msg = std::string(1, letter) + ": is the shared drive's letter."; return false; }
++    if(letter == s.getChar("DRIVELETTER_CONFDRIVE", -1)) { msg = std::string(1, letter) + ": is the config drive's letter."; return false; }
++    std::vector<FolderDrive> have = folderDrives();
++    for(size_t i = 0; i < have.size(); i++) {
++        if(have[i].letter == letter) { msg = std::string("There is a drive ") + letter + ": already."; return false; }
++    }
++    std::string path = std::string(LOCAL_DRIVES_ROOT "/" LOCAL_DRIVES_PREFIX) + letter;
++    struct stat st;
++    if(lstat(path.c_str(), &st) == 0) { msg = path + " is there already, and it isn't a folder."; return false; }
++    if(mkdir(path.c_str(), 0775) != 0) { msg = std::string("Couldn't make ") + path + ": " + strerror(errno); return false; }
++    // as the storage itself: its owner and group, the group may write
++    if(stat(LOCAL_DRIVES_ROOT, &st) == 0) { if(chown(path.c_str(), st.st_uid, st.st_gid) != 0) Debug::out(LOG_ERROR, "createFolderDrive: chown %s: %s", path.c_str(), strerror(errno)); }
++    chmod(path.c_str(), 0775);
++    Debug::out(LOG_INFO, "SettingsResource: made the folder drive %s", path.c_str());
++    return true;
++}
++
++// {"removeDrive":{"letter":"G","withFiles":true}}: withFiles is needed when
++// the folder isn't empty. The folder is moved aside first, so the translated
++// disk lets go of it before its files are deleted.
++static bool removeFolderDrive(cJSON *remove, std::string &msg, std::string &aside)
++{
++    char letter;
++    if(!driveLetterOf(remove, letter, msg)) return false;
++    bool withFiles = false;
++    getBool(remove, "withFiles", withFiles);
++    std::vector<FolderDrive> have = folderDrives();
++    std::string name;
++    for(size_t i = 0; i < have.size(); i++) if(have[i].letter == letter) { name = have[i].name; break; }
++    if(name.empty()) { msg = std::string("There is no folder drive ") + letter + ":."; return false; }
++    std::string path = std::string(LOCAL_DRIVES_ROOT "/") + name;
++    long files = 0; long long bytes = 0; bool more = false;
++    countFolder(path, files, bytes, more);
++    if(files > 0 && !withFiles) { msg = std::string(1, letter) + ": isn't empty."; return false; }
++    aside = std::string(LOCAL_DRIVES_ROOT "/.removing-") + name;
++    removeTree(aside);                                      // left from a removal that was cut short
++    if(rename(path.c_str(), aside.c_str()) != 0) { msg = std::string("Couldn't remove ") + path + ": " + strerror(errno); aside = ""; return false; }
++    Debug::out(LOG_INFO, "SettingsResource: removing the folder drive %s (%ld entries)", path.c_str(), files);
++    return true;
++}
++
+ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+ {
+     if(name == "storageshare") {                                 // the storage (/storage) over NFS and SMB (storageshare.cpp)
+@@ -378,6 +511,30 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+         addLetter(out, "configLetter",  s.getChar("DRIVELETTER_CONFDRIVE",  -1));
+         cJSON_AddBoolToObject(out, "mountRawNotTrans",  s.getBool("MOUNT_RAW_NOT_TRANS", false));
+         cJSON_AddBoolToObject(out, "useZipDir",         s.getBool("USE_ZIP_DIR", true));
++        // the drives from folders on the CosmosEx's storage, and what's in them
++        cJSON *folders = cJSON_CreateArray();
++        std::vector<FolderDrive> have = folderDrives();
++        char shared = s.getChar("DRIVELETTER_SHARED", -1), conf = s.getChar("DRIVELETTER_CONFDRIVE", -1);
++        unsigned seen = 0;
++        for(size_t i = 0; i < have.size(); i++) {
++            cJSON *f = cJSON_CreateObject();
++            long files = 0; long long bytes = 0; bool more = false;
++            std::string path = std::string(LOCAL_DRIVES_ROOT "/") + have[i].name;
++            countFolder(path, files, bytes, more);
++            cJSON_AddStringToObject(f, "letter", std::string(1, have[i].letter).c_str());
++            cJSON_AddStringToObject(f, "path", path.c_str());
++            cJSON_AddNumberToObject(f, "files", files);
++            cJSON_AddNumberToObject(f, "bytes", (double) bytes);
++            cJSON_AddBoolToObject(f, "more", more);
++            // why the translated disk skips it (as TranslatedDisk::attachLocalFolders)
++            if(have[i].letter == shared)                    cJSON_AddStringToObject(f, "problem", "not used: its letter is the shared drive's");
++            else if(have[i].letter == conf)                 cJSON_AddStringToObject(f, "problem", "not used: its letter is the config drive's");
++            else if(seen & (1u << (have[i].letter - 'A')))  cJSON_AddStringToObject(f, "problem", "not used: another folder has this letter");
++            seen |= 1u << (have[i].letter - 'A');
++            cJSON_AddItemToArray(folders, f);
++        }
++        cJSON_AddItemToObject(out, "folders", folders);
++        cJSON_AddStringToObject(out, "folderRoot", LOCAL_DRIVES_ROOT);
+         return true;
+     }
+ 
+@@ -716,6 +873,19 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+     }
+ 
+     if(name == "translated") {                              // onTranslated_save()
++        // one action instead of the settings: a drive from a folder made or removed
++        cJSON *cd = cJSON_GetObjectItem(in, "createDrive"), *rd = cJSON_GetObjectItem(in, "removeDrive");
++        if(cd || rd) {
++            std::string aside;
++            if(cd ? !createFolderDrive(cd, s, msg) : !removeFolderDrive(rd, msg, aside)) return false;
++            reload(SETTINGSUSER_TRANSLATED);                // the translated disk scans the folders again (and lets go of a removed one)
++            if(!aside.empty()) {
++                if(!removeTree(aside)) warning = "Some of the drive's files couldn't be deleted: they are in " + aside + ".";
++            }
++            Utils::forceSync();
++            return true;
++        }
++
+         char l1, l2, l3;
+         if(!getLetter(in, "firstLetter", l1, msg) || !getLetter(in, "sharedLetter", l2, msg) || !getLetter(in, "configLetter", l3, msg)) return false;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

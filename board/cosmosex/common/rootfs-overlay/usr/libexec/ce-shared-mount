@@ -1,0 +1,107 @@
+#!/bin/sh
+# Shared drive mount hook (ce-atari patch 0007): configures autofs to mount
+# the CosmosEx shared drive at /mnt/shared on first access, instead of the
+# app mounting it once.
+#
+#   ce-shared-mount update   (re)write the autofs map from the SHARED_*
+#                            settings; called by the app whenever they may
+#                            have changed, and by S20automount at boot
+#
+# autofs then mounts on access, retries after a failure (negative_timeout in
+# /etc/autofs.conf) and unmounts after 5 minutes idle, so a server that comes
+# up later than the CosmosEx is picked up on the next access.
+
+SET=/ce/settings
+DIR=/run/autofs
+MAP=$DIR/auto.cosmosex
+CRED=$DIR/cifs.credentials
+LOG=/var/log/ce-shared-mount.log
+MNT=/mnt/shared
+
+log() {
+	echo "$(date '+%F %T') $*" >> "$LOG"
+}
+
+get() {
+	[ -f "$SET/$1" ] && tr -d '\r\n' < "$SET/$1"
+}
+
+update() {
+	mkdir -p "$DIR"
+	chmod 700 "$DIR"
+
+	enabled=$(get SHARED_ENABLED)
+	nfs=$(get SHARED_NFS_NOT_SAMBA)
+	addr=$(get SHARED_ADDRESS)
+	path=$(get SHARED_PATH | tr '\\' '/')
+	user=$(get SHARED_USERNAME)
+	pass=$(get SHARED_PASSWORD)
+
+	case "$path" in
+	/*) ;;
+	*) path="/$path" ;;
+	esac
+
+	entry=""
+	cred=""
+	if [ "$enabled" = 1 ] && [ -n "$addr" ] && [ "$path" != / ]; then
+		if [ "$nfs" = 1 ]; then
+			# Same soft options as the app (patch 0006); retry=0: a failed
+			# mount gives up at once instead of retrying for 2 minutes
+			opts="-fstype=nfs,nolock,soft,timeo=20,retrans=2,retry=0,noexec,noatime"
+			entry="$MNT $opts \"$addr:$path\""
+		else
+			# As the app: files owned by user pi; guest if no user name
+			uid=$(id -u pi); gid=$(id -g pi)
+			opts="-fstype=cifs,uid=$uid,gid=$gid,forceuid,forcegid,noexec,noatime"
+			if [ -n "$user" ]; then
+				opts="$opts,credentials=$CRED"
+				cred=$(printf 'username=%s\npassword=%s\n' "$user" "$pass")
+			else
+				opts="$opts,guest"
+			fi
+			entry="$MNT $opts \"://$addr$path\""
+		fi
+	fi
+
+	# Unchanged? Nothing to do (but log the call, so a save of the shared
+	# drive settings is always visible here).
+	if [ -f "$MAP" ] && [ "$(cat "$MAP")" = "$entry" ] &&
+		[ "$(cat "$CRED" 2>/dev/null)" = "$cred" ]; then
+		if [ -n "$entry" ]; then log "update: unchanged"; else log "update: unchanged (shared drive disabled: SHARED_ENABLED=${enabled:-unset})"; fi
+		return 0
+	fi
+
+	umask 077
+	printf '%s\n' "$entry" > "$MAP.new" && mv -f "$MAP.new" "$MAP"
+	if [ -n "$cred" ]; then
+		printf '%s\n' "$cred" > "$CRED.new" && mv -f "$CRED.new" "$CRED"
+	else
+		rm -f "$CRED"
+	fi
+
+	if [ -n "$entry" ]; then
+		log "shared drive: $(echo "$entry" | sed 's/credentials=[^, ]*/credentials=.../')"
+	else
+		log "shared drive: disabled"
+	fi
+
+	# A share mounted with the old settings stays until unmounted: detach it
+	# (lazily, so a busy share doesn't block), then let autofs reread the map.
+	if awk -v m="$MNT" '$2 == m && $3 != "autofs" { found = 1 } END { exit !found }' /proc/mounts; then
+		umount -l "$MNT" && log "unmounted the old share"
+	fi
+	pid=$(pidof automount)
+	[ -n "$pid" ] && kill -HUP $pid
+	return 0
+}
+
+case "$1" in
+update)
+	update
+	;;
+*)
+	echo "Usage: $0 update"
+	exit 1
+	;;
+esac

@@ -1,0 +1,825 @@
+From eb13581a121aa37f7129f87e13c7c245d198de1b Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:27:47 +0100
+Subject: [PATCH] ce_main_app: settings as JSON (GET/PUT /api/v1/settings) for
+ the web UI
+
+The web UI's Config page needs the device settings as data instead of the
+config terminal. /api/v1/settings returns them per section (acsi,
+translated, shared, floppy, network, ikbd, other, hddimage), the same
+settings as the Atari config screens. PUT /api/v1/settings/<section>
+saves one section with the same checks, settings keys and reloads as that
+screen's save function (onAcsiConfig_save, onTranslated_save, ...).
+
+- Secrets are never returned: the shared drive password and the Wi-Fi key
+  are reported as passwordSet / pskSet. Leaving them out of a PUT keeps
+  them.
+- PUT accepts only application/json, so a cross-site form post from
+  another web page can't change settings without a CORS preflight.
+- Text that ends up in config files is checked: no quotes, backslashes
+  or control characters in the Wi-Fi name and key (written quoted into
+  wpa_supplicant.conf), the shared drive fields and the NTP server;
+  hostnames are letters, digits and '-'.
+- Problems the config screens only warn about (SCSI IDs 0/7, no drive
+  letters, an HDD image on the network) are returned as "warning".
+
+ConfigStream::getSettingsReloadProxy() gives the resource the same reload
+path as the config screens.
+---
+ ce_main_app/config/configstream.h             |   1 +
+ .../api/resource/settingsresource.cpp         | 672 ++++++++++++++++++
+ .../webserver/api/resource/settingsresource.h |  36 +
+ .../webserver/api/router/apiv1router.cpp      |   8 +
+ .../webserver/api/router/apiv1router.h        |   2 +
+ 5 files changed, 719 insertions(+)
+ create mode 100644 ce_main_app/webserver/api/resource/settingsresource.cpp
+ create mode 100644 ce_main_app/webserver/api/resource/settingsresource.h
+
+diff --git a/ce_main_app/config/configstream.h b/ce_main_app/config/configstream.h
+index 93c3a0cc..d180c219 100644
+--- a/ce_main_app/config/configstream.h
++++ b/ce_main_app/config/configstream.h
+@@ -82,6 +82,7 @@ public:
+     void processCommand(BYTE *cmd, int writeToFd=-1);
+     void setAcsiDataTrans(AcsiDataTrans *dt);
+     void setSettingsReloadProxy(SettingsReloadProxy *rp);
++    SettingsReloadProxy *getSettingsReloadProxy(void) { return reloadProxy; }
+ 
+     void fillUpdateWithCurrentVersions(void);
+     void fillUpdateDownloadWithProgress(void);
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+new file mode 100644
+index 00000000..9dd4e559
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -0,0 +1,672 @@
++// /api/v1/settings: the device settings as JSON (see settingsresource.h).
++// Every save mirrors the matching Atari config screen's save function in
++// config/configstream_screens*.cpp: same validation, same settings keys,
++// same reloads.
++
++#include "webserver/webserver.h"
++
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <ctype.h>
++#include <sys/stat.h>
++#include <limits.h>
++
++#include "lib/cjson-code-58/cJSON.h"
++#include "debug.h"
++#include "global.h"
++#include "settingsresource.h"
++#include "../../../settings.h"
++#include "../../../settingsreloadproxy.h"
++#include "../../../utils.h"
++#include "../../../mounter.h"
++#include "../../../periodicthread.h"
++#include "../../../config/configstream.h"
++#include "../../../config/netsettings.h"
++#include "../../../ikbd/keybjoys.h"
++#include "../../../ikbd/keytranslator.h"
++#include "../../../translated/translateddisk.h"
++
++extern SharedObjects shared;
++extern THwConfig     hwConfig;
++extern volatile bool do_timeSync;
++extern volatile bool do_loadIkbdConfig;
++
++#define SETTINGS_MAX_BODY   (16 * 1024)
++
++static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage" };
++#define SECTION_COUNT   (int) (sizeof(SECTIONS) / sizeof(SECTIONS[0]))
++
++static const char *ACSI_MODES[4] = { "off", "sd", "raw", "translated" };    // index = DEVTYPE_*
++
++/* --------------------------------------------------------------- helpers */
++
++static SettingsReloadProxy *reloadProxy(void)
++{
++    return shared.configStream.web ? shared.configStream.web->getSettingsReloadProxy() : NULL;
++}
++
++static void reload(int what)
++{
++    SettingsReloadProxy *rp = reloadProxy();
++    if(rp) {
++        rp->reloadSettings(what);
++    }
++}
++
++// "1.2.3.4", each part 0..255; normalised (leading zeros dropped)
++static bool validIp(const std::string &in, std::string &out)
++{
++    int a, b, c, d;
++    char rest;
++    if(sscanf(in.c_str(), "%d.%d.%d.%d%c", &a, &b, &c, &d, &rest) != 4) return false;
++    if(a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255 || d < 0 || d > 255) return false;
++    for(size_t i=0; i<in.length(); i++) {
++        if(!isdigit((unsigned char) in[i]) && in[i] != '.') return false;
++    }
++    char buf[20];
++    snprintf(buf, sizeof(buf), "%d.%d.%d.%d", a, b, c, d);
++    out = buf;
++    return true;
++}
++
++// printable ASCII without characters that would break the config files the
++// settings end up in (wpa_supplicant.conf, interfaces, mount options)
++static bool safeText(const std::string &s, const char *alsoForbidden = "")
++{
++    for(size_t i=0; i<s.length(); i++) {
++        unsigned char c = s[i];
++        if(c < 0x20 || c == 0x7f || c == '"' || c == '\\') return false;
++        if(strchr(alsoForbidden, c) && c != 0) return false;
++    }
++    return true;
++}
++
++static bool validHostname(const std::string &h)
++{
++    if(h.empty() || h.length() > 63 || h[0] == '-' || h[h.length() - 1] == '-') return false;
++    for(size_t i=0; i<h.length(); i++) {
++        if(!isalnum((unsigned char) h[i]) && h[i] != '-') return false;
++    }
++    return true;
++}
++
++// JSON getters: true if present with the right type
++static bool getBool(cJSON *o, const char *key, bool &v)
++{
++    cJSON *i = cJSON_GetObjectItem(o, key);
++    if(!i) return false;
++    if(i->type == cJSON_True)  { v = true;  return true; }
++    if(i->type == cJSON_False) { v = false; return true; }
++    return false;
++}
++
++static bool getString(cJSON *o, const char *key, std::string &v)
++{
++    cJSON *i = cJSON_GetObjectItem(o, key);
++    if(!i || i->type != cJSON_String || !i->valuestring) return false;
++    v = i->valuestring;
++    return true;
++}
++
++static bool getNumber(cJSON *o, const char *key, double &v)
++{
++    cJSON *i = cJSON_GetObjectItem(o, key);
++    if(!i || i->type != cJSON_Number) return false;
++    v = i->valuedouble;
++    return true;
++}
++
++static void addLetter(cJSON *o, const char *key, char letter)
++{
++    if(letter >= 'C' && letter <= 'P') {
++        char b[2] = { letter, 0 };
++        cJSON_AddStringToObject(o, key, b);
++    } else {
++        cJSON_AddNullToObject(o, key);
++    }
++}
++
++// letter "C".."P", or null / "" = none (-1); false if invalid
++static bool getLetter(cJSON *o, const char *key, char &letter, std::string &msg)
++{
++    cJSON *i = cJSON_GetObjectItem(o, key);
++    if(!i || i->type == cJSON_NULL) { letter = -1; return true; }
++    if(i->type != cJSON_String || !i->valuestring) { msg = std::string(key) + ": a drive letter or null"; return false; }
++    std::string s = i->valuestring;
++    if(s.empty()) { letter = -1; return true; }
++    char c = toupper((unsigned char) s[0]);
++    if(s.length() != 1 || c < 'A' || c > 'Z') { msg = std::string(key) + ": a drive letter or null"; return false; }
++    letter = c;
++    return true;
++}
++
++/* -------------------------------------------------------------- sections */
++
++bool SettingsResource::buildSection(const std::string &name, cJSON *out)
++{
++    Settings s;
++
++    if(name == "acsi") {
++        cJSON *ids = cJSON_CreateArray();
++        char key[32];
++        for(int id=0; id<8; id++) {
++            sprintf(key, "ACSI_DEVTYPE_%d", id);
++            int t = s.getInt(key, DEVTYPE_OFF);
++            cJSON_AddItemToArray(ids, cJSON_CreateString((t >= 0 && t <= 3) ? ACSI_MODES[t] : "off"));
++        }
++        cJSON_AddItemToObject(out, "ids", ids);
++        cJSON_AddStringToObject(out, "interface", hwConfig.hddIface == HDD_IF_SCSI ? "SCSI" : "ACSI");
++        return true;
++    }
++
++    if(name == "translated") {
++        addLetter(out, "firstLetter",   s.getChar("DRIVELETTER_FIRST",      -1));
++        addLetter(out, "sharedLetter",  s.getChar("DRIVELETTER_SHARED",     -1));
++        addLetter(out, "configLetter",  s.getChar("DRIVELETTER_CONFDRIVE",  -1));
++        cJSON_AddBoolToObject(out, "mountRawNotTrans",  s.getBool("MOUNT_RAW_NOT_TRANS", false));
++        cJSON_AddBoolToObject(out, "useZipDir",         s.getBool("USE_ZIP_DIR", true));
++        return true;
++    }
++
++    if(name == "shared") {
++        cJSON_AddBoolToObject(out,   "enabled",   s.getBool("SHARED_ENABLED", false));
++        cJSON_AddStringToObject(out, "protocol",  s.getBool("SHARED_NFS_NOT_SAMBA", false) ? "nfs" : "smb");
++        cJSON_AddStringToObject(out, "address",   s.getString("SHARED_ADDRESS", ""));
++        cJSON_AddStringToObject(out, "path",      s.getString("SHARED_PATH", ""));
++        cJSON_AddStringToObject(out, "username",  s.getString("SHARED_USERNAME", ""));
++        cJSON_AddBoolToObject(out,   "passwordSet", strlen(s.getString("SHARED_PASSWORD", "")) > 0);
++        std::string mountPath;                              // attached as a drive right now?
++        bool mounted = false;
++        TranslatedDisk *translated = TranslatedDisk::getInstance();
++        if(translated) {
++            translated->mutexLock();
++            mounted = translated->getSharedDrivePath(mountPath);
++            translated->mutexUnlock();
++        }
++        cJSON_AddBoolToObject(out,   "mounted",   mounted);
++        return true;
++    }
++
++    if(name == "floppy") {
++        FloppyConfig fc;
++        s.loadFloppyConfig(&fc);
++        cJSON_AddBoolToObject(out,   "enabled",         fc.enabled);
++        cJSON_AddNumberToObject(out, "driveId",         fc.id);
++        cJSON_AddBoolToObject(out,   "writeProtected",  fc.writeProtected);
++        cJSON_AddBoolToObject(out,   "soundEnabled",    fc.soundEnabled);
++        return true;
++    }
++
++    if(name == "network") {
++        NetworkSettings ns;
++        ns.load();
++        cJSON_AddStringToObject(out, "hostname", ns.hostname.c_str());
++        cJSON_AddStringToObject(out, "dns",      ns.nameserver.c_str());
++
++        cJSON *eth = cJSON_CreateObject();
++        cJSON_AddBoolToObject(eth,   "dhcp",    ns.eth0.dhcpNotStatic);
++        cJSON_AddStringToObject(eth, "address", ns.eth0.address.c_str());
++        cJSON_AddStringToObject(eth, "netmask", ns.eth0.netmask.c_str());
++        cJSON_AddStringToObject(eth, "gateway", ns.eth0.gateway.c_str());
++        cJSON_AddItemToObject(out, "eth0", eth);
++
++        cJSON *wl = cJSON_CreateObject();
++        cJSON_AddBoolToObject(wl,   "enabled", ns.wlan0.isEnabled);
++        cJSON_AddBoolToObject(wl,   "dhcp",    ns.wlan0.dhcpNotStatic);
++        cJSON_AddStringToObject(wl, "address", ns.wlan0.address.c_str());
++        cJSON_AddStringToObject(wl, "netmask", ns.wlan0.netmask.c_str());
++        cJSON_AddStringToObject(wl, "gateway", ns.wlan0.gateway.c_str());
++        cJSON_AddStringToObject(wl, "ssid",    ns.wlan0.wpaSsid.c_str());
++        cJSON_AddBoolToObject(wl,   "pskSet",  !ns.wlan0.wpaPsk.empty());
++        cJSON_AddItemToObject(out, "wlan0", wl);
++        return true;
++    }
++
++    if(name == "ikbd") {
++        cJSON_AddBoolToObject(out, "joy0First",        s.getBool("JOY_FIRST_IS_0", false));
++        cJSON_AddBoolToObject(out, "mouseWheelAsKeys", s.getBool("MOUSE_WHEEL_AS_KEYS", true));
++        cJSON_AddBoolToObject(out, "keybJoy0",         s.getBool("KEYBORD_JOY0", false));
++        cJSON_AddBoolToObject(out, "keybJoy1",         s.getBool("KEYBORD_JOY1", false));
++
++        KeybJoyKeys kjk;
++        KeyTranslator kt;
++        kjk.setKeyTranslator(&kt);
++        kjk.loadKeys();
++        cJSON *keys = cJSON_CreateArray();
++        for(int j=0; j<2; j++) {
++            cJSON *k = cJSON_CreateObject();
++            cJSON_AddStringToObject(k, "up",     kjk.joyKeys[j].human.up.c_str());
++            cJSON_AddStringToObject(k, "down",   kjk.joyKeys[j].human.down.c_str());
++            cJSON_AddStringToObject(k, "left",   kjk.joyKeys[j].human.left.c_str());
++            cJSON_AddStringToObject(k, "right",  kjk.joyKeys[j].human.right.c_str());
++            cJSON_AddStringToObject(k, "button", kjk.joyKeys[j].human.button.c_str());
++            cJSON_AddItemToArray(keys, k);
++        }
++        cJSON_AddItemToObject(out, "keybJoyKeys", keys);
++        return true;
++    }
++
++    if(name == "other") {
++        cJSON_AddBoolToObject(out,   "timeSync",          s.getBool("TIME_SET", true));
++        cJSON_AddNumberToObject(out, "utcOffset",         s.getFloat("TIME_UTC_OFFSET", 0));
++        cJSON_AddStringToObject(out, "ntpServer",         s.getString("TIME_NTP_SERVER", "200.20.186.76"));
++        cJSON_AddNumberToObject(out, "screencastFrameskip", s.getInt("SCREENCAST_FRAMESKIP", 20));
++        static const char *res[3] = { "low", "mid", "high" };
++        int r = s.getInt("SCREEN_RESOLUTION", 1);
++        cJSON_AddStringToObject(out, "screenResolution",  (r >= 0 && r <= 2) ? res[r] : "mid");
++        return true;
++    }
++
++    if(name == "hddimage") {
++        cJSON_AddStringToObject(out, "path", s.getString("HDDIMAGE", ""));
++        return true;
++    }
++
++    return false;
++}
++
++bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::string &msg, std::string &warning)
++{
++    Settings s;
++
++    if(name == "acsi") {                                    // onAcsiConfig_save()
++        cJSON *ids = cJSON_GetObjectItem(in, "ids");
++        if(!ids || ids->type != cJSON_Array || cJSON_GetArraySize(ids) != 8) { msg = "\"ids\": 8 modes (off, sd, raw, translated)"; return false; }
++
++        int devTypes[8], tranCnt = 0, sdCnt = 0;
++        bool somethingActive = false;
++        for(int id=0; id<8; id++) {
++            cJSON *m = cJSON_GetArrayItem(ids, id);
++            devTypes[id] = -1;
++            for(int t=0; t<4 && m && m->type == cJSON_String && m->valuestring; t++) {
++                if(strcmp(m->valuestring, ACSI_MODES[t]) == 0) devTypes[id] = t;
++            }
++            if(devTypes[id] < 0) { msg = "ID " + std::to_string(id) + ": mode must be off, sd, raw or translated"; return false; }
++            if(devTypes[id] != DEVTYPE_OFF)        somethingActive = true;
++            if(devTypes[id] == DEVTYPE_TRANSLATED) tranCnt++;
++            if(devTypes[id] == DEVTYPE_SD)         sdCnt++;
++        }
++        if(!somethingActive) { msg = "All IDs are off: that would make the CosmosEx unreachable. Turn on at least one."; return false; }
++        if(tranCnt > 1)      { msg = "Only one ID can be the translated drive (ce_dd)."; return false; }
++        if(sdCnt > 1)        { msg = "Only one ID can be the SD card."; return false; }
++        if(hwConfig.hddIface == HDD_IF_SCSI && (devTypes[0] != DEVTYPE_OFF || devTypes[7] != DEVTYPE_OFF)) {
++            warning = "IDs 0 and 7 might not work: the SCSI controller might use them.";
++        }
++
++        char key[32];
++        for(int id=0; id<8; id++) {
++            sprintf(key, "ACSI_DEVTYPE_%d", id);
++            s.setInt(key, devTypes[id]);
++        }
++        reload(SETTINGSUSER_ACSI);
++        Utils::forceSync();
++        return true;
++    }
++
++    if(name == "translated") {                              // onTranslated_save()
++        char l1, l2, l3;
++        if(!getLetter(in, "firstLetter", l1, msg) || !getLetter(in, "sharedLetter", l2, msg) || !getLetter(in, "configLetter", l3, msg)) return false;
++
++        if((l1 != -1 && (l1 == l2 || l1 == l3)) || (l2 != -1 && l2 == l3)) { msg = "Drive letters must be different."; return false; }
++        if((l1 != -1 && l1 < 'C') || (l2 != -1 && l2 < 'C') || (l3 != -1 && l3 < 'C')) { msg = "Drive letters A and B are for floppies."; return false; }
++        if(l1 > 'P' || l2 > 'P' || l3 > 'P') { msg = "The last allowed drive letter is P."; return false; }
++        if(l1 == -1 && l2 == -1 && l3 == -1) warning = "No drive letter assigned: the translated disk won't be reachable.";
++
++        bool raw = s.getBool("MOUNT_RAW_NOT_TRANS", false), zipDir = s.getBool("USE_ZIP_DIR", true);
++        getBool(in, "mountRawNotTrans", raw);
++        getBool(in, "useZipDir", zipDir);
++
++        s.setChar("DRIVELETTER_FIRST",      l1);
++        s.setChar("DRIVELETTER_SHARED",     l2);
++        s.setChar("DRIVELETTER_CONFDRIVE",  l3);
++        s.setBool("MOUNT_RAW_NOT_TRANS",    raw);
++        s.setBool("USE_ZIP_DIR",            zipDir);
++        reload(SETTINGSUSER_TRANSLATED);
++        Utils::forceSync();
++        return true;
++    }
++
++    if(name == "shared") {                                  // onSharedSave()
++        bool enabled = false;
++        std::string protocol = "smb", address, path, username;
++        getBool(in, "enabled", enabled);
++        getString(in, "protocol", protocol);
++        getString(in, "address", address);
++        getString(in, "path", path);
++        getString(in, "username", username);
++        if(protocol != "smb" && protocol != "nfs") { msg = "protocol: smb or nfs"; return false; }
++
++        if(enabled) {
++            std::string ip;
++            if(!validIp(address, ip)) { msg = "Server address: an IP address, e.g. 192.168.1.10."; return false; }
++            address = ip;
++            if(path.empty())          { msg = "Path on the server is empty."; return false; }
++        }
++        if(!safeText(address) || !safeText(path, ",") || !safeText(username, ",=")) { msg = "Server, path or user name contains characters that aren't allowed (quotes, backslash, comma, control characters)."; return false; }
++        std::replace(path.begin(), path.end(), '\\', '/');
++
++        s.setBool  ("SHARED_ENABLED",       enabled);
++        s.setBool  ("SHARED_NFS_NOT_SAMBA", protocol == "nfs");
++        s.setString("SHARED_ADDRESS",       address.c_str());
++        s.setString("SHARED_PATH",          path.c_str());
++        s.setString("SHARED_USERNAME",      username.c_str());
++
++        std::string password;
++        if(getString(in, "password", password)) {           // absent or null: keep the stored one
++            if(!safeText(password, ",")) { msg = "The password contains characters that aren't allowed (quotes, backslash, comma)."; return false; }
++            s.setString("SHARED_PASSWORD", password.c_str());
++        }
++        reload(SETTINGSUSER_SHARED);
++        Utils::forceSync();
++        return true;
++    }
++
++    if(name == "floppy") {                                  // onFloppyConfigSave()
++        FloppyConfig fc;
++        s.loadFloppyConfig(&fc);
++        double id = fc.id;
++        getBool(in, "enabled", fc.enabled);
++        getBool(in, "writeProtected", fc.writeProtected);
++        getBool(in, "soundEnabled", fc.soundEnabled);
++        if(getNumber(in, "driveId", id) && id != 0 && id != 1) { msg = "driveId: 0 or 1"; return false; }
++        fc.id = (int) id;
++        s.saveFloppyConfig(&fc);
++        reload(SETTINGSUSER_FLOPPYCONF);
++        Utils::forceSync();
++        return true;
++    }
++
++    if(name == "network") {                                 // onNetwork_save()
++        NetworkSettings nsNew, nsOld;
++        nsNew.load();
++        nsOld.load();
++
++        std::string hostname = nsNew.hostname, dns = nsNew.nameserver;
++        getString(in, "hostname", hostname);
++        getString(in, "dns", dns);
++        if(hostname.empty()) hostname = "CosmosEx";
++        if(!validHostname(hostname)) { msg = "Hostname: letters, digits and '-', at most 63."; return false; }
++
++        cJSON *eth = cJSON_GetObjectItem(in, "eth0");
++        cJSON *wl  = cJSON_GetObjectItem(in, "wlan0");
++        if(eth) {
++            getBool(eth, "dhcp", nsNew.eth0.dhcpNotStatic);
++            getString(eth, "address", nsNew.eth0.address);
++            getString(eth, "netmask", nsNew.eth0.netmask);
++            getString(eth, "gateway", nsNew.eth0.gateway);
++        }
++        if(wl) {
++            getBool(wl, "enabled", nsNew.wlan0.isEnabled);
++            getBool(wl, "dhcp", nsNew.wlan0.dhcpNotStatic);
++            getString(wl, "address", nsNew.wlan0.address);
++            getString(wl, "netmask", nsNew.wlan0.netmask);
++            getString(wl, "gateway", nsNew.wlan0.gateway);
++            getString(wl, "ssid", nsNew.wlan0.wpaSsid);
++            std::string psk;
++            if(getString(wl, "psk", psk)) nsNew.wlan0.wpaPsk = psk;     // absent or null: keep
++        }
++
++        if(!nsNew.eth0.dhcpNotStatic || !nsNew.wlan0.dhcpNotStatic) {
++            if(!validIp(dns, dns)) { msg = "Without DHCP, a valid DNS server address is needed."; return false; }
++        } else if(!dns.empty() && !validIp(dns, dns)) {
++            msg = "DNS server: an IP address, or empty."; return false;
++        }
++        TNetInterface *ifs[2] = { &nsNew.eth0, &nsNew.wlan0 };
++        const char *names[2] = { "Ethernet", "Wi-Fi" };
++        for(int i=0; i<2; i++) {
++            if(ifs[i]->dhcpNotStatic) continue;
++            if(!validIp(ifs[i]->address, ifs[i]->address) || !validIp(ifs[i]->netmask, ifs[i]->netmask) || !validIp(ifs[i]->gateway, ifs[i]->gateway)) {
++                msg = std::string(names[i]) + ": address, netmask and gateway must be IP addresses (or use DHCP).";
++                return false;
++            }
++        }
++        // the Wi-Fi name and key go into wpa_supplicant.conf in quotes
++        if(nsNew.wlan0.wpaSsid.length() > 32 || !safeText(nsNew.wlan0.wpaSsid)) { msg = "Wi-Fi name: at most 32 characters, no quotes or backslashes."; return false; }
++        if(!nsNew.wlan0.wpaPsk.empty() && (nsNew.wlan0.wpaPsk.length() < 8 || nsNew.wlan0.wpaPsk.length() > 63 || !safeText(nsNew.wlan0.wpaPsk))) {
++            msg = "Wi-Fi key: 8 to 63 characters, no quotes or backslashes."; return false;
++        }
++        if(nsNew.wlan0.isEnabled && nsNew.wlan0.wpaSsid.empty()) { msg = "Wi-Fi is on but has no network name."; return false; }
++
++        nsNew.nameserver = dns;
++        nsNew.hostname   = hostname;
++
++        if(nsNew.isDifferentThan(nsOld)) {
++            bool ethChanged  = nsNew.eth0IsDifferentThan(nsOld);
++            bool wlanChanged = nsNew.wlan0IsDifferentThan(nsOld);
++            nsNew.save();
++            Utils::forceSync();
++
++            if(ethChanged) {
++                TMounterRequest tmr;
++                tmr.action = MOUNTER_ACTION_RESTARTNETWORK_ETH0;
++                Mounter::add(tmr);
++            }
++            if(wlanChanged) {
++                TMounterRequest tmr;
++                tmr.action = MOUNTER_ACTION_RESTARTNETWORK_WLAN0;
++                Mounter::add(tmr);
++            }
++            if(ethChanged || wlanChanged) {
++                warning = "The network restarts now: if you changed this connection's address, reconnect at the new one.";
++            }
++        }
++        return true;
++    }
++
++    if(name == "ikbd") {                                    // onIkbdSave()
++        KeybJoyKeys kjk;
++        KeyTranslator kt;
++        kjk.setKeyTranslator(&kt);
++        kjk.loadKeys();
++
++        cJSON *keys = cJSON_GetObjectItem(in, "keybJoyKeys");
++        if(keys) {
++            if(keys->type != cJSON_Array || cJSON_GetArraySize(keys) != 2) { msg = "keybJoyKeys: two joysticks"; return false; }
++            for(int j=0; j<2; j++) {
++                cJSON *k = cJSON_GetArrayItem(keys, j);
++                getString(k, "up",     kjk.joyKeys[j].human.up);
++                getString(k, "down",   kjk.joyKeys[j].human.down);
++                getString(k, "left",   kjk.joyKeys[j].human.left);
++                getString(k, "right",  kjk.joyKeys[j].human.right);
++                getString(k, "button", kjk.joyKeys[j].human.button);
++            }
++            for(int j=0; j<2; j++) {
++                if(!kjk.keybJoyHumanSettingsValidForSingleJoy(j)) { msg = "Keyboard joystick " + std::to_string(j) + ": some key isn't valid or is used twice."; return false; }
++            }
++            if(!kjk.keybJoyHumanSettingsValidBetweenJoys()) { msg = "Keyboard joysticks 0 and 1 use the same key."; return false; }
++            kjk.saveKeys();
++        }
++
++        bool v;
++        if(getBool(in, "joy0First", v))        s.setBool("JOY_FIRST_IS_0", v);
++        if(getBool(in, "mouseWheelAsKeys", v)) s.setBool("MOUSE_WHEEL_AS_KEYS", v);
++        if(getBool(in, "keybJoy0", v))         s.setBool("KEYBORD_JOY0", v);
++        if(getBool(in, "keybJoy1", v))         s.setBool("KEYBORD_JOY1", v);
++        do_loadIkbdConfig = true;
++        return true;
++    }
++
++    if(name == "other") {                                   // onOtherSave()
++        bool timeSync = s.getBool("TIME_SET", true);
++        double utc = s.getFloat("TIME_UTC_OFFSET", 0), frameskip = s.getInt("SCREENCAST_FRAMESKIP", 20);
++        std::string ntp = s.getString("TIME_NTP_SERVER", "200.20.186.76"), res;
++        int screenRes = s.getInt("SCREEN_RESOLUTION", 1);
++
++        getBool(in, "timeSync", timeSync);
++        getNumber(in, "utcOffset", utc);
++        getString(in, "ntpServer", ntp);
++        getNumber(in, "screencastFrameskip", frameskip);
++        if(getString(in, "screenResolution", res)) {
++            if(res == "low") screenRes = 0;
++            else if(res == "mid") screenRes = 1;
++            else if(res == "high") screenRes = 2;
++            else { msg = "screenResolution: low, mid or high"; return false; }
++        }
++        if(utc < -12 || utc > 14) { msg = "UTC offset: -12 to +14 hours."; return false; }
++        if(ntp.empty() || ntp.length() > 100 || !safeText(ntp, " ,;'`$")) { msg = "NTP server: a host name or IP address."; return false; }
++        if(frameskip < 10)  frameskip = 10;                 // as the config screen
++        if(frameskip > 255) frameskip = 255;
++
++        s.setBool  ("TIME_SET",             timeSync);
++        s.setFloat ("TIME_UTC_OFFSET",      (float) utc);
++        s.setString("TIME_NTP_SERVER",      ntp.c_str());
++        s.setInt   ("SCREENCAST_FRAMESKIP", (int) frameskip);
++        s.setInt   ("SCREEN_RESOLUTION",    screenRes);
++
++        do_timeSync = true;
++        Utils::forceSync();
++        Utils::setTimezoneVariable_inProfileScript();
++        Utils::setTimezoneVariable_inThisContext();
++        return true;
++    }
++
++    if(name == "hddimage") {                                // onHddImageSave(), without the usb/shared shortcuts
++        std::string path;
++        getString(in, "path", path);
++        if(!path.empty()) {
++            struct stat st;
++            if(path[0] != '/' || !safeText(path))   { msg = "The path must be absolute, e.g. /mnt/sda1/disk.img."; return false; }
++            if(stat(path.c_str(), &st) < 0)        { msg = "Can't access that file."; return false; }
++            // only images on data drives: the ST gets read-write access to
++            // this file, and the web API has no login (stricter than the
++            // config screen, which takes any path)
++            char real[PATH_MAX];
++            if(!realpath(path.c_str(), real) || (strncmp(real, "/mnt/", 5) != 0 && strncmp(real, "/pi/", 4) != 0)) {
++                msg = "The image must be on a USB drive, the shared drive or /pi (a path under /mnt/ or /pi/).";
++                return false;
++            }
++            path = real;
++            if(!S_ISREG(st.st_mode))               { msg = "That's not a regular file."; return false; }
++            if(path.find("/mnt/shared/") == 0) warning = "An HDD image on the network isn't safe: a dropped connection can corrupt it.";
++        }
++        s.setString("HDDIMAGE", path.c_str());
++        reload(SETTINGSUSER_ACSI);
++        Utils::forceSync();
++        return true;
++    }
++
++    msg = "unknown section";
++    return false;
++}
++
++/* ------------------------------------------------------------------ http */
++
++SettingsResource::SettingsResource()
++{
++}
++
++SettingsResource::~SettingsResource()
++{
++}
++
++void SettingsResource::sendJson(mg_connection *conn, cJSON *root, int code)
++{
++    char *json = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    std::string sJson = json ? json : "{}";
++    free(json);
++
++    const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 404) ? "Not Found" :
++                       (code == 405) ? "Method Not Allowed" : (code == 413) ? "Payload Too Large" :
++                       (code == 415) ? "Unsupported Media Type" : "Error";
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) sJson.length());
++    mg_write(conn, sJson.c_str(), sJson.length());
++}
++
++void SettingsResource::sendError(mg_connection *conn, int code, const char *message)
++{
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "status", "error");
++    cJSON_AddStringToObject(root, "error", message);
++    sendJson(conn, root, code);
++}
++
++bool SettingsResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
++{
++    std::string section = sResourceInfo;
++    size_t q = section.find('?');
++    if(q != std::string::npos) section.erase(q);
++    while(!section.empty() && section[0] == '/') section.erase(0, 1);
++
++    bool known = section.empty();
++    for(int i=0; i<SECTION_COUNT; i++) {
++        if(section == SECTIONS[i]) known = true;
++    }
++    if(!known) {
++        sendError(conn, 404, "unknown settings section");
++        return true;
++    }
++
++    const char *m = req_info->request_method;
++
++    if(strcmp(m, "GET") == 0) {
++        cJSON *root = cJSON_CreateObject();
++        if(section.empty()) {
++            for(int i=0; i<SECTION_COUNT; i++) {
++                cJSON *sec = cJSON_CreateObject();
++                buildSection(SECTIONS[i], sec);
++                cJSON_AddItemToObject(root, SECTIONS[i], sec);
++            }
++        } else {
++            buildSection(section, root);
++        }
++        sendJson(conn, root);
++        return true;
++    }
++
++    if(strcmp(m, "PUT") != 0 || section.empty()) {
++        sendError(conn, 405, "GET /api/v1/settings[/<section>] or PUT /api/v1/settings/<section>");
++        return true;
++    }
++
++    // JSON only: a cross-site form post can't send this without a CORS preflight
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/json", 16) != 0) {
++        sendError(conn, 415, "Content-Type must be application/json");
++        return true;
++    }
++
++    std::string body;
++    char buf[1024];
++    int n;
++    while((n = mg_read(conn, buf, sizeof(buf))) > 0) {
++        body.append(buf, n);
++        if(body.length() > SETTINGS_MAX_BODY) {
++            sendError(conn, 413, "request too large");
++            return true;
++        }
++    }
++
++    cJSON *in = cJSON_Parse(body.c_str());
++    if(!in || in->type != cJSON_Object) {
++        if(in) cJSON_Delete(in);
++        sendError(conn, 400, "invalid JSON (an object is expected)");
++        return true;
++    }
++
++    std::string msg, warning;
++    bool ok = saveSection(section, in, msg, warning);
++    cJSON_Delete(in);
++
++    if(!ok) {
++        Debug::out(LOG_INFO, "SettingsResource: %s not saved: %s", section.c_str(), msg.c_str());
++        sendError(conn, 400, msg.c_str());
++        return true;
++    }
++    Debug::out(LOG_INFO, "SettingsResource: %s saved from the web UI", section.c_str());
++
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "status", "ok");
++    if(!warning.empty()) cJSON_AddStringToObject(root, "warning", warning.c_str());
++    cJSON *sec = cJSON_CreateObject();
++    buildSection(section, sec);
++    cJSON_AddItemToObject(root, "settings", sec);
++    sendJson(conn, root);
++    return true;
++}
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+new file mode 100644
+index 00000000..a4fbc9f9
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -0,0 +1,36 @@
++#ifndef SETTINGSRESOURCE_H
++#define	SETTINGSRESOURCE_H
++
++#include <string>
++
++#include "../../CivetServer.h"
++
++#include "iapiresource.h"
++
++struct cJSON;
++
++// Settings as JSON, for the web UI's Config page (the same settings as the
++// Atari config screens, with the same checks and the same reloads):
++//   GET /api/v1/settings              all sections
++//   GET /api/v1/settings/<section>    one section
++//   PUT /api/v1/settings/<section>    save one section (application/json only)
++// Sections: acsi, translated, shared, floppy, network, ikbd, other, hddimage.
++// Secrets are never returned: the shared drive password and the Wi-Fi key
++// are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
++// null) to keep them, send "" to clear.
++class SettingsResource : public IApiResource {
++public:
++    SettingsResource();
++    virtual ~SettingsResource();
++    bool dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo="" );
++
++private:
++    bool buildSection(const std::string &name, cJSON *out);
++    // false + message: invalid input, nothing saved
++    bool saveSection(const std::string &name, cJSON *in, std::string &message, std::string &warning);
++
++    void sendJson(mg_connection *conn, cJSON *root, int code = 200);
++    void sendError(mg_connection *conn, int code, const char *message);
++};
++
++#endif
+diff --git a/ce_main_app/webserver/api/router/apiv1router.cpp b/ce_main_app/webserver/api/router/apiv1router.cpp
+index 53aa8304..ab34bdc3 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.cpp
++++ b/ce_main_app/webserver/api/router/apiv1router.cpp
+@@ -21,6 +21,7 @@ ApiV1Router::ApiV1Router(VirtualKeyboardService* pxVKbdService,VirtualMouseServi
+     pxConfig=new ConfigResource();
+     pxStatus=new StatusResource();
+     pxLibrary=new LibraryResource(pxFloppyService);
++    pxSettings=new SettingsResource();
+ }
+ 
+ ApiV1Router::~ApiV1Router()
+@@ -33,6 +34,7 @@ ApiV1Router::~ApiV1Router()
+     delete pxDownload;
+     delete pxStatus;
+     delete pxLibrary;
++    delete pxSettings;
+     pxStatus=NULL;
+     pxLibrary=NULL;
+     pxMouse=NULL;
+@@ -97,6 +99,12 @@ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+         sResourceInfo.erase(0,7);
+         bool processed=pxConfig->dispatch(conn,req_info,sResourceInfo);
+         return processed;
++    } else if( sResource=="settings" || sResource.substr(0,9)=="settings/" )
++    {
++        std::string sResourceInfo=sResource;
++        sResourceInfo.erase(0,8);
++        bool processed=pxSettings->dispatch(conn,req_info,sResourceInfo);
++        return processed;
+     } else if( sResource.substr(0,8)=="library/" )
+     {
+         std::string sResourceInfo=sResource;
+diff --git a/ce_main_app/webserver/api/router/apiv1router.h b/ce_main_app/webserver/api/router/apiv1router.h
+index c69733b7..850cb61b 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.h
++++ b/ce_main_app/webserver/api/router/apiv1router.h
+@@ -14,6 +14,7 @@
+ #include "../resource/downloadresource.h"
+ #include "../resource/statusresource.h"
+ #include "../resource/libraryresource.h"
++#include "../resource/settingsresource.h"
+ 
+ class ApiV1Router: public CivetHandler
+ {
+@@ -32,6 +33,7 @@ private:
+ 	DownloadResource *pxDownload;
+     StatusResource *pxStatus;
+     LibraryResource *pxLibrary;
++    SettingsResource *pxSettings;
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

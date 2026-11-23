@@ -1,0 +1,28 @@
+From 854c180b66c237a7162ba2849336905639406204 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:19:02 +0100
+Subject: [PATCH] ce_main_app: library pictures: send a User-Agent
+
+The media endpoint fetched list pictures with libcurl's default of no
+User-Agent header; Wikimedia (where image lists may point for game
+covers) refuses such requests. Send one.
+---
+ ce_main_app/webserver/api/resource/libraryresource.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/libraryresource.cpp b/ce_main_app/webserver/api/resource/libraryresource.cpp
+index 92501f52..678af0d6 100644
+--- a/ce_main_app/webserver/api/resource/libraryresource.cpp
++++ b/ce_main_app/webserver/api/resource/libraryresource.cpp
+@@ -558,6 +558,8 @@ void LibraryResource::onGetMedia(mg_connection *conn, const std::string &sourceI
+         CURL *curl = curl_easy_init();
+         if(curl) {
+             curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
++            // servers like Wikimedia's refuse requests without a User-Agent
++            curl_easy_setopt(curl, CURLOPT_USERAGENT, "CosmosEx/1.0 (Atari ST disk emulator; image library pictures)");
+             curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+             curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+             curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+-- 
+2.54.0 (Apple Git-157)
+

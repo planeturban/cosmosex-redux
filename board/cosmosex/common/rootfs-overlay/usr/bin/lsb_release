@@ -1,0 +1,12 @@
+#!/bin/sh
+# /ce/whichdistro.sh picks the update branch by looking for "stretch" in
+# "lsb_release -a"; the release scripts and binaries are the stretch ones.
+case "$1" in
+-c|--codename)	echo "Codename:	stretch" ;;
+*)
+	echo "Distributor ID:	CosmosEx"
+	echo "Description:	CosmosEx Buildroot image (stretch-compatible)"
+	echo "Release:	9"
+	echo "Codename:	stretch"
+	;;
+esac

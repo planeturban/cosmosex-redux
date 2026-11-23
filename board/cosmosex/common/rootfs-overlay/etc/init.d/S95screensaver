@@ -1,0 +1,23 @@
+#!/bin/sh
+# HDMI screen saver: spinning Atari logo, then HDMI off (ce-screensaver).
+# Settings: /etc/default/ce-screensaver.
+DAEMON=/usr/sbin/ce-screensaver
+PIDFILE=/var/run/ce-screensaver.pid
+SCREENSAVER_ARGS="-l 300 -o 1800"
+[ -r /etc/default/ce-screensaver ] && . /etc/default/ce-screensaver
+
+case "$1" in
+start)
+	[ -c /dev/fb0 ] || exit 0
+	start-stop-daemon -S -b -m -p "$PIDFILE" -N 19 -x "$DAEMON" -- $SCREENSAVER_ARGS
+	;;
+stop)
+	start-stop-daemon -K -q -p "$PIDFILE"
+	;;
+restart)
+	"$0" stop; sleep 1; "$0" start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"; exit 1
+	;;
+esac

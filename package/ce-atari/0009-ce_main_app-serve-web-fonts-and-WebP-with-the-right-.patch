@@ -1,0 +1,34 @@
+From 4458bec233b8033abc7d5ed60e7cc820afef90f3 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:48:21 +0200
+Subject: [PATCH] ce_main_app: serve web fonts and WebP with the right MIME
+ type
+
+The bundled civetweb's MIME table has no entries for .woff2, .woff or
+.webp, so they were served as text/plain. Browsers tolerate that for
+fonts today, but not with X-Content-Type-Options: nosniff, and WebP
+images need image/webp. Register them via civetweb's extra_mime_types.
+---
+ ce_main_app/webserver/webserver.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/webserver/webserver.cpp b/ce_main_app/webserver/webserver.cpp
+index 837cdba2..a9fee64b 100644
+--- a/ce_main_app/webserver/webserver.cpp
++++ b/ce_main_app/webserver/webserver.cpp
+@@ -24,8 +24,11 @@ void WebServer::start()
+ {
+     Debug::out(LOG_DEBUG, "Webserver starting...");
+ 
++    // civetweb's built-in MIME table predates web fonts and WebP
+     const char * options[] = { "document_root", DOCUMENT_ROOT,
+-                               "listening_ports", PORT, 0
++                               "listening_ports", PORT,
++                               "extra_mime_types", ".woff2=font/woff2,.woff=font/woff,.webp=image/webp",
++                               0
+                              };
+     struct mg_callbacks callbacks;
+     memset(&callbacks, 0, sizeof(callbacks));
+-- 
+2.54.0 (Apple Git-157)
+

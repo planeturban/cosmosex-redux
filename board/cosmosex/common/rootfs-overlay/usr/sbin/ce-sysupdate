@@ -1,0 +1,624 @@
+#!/bin/sh
+# System updates without rewriting the card (two root partitions, A and B).
+# The new system goes to the root partition not in use (p2 = slot A,
+# p3 = slot B), with its kernel, device trees and overlays on the boot
+# partition (A: in /boot, B: in /boot/b/, os_prefix=b/). It's started once
+# with the firmware's tryboot flag; at that start (S99sysupdate) it becomes
+# the default only if the app works. If it doesn't start, the next start
+# (power off and on) is the old system: nothing changed.
+#
+#   ce-sysupdate check            the newest published image (key=value; $RUN/latest.txt)
+#   ce-sysupdate seturl <address> | default
+#                                 where the list of published images is (latest.json)
+#   ce-sysupdate [-n] online      download it and install it
+#   ce-sysupdate [-n] install <file>   an SD card image (.img, or .img.xz), e.g. uploaded or on a USB stick
+#                                 -n: install only, don't restart: it's tried at the next start
+#                                 (restart, or power off and on)
+#   ce-sysupdate boot a|b         the system the next start uses (no restart)
+#   ce-sysupdate restart [stopapp]   restart (into a system installed with -n: tried once);
+#                                 stopapp: stop the app first, at once (the ST was just reset:
+#                                 it mustn't find the CosmosEx while it goes down)
+#   ce-sysupdate usb              the images on USB sticks (top folder: cosmosex-*.img.xz / .img)
+#   ce-sysupdate confirm          at start-up: a new system being tried -> keep it if the app works
+#   ce-sysupdate keep | back      while trying a new system: keep it / restart into the old one
+#   ce-sysupdate previous         restart into the system installed before (it becomes the default)
+#   ce-sysupdate status           everything for the web interface (key=value)
+#   ce-sysupdate workdir          where downloads and uploads go
+#
+# The list of published images is a JSON file (the site's images/latest.json):
+#   { "images": { "<variant>": { "version": "2026.11.17.1", "file": "...img.xz",
+#                                "size": 25210708, "sha256": "...", "date": "2026-11-17" } } }
+# "file" is a whole address, or a path from the folder the list is in (when
+# that folder is called images, as on the CosmosEx site: from the one above).
+# Its address: the one set with seturl (web interface: Config > Software &
+# update; kept in /ce/settings/SYSUPDATE_LIST, so in backups too), or else LIST in /etc/ce-sysupdate.conf.
+# The firmware files (bootcode.bin, start*.elf, fixup*.dat) are shared by
+# both systems and not updated.
+
+CONF=/etc/ce-sysupdate.conf
+LIST=https://redux.cosmosex.net/images/latest.json
+SITE=
+[ -f "$CONF" ] && . "$CONF"
+[ -n "$SITE" ] && LIST="${SITE%/}/images/latest.json"      # a conf from before the list had an address of its own
+LIST_DEFAULT=$LIST
+
+STATE=/data/ce-update               # kept over restarts
+LIST_FILE=/ce/settings/SYSUPDATE_LIST
+RUN=/run/ce-sysupdate
+LOCK=/run/ce-sysupdate.lock
+DISK=/dev/mmcblk0
+UA="CosmosEx/1.0 (system update)"
+VARIANT=$(cat /etc/cosmosex-variant 2>/dev/null || echo armv7)
+VERSION=$(cat /etc/cosmosex-version 2>/dev/null || echo unknown)
+
+mkdir -p "$STATE" "$RUN"
+
+# an address this tool takes: http(s), no characters a shell or curl could read as anything else
+url_ok() {
+	case "$1" in *'
+'*) return 1 ;; esac                # one line only (grep would take any line that fits)
+	[ "${#1}" -le 300 ] && echo "$1" | grep -qE '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%+/-]*)?$'
+}
+# the address set by the user (read, never run as shell)
+if [ -f "$LIST_FILE" ]; then
+	u=$(head -n 1 "$LIST_FILE" | tr -d '\r')
+	url_ok "$u" && LIST=$u
+fi
+
+NORESTART=
+[ "$1" = -n ] && { NORESTART=1; shift; }
+
+# a file's size without reading it (no stat in this image)
+fsize() { ls -ln "$1" 2>/dev/null | awk '{ print $5 + 0 }'; }
+
+# restart with the firmware's one-shot tryboot flag. ce-tryboot restarts
+# straight away (the kernel call, no shutdown scripts), so save the clock
+# first as S03housekeeping does at a normal shutdown (no battery clock: the
+# next start continues from it until the network time comes)
+tryboot_restart() {
+	/usr/sbin/ce-housekeeping clock 2>/dev/null
+	/usr/sbin/ce-tryboot "0 tryboot"
+}
+
+log() {
+	echo "sysupdate: $*"
+	logger -t sysupdate "$*" 2>/dev/null
+}
+
+# the state the web interface shows: state, progress (0-100), message
+set_state() {
+	{
+		echo "state=$1"
+		echo "progress=${2:-0}"
+		echo "message=$3"
+		echo "time=$(date '+%Y-%m-%d %H:%M:%S')"
+	} > "$STATE/status.tmp" && mv -f "$STATE/status.tmp" "$STATE/status"
+	[ -n "$3" ] && log "$1: $3"
+}
+
+fail() {
+	set_state failed 0 "$*"
+	cleanup
+	exit 1
+}
+
+cleanup() {
+	mountpoint -q "$RUN/new" && umount "$RUN/new"
+	mountpoint -q "$RUN/bootimg" && umount "$RUN/bootimg"
+	rm -f "$RUN/boot.vfat" "$RUN/mbr"
+	[ -n "$DELETE_AFTER" ] && rm -f "$DELETE_AFTER"
+	boot_ro
+}
+
+lock() {
+	exec 9> "$LOCK"
+	flock -n 9 || { echo "busy: an update is running"; exit 2; }
+}
+
+# --- slots --------------------------------------------------------------------
+
+slot_of_dev() {
+	case "$1" in
+		${DISK}p2) echo a ;;
+		${DISK}p3) echo b ;;
+	esac
+}
+current_slot() { slot_of_dev "$(findmnt -n -o SOURCE /)"; }
+other_slot() { [ "$1" = a ] && echo b || echo a; }
+slot_part() { [ "$1" = a ] && echo 2 || echo 3; }
+# the slot the firmware starts by default (config.txt)
+default_slot() { grep -q '^os_prefix=b/' /boot/config.txt 2>/dev/null && echo b || echo a; }
+
+boot_rw() { mount -o remount,rw /boot; }
+boot_ro() { sync; mount -o remount,ro /boot 2>/dev/null; }
+
+# replace a file on the boot partition (FAT) in one step
+put_boot_file() {     # source, destination
+	cp "$1" "$2.new" && mv -f "$2.new" "$2"
+}
+
+# --- check / download ---------------------------------------------------------
+
+clock_hint() {
+	[ "$(date +%Y)" -lt 2020 ] && echo " The clock isn't set yet (HTTPS needs it): wait for the time sync, or upload the image instead."
+}
+
+# images.<variant> of the list, as key=value lines (no JSON tool in this image:
+# the text is cut at the braces, then the object after "<variant>": at its commas)
+list_entry() {     # file, variant
+	tr -d '\r\n\t' < "$1" | sed 's/[{}]/\n&\n/g' | awk -v pat="\"$2\"[ ]*:[ ]*\$" '
+		/^[ ]*$/ { next }
+		state == 0 { if ($0 ~ pat) state = 1; next }
+		state == 1 { state = ($0 == "{") ? 2 : (($0 ~ pat) ? 1 : 0); next }
+		state == 2 {
+			if ($0 == "}") exit
+			n = split($0, part, ",")
+			for (i = 1; i <= n; i++) {
+				k = part[i]; sub(/^[ ]*"/, "", k); sub(/".*$/, "", k)
+				v = part[i]; sub(/^[^:]*:[ ]*/, "", v); sub(/[ ]+$/, "", v); sub(/^"/, "", v); sub(/"$/, "", v)
+				if (k ~ /^[a-z0-9_]+$/) print k "=" v
+			}
+			exit
+		}'
+}
+
+do_check() {
+	if ! curl -fsS --max-time 30 --max-filesize 1048576 -A "$UA" -o "$RUN/latest.json" "$LIST" 2> "$RUN/curl.err"; then
+		echo "error=Couldn't get $LIST: $(tail -n 1 "$RUN/curl.err").$(clock_hint)"
+		return 1
+	fi
+	list_entry "$RUN/latest.json" "$VARIANT" | grep -E '^(version|file|size|sha256|date)=' > "$RUN/latest.txt.tmp"
+	if [ ! -s "$RUN/latest.txt.tmp" ]; then
+		if grep -q '"images"' "$RUN/latest.json"; then echo "error=The list has no image for this CosmosEx ($VARIANT): $LIST"
+		else echo "error=That isn't a list of CosmosEx images: $LIST"; fi
+		return 1
+	fi
+	# the list is someone else's text: each value once (the first), one line,
+	# checked whole, and latest.txt written from the checked values only
+	one() { sed -n "s/^$1=//p" "$RUN/latest.txt.tmp" | head -n 1; }
+	fits() { case "$1" in *[!$2]*|'') return 1 ;; esac; return 0; }     # only these characters, and not empty
+	v=$(one version); f=$(one file); h=$(one sha256); z=$(one size); d=$(one date)
+	# the image's address: as given, or from the list's folder (above it when that is "images")
+	case "$f" in
+		http://*|https://*) u=$f ;;
+		*)  case "$LIST" in */images/*) root=${LIST%/images/*} ;; *) root=${LIST%/*} ;; esac
+		    case "$f" in /*|*..*) u= ;; *) u="$root/$f" ;; esac ;;
+	esac
+	fits "$d" '0-9-' || d=
+	if ! fits "$v" '0-9.' || ! fits "$h" '0-9a-f' || [ "${#h}" != 64 ] || ! fits "$z" '0-9' || [ "${#z}" -gt 12 ] ||
+	   ! fits "$f" 'A-Za-z0-9._~%+/:-' || ! url_ok "$u"; then
+		echo "error=The list's entry for $VARIANT isn't usable ($LIST)."
+		return 1
+	fi
+	case "$f" in *.img.xz) ;; *) echo "error=The list's entry for $VARIANT isn't usable ($LIST)."; return 1 ;; esac
+	{
+		echo "version=$v"; echo "file=$f"; echo "size=$z"; echo "sha256=$h"; echo "date=$d"
+		echo "url=$u"
+		echo "checked=$(date '+%Y-%m-%d %H:%M:%S')"
+	} > "$RUN/latest.txt.tmp"
+	mv -f "$RUN/latest.txt.tmp" "$RUN/latest.txt"
+	cat "$RUN/latest.txt"
+}
+
+# where the list is: an address, or "default" (or nothing) for the image's own
+do_seturl() {
+	case "$1" in
+		''|default) rm -f "$LIST_FILE"; LIST=$LIST_DEFAULT ;;
+		*)  url_ok "$1" || { echo "error=That isn't an address this can use: http:// or https://, and only letters, digits and . - _ ~ % + / in it."; return 1; }
+		    if [ "$1" = "$LIST_DEFAULT" ]; then rm -f "$LIST_FILE"
+		    else mkdir -p "${LIST_FILE%/*}" && echo "$1" > "$LIST_FILE.tmp" && mv -f "$LIST_FILE.tmp" "$LIST_FILE" || { echo "error=Couldn't save the address."; return 1; }
+		    fi
+		    LIST=$1 ;;
+	esac
+	sync
+	rm -f "$RUN/latest.txt" "$RUN/latest.json"          # what was found in the list before
+	echo "list=$LIST"
+}
+
+workdir() {
+	if mountpoint -q /storage; then echo /storage/.ce-update; else echo "$STATE/work"; fi
+}
+
+do_online() {
+	lock
+	set_state checking 0 "Looking for the newest system"
+	out=$(do_check) || fail "$(echo "$out" | sed -n 's/^error=//p')"
+	v=$(sed -n 's/^version=//p' "$RUN/latest.txt")
+	f=$(sed -n 's/^file=//p' "$RUN/latest.txt")
+	size=$(sed -n 's/^size=//p' "$RUN/latest.txt")
+	h=$(sed -n 's/^sha256=//p' "$RUN/latest.txt")
+	w=$(workdir); mkdir -p "$w"; rm -f "$w"/*
+	file="$w/${f##*/}"
+	DELETE_AFTER=$file
+	free=$(df -k "$w" | awk 'NR == 2 { print $4 }')
+	[ "$free" -gt $((size / 1024 + 4096)) ] || fail "Not enough room for the download ($((size / 1048576)) MB) in $w."
+
+	set_state downloading 0 "Downloading $v"
+	# (no more than the list said: a wrong list can't fill the card)
+	curl -fsS --max-time 3600 --max-filesize "$size" -A "$UA" -o "$file" "$(sed -n 's/^url=//p' "$RUN/latest.txt")" 2> "$RUN/curl.err" &
+	pid=$!
+	while kill -0 $pid 2>/dev/null; do
+		got=$(fsize "$file")     # (no stat in this image)
+		[ "$size" -gt 0 ] && set_state downloading $((got * 100 / size)) "Downloading $v ($((got / 1048576)) of $((size / 1048576)) MB)"
+		sleep 2
+	done
+	wait $pid || fail "The download failed: $(tail -n 1 "$RUN/curl.err").$(clock_hint)"
+	set_state verifying 0 "Checking the download"
+	[ "$(sha256sum "$file" | cut -d' ' -f1)" = "$h" ] || fail "The download is damaged (its checksum differs); nothing was changed."
+	install_image "$file" "$v"
+}
+
+# --- install ------------------------------------------------------------------
+
+# a little-endian number from the image's partition table
+mbr_u32() { od -An -tu4 -j "$1" -N4 "$RUN/mbr" | tr -d ' '; }
+mbr_type() { od -An -tx1 -j "$1" -N1 "$RUN/mbr" | tr -d ' '; }
+
+install_image() {     # file, [version from the site]
+	f=$1
+	[ -f "$f" ] || fail "No such file: $f"
+	cur=$(current_slot)
+	[ -n "$cur" ] || fail "This CosmosEx doesn't run from partition 2 or 3: no system updates."
+	if [ "$cur" != "$(default_slot)" ]; then
+		[ -f "$STATE/pending" ] && fail "A new system is being tried: keep it or go back first."
+		fail "The next start is set to the other system (slot $(default_slot | tr ab AB)), which an update would replace: choose this one ($VERSION) as the next start first."
+	fi
+	new=$(other_slot "$cur")
+	part=${DISK}p$(slot_part "$new")
+
+	magic=$(od -An -tx1 -N6 "$f" | tr -d ' \n')
+	if [ "$magic" = fd377a585a00 ]; then
+		set_state verifying 0 "Checking the file (xz)"
+		xz -t "$f" 2>/dev/null || fail "The file is damaged (xz says so); nothing was changed."
+		decomp() { xz -dc "$f"; }
+	else
+		decomp() { cat "$f"; }
+	fi
+
+	# the image's partition table: 1 = boot (FAT), 2 = root (ext4)
+	decomp 2>/dev/null | dd bs=512 count=1 iflag=fullblock of="$RUN/mbr" 2>/dev/null
+	[ "$(od -An -tx1 -j 510 -N2 "$RUN/mbr" | tr -d ' ')" = 55aa ] || fail "That's not an SD card image (no partition table)."
+	t1=$(mbr_type 450); s1=$(mbr_u32 454); n1=$(mbr_u32 458)
+	t2=$(mbr_type 466); s2=$(mbr_u32 470); n2=$(mbr_u32 474)
+	case "$t1" in 0b|0c|0e) ;; *) fail "That's not a CosmosEx image (partition 1 isn't FAT)." ;; esac
+	[ "$t2" = 83 ] || fail "That's not a CosmosEx image (partition 2 isn't Linux)."
+	[ "$s1" -gt 0 ] && [ "$n1" -gt 0 ] && [ $((s1 + n1)) -le "$s2" ] && [ "$n2" -gt 0 ] ||
+		fail "The image's partition table doesn't look right."
+	room=$(cat /sys/class/block/${part##*/}/size)
+	[ "$n2" -le "$room" ] || fail "The new system ($((n2 / 2048)) MB) doesn't fit partition ${part##*/} ($((room / 2048)) MB)."
+
+	# boot partition to RAM, root file system to the free slot, in one pass
+	log "installing $f to slot $new ($part)"
+	# the system in that slot is gone from here on: no going back to it,
+	# nor a staged one starting
+	boot_rw && rm -f "/boot/config-$new.txt" /boot/tryboot.txt; boot_ro
+	rm -f "$STATE/version-$new" "$STATE/pending"
+	set_state writing 0 "Writing the new system"
+	chunk=32768                                       # 16 MB
+	decomp 2>/dev/null | {
+		dd bs=512 count="$s1" iflag=fullblock of=/dev/null 2>/dev/null
+		dd bs=512 count="$n1" iflag=fullblock of="$RUN/boot.vfat" 2>/dev/null
+		dd bs=512 count=$((s2 - s1 - n1)) iflag=fullblock of=/dev/null 2>/dev/null
+		done_s=0
+		while [ $done_s -lt "$n2" ]; do
+			c=$chunk; [ $((n2 - done_s)) -lt $c ] && c=$((n2 - done_s))
+			dd bs=512 count=$c seek=$done_s iflag=fullblock of="$part" conv=notrunc 2>/dev/null || exit 1
+			done_s=$((done_s + c))
+			set_state writing $((done_s * 100 / n2)) "Writing the new system ($((done_s / 2048)) of $((n2 / 2048)) MB)"
+		done
+		cat > /dev/null
+	} || fail "Writing partition ${part##*/} failed."
+	sync
+
+	# read back from the card and compare with the image
+	set_state verifying 0 "Checking what was written"
+	echo 3 > /proc/sys/vm/drop_caches
+	want=$(decomp 2>/dev/null | { dd bs=512 count="$s2" iflag=fullblock of=/dev/null 2>/dev/null; dd bs=512 count="$n2" iflag=fullblock 2>/dev/null; } | sha256sum | cut -d' ' -f1)
+	got=$(dd if="$part" bs=512 count="$n2" 2>/dev/null | sha256sum | cut -d' ' -f1)
+	[ "$want" = "$got" ] || fail "What was written to ${part##*/} differs from the image (bad card?). The current system is unchanged."
+	e2fsck -n "$part" > /dev/null 2>&1 || fail "The new system's file system has errors; not used."
+
+	# which system it is
+	mkdir -p "$RUN/new" "$RUN/bootimg"
+	mount -t ext4 -o ro "$part" "$RUN/new" || fail "Can't mount the new system."
+	nv=$(cat "$RUN/new/etc/cosmosex-variant" 2>/dev/null)
+	if [ -z "$nv" ]; then                         # images before 2026.11.16 don't say: by their loader
+		if [ -e "$RUN/new/lib/ld-linux-aarch64.so.1" ]; then nv=arm64; else nv=armv7; fi
+	fi
+	newver=$(cat "$RUN/new/etc/cosmosex-version" 2>/dev/null)
+	newver=${newver:-${2:-unknown}}
+	umount "$RUN/new"
+	[ "$nv" = "$VARIANT" ] || fail "That image is for $nv; this CosmosEx runs $VARIANT."
+
+	# its boot files: kernel, device trees, overlays, cmdline.txt; config for tryboot.txt
+	mount -t vfat -o ro,loop "$RUN/boot.vfat" "$RUN/bootimg" || fail "Can't read the image's boot partition."
+	[ -f "$RUN/bootimg/config.txt" ] && [ -f "$RUN/bootimg/cmdline.txt" ] || fail "The image's boot partition has no config.txt or cmdline.txt."
+	dir=/boot; [ "$new" = b ] && dir=/boot/b
+	need=$(du -sk "$RUN/bootimg" | cut -f1)
+	free=$(df -k /boot | awk 'NR == 2 { print $4 }')
+	have=$(du -sk "$dir" 2>/dev/null | cut -f1)
+	[ "$new" = a ] && have=0                      # slot A's files are among others in /boot
+	[ $((free + have)) -gt $((need + 512)) ] || fail "Not enough room on the boot partition ($free KB free)."
+
+	set_state bootfiles 100 "Copying the new system's start files"
+	boot_rw || fail "Can't write to the boot partition."
+	mkdir -p "$dir/overlays"
+	ok=1
+	for src in "$RUN/bootimg"/* "$RUN/bootimg"/overlays/*; do
+		[ -f "$src" ] || continue
+		name=${src#"$RUN/bootimg"/}
+		case "$name" in
+			bootcode.bin|start*.elf|fixup*.dat|config.txt|cmdline.txt) continue ;;     # shared, or made below
+			*.example) put_boot_file "$src" "/boot/$name" || ok=; continue ;;           # our examples: at the top, for both systems
+			*.txt|*.pub|*.conf|*.md) continue ;;                                       # the user's files
+		esac
+		put_boot_file "$src" "$dir/$name" || ok=
+	done
+	sed "s#root=/dev/mmcblk0p[0-9]*#root=$part#" "$RUN/bootimg/cmdline.txt" > "$RUN/cmdline.txt" &&
+		put_boot_file "$RUN/cmdline.txt" "$dir/cmdline.txt" || ok=
+	# the new system's config: its config.txt (+ os_prefix for slot B)
+	{
+		cat "$RUN/bootimg/config.txt"
+		[ "$new" = b ] && printf '\n[all]\n# slot B: kernel, device trees, overlays and cmdline.txt from b/ (partition 3)\nos_prefix=b/\n'
+	} > "$RUN/config-new.txt"
+	put_boot_file "$RUN/config-new.txt" /boot/tryboot.txt || ok=
+	boot_ro
+	umount "$RUN/bootimg"
+	[ -n "$ok" ] || fail "Copying the start files to the boot partition failed. The current system is unchanged."
+
+	{
+		echo "slot=$new"
+		echo "version=$newver"
+		echo "from=$VERSION"
+		echo "fromslot=$cur"
+		[ -n "$NORESTART" ] && echo "staged=yes"
+	} > "$STATE/pending"
+	cleanup
+	sync
+	if [ -n "$NORESTART" ]; then
+		set_state staged 100 "$newver is installed (system $(echo "$new" | tr ab AB)). It's tried at the next start (restart, or power off and on), and kept if it works."
+		exit 0
+	fi
+	set_state restarting 100 "Restarting into $newver (once, to try it)"
+	sleep 2
+	tryboot_restart
+	fail "Couldn't restart."
+}
+
+# --- after the restart --------------------------------------------------------
+
+pending() { sed -n "s/^$1=//p" "$STATE/pending" 2>/dev/null; }
+
+# make the running (tried) system the default
+commit() {
+	cur=$(current_slot)
+	def=$(default_slot)
+	boot_rw || return 1
+	cp /boot/config.txt "/boot/config-$def.txt" &&       # to go back to (ce-sysupdate previous)
+	put_boot_file /boot/tryboot.txt /boot/config.txt &&
+	rm -f /boot/tryboot.txt "/boot/config-$cur.txt"
+	rc=$?
+	boot_ro
+	[ $rc = 0 ] || return 1
+	echo "$(pending from)" > "$STATE/version-$def"
+	echo "$(pending version)" > "$STATE/version-$cur"
+	return 0
+}
+
+app_ok() {      # the app answers, and Hans and Franz (on the CosmosEx board) do
+	s=$(wget -q -O- http://127.0.0.1/api/v1/status 2>/dev/null | tr -d ' \n')
+	echo "$s" | grep -q '"hans":{"ok":true' && echo "$s" | grep -q '"franz":{"ok":true'
+}
+
+do_confirm() {
+	# an update cut short (power off while writing): the current system is unchanged
+	case "$(sed -n 's/^state=//p' "$STATE/status" 2>/dev/null)" in
+		checking|downloading|verifying|writing|bootfiles)
+			[ -f "$STATE/pending" ] || set_state failed 0 "The update was interrupted (power off?); the system is unchanged. Try again."
+			rm -rf "$STATE/work" /storage/.ce-update 2>/dev/null
+			;;
+	esac
+	[ -f "$STATE/pending" ] || return 0
+	cur=$(current_slot)
+	if [ "$(pending staged)" = yes ]; then
+		# installed without a restart, and this start (power on) was the old
+		# system: restart into the new one, once to try it
+		[ "$cur" != "$(pending slot)" ] && [ -f /boot/tryboot.txt ] || { rm -f "$STATE/pending"; return 0; }
+		try_staged
+		return 0
+	fi
+	if [ "$cur" != "$(pending slot)" ] || [ "$cur" = "$(default_slot)" ]; then
+		# started the old system: the new one didn't start, or the power went off
+		boot_rw && rm -f /boot/tryboot.txt; boot_ro
+		set_state failed 0 "The new system ($(pending version)) didn't start; this is the previous one ($VERSION), unchanged. Try again, or use another image."
+		rm -f "$STATE/pending"
+		return 0
+	fi
+	set_state trial 100 "Trying $(pending version): waiting for the CosmosEx app"
+	# chips being flashed first (ce-flash, before the app starts): up to 5 minutes more
+	f=0
+	while [ -f /data/ce-flash/request ] && [ $f -lt 100 ]; do sleep 3; f=$((f + 1)); done
+	i=0
+	while [ $i -lt 60 ]; do
+		if app_ok; then
+			if commit; then
+				set_state done 100 "Updated from $(pending from) to $(pending version)."
+				rm -f "$STATE/pending"
+			else
+				set_state trial 100 "$(pending version) works, but it couldn't be made the default: Keep it, or Go back."
+			fi
+			return 0
+		fi
+		sleep 3
+		i=$((i + 1))
+	done
+	set_state trial 100 "$(pending version) is running, but the CosmosEx chips don't answer. Keep it, or Go back to $(pending from) (the next restart goes back too)."
+}
+
+do_keep() {
+	[ -f "$STATE/pending" ] && [ "$(current_slot)" = "$(pending slot)" ] || { echo "nothing to keep"; return 1; }
+	commit || { set_state trial 100 "Couldn't make $(pending version) the default."; return 1; }
+	set_state done 100 "Updated from $(pending from) to $(pending version) (kept by hand)."
+	rm -f "$STATE/pending"
+}
+
+do_back() {
+	[ -f "$STATE/pending" ] || { echo "no new system being tried"; return 1; }
+	boot_rw && rm -f /boot/tryboot.txt; boot_ro
+	set_state failed 0 "Went back from $(pending version) to $(pending from)."
+	rm -f "$STATE/pending"
+	sync
+	reboot
+}
+
+do_previous() {
+	lock
+	cur=$(current_slot)
+	other=$(other_slot "$cur")
+	[ -f "$STATE/pending" ] && { echo "a new system is being tried: keep it or go back first"; return 1; }
+	[ "$cur" = "$(default_slot)" ] || { echo "not running the default system"; return 1; }
+	[ -f "/boot/config-$other.txt" ] || { echo "no previous system"; return 1; }
+	pv=$(cat "$STATE/version-$other" 2>/dev/null || echo "the previous system")
+	boot_rw || return 1
+	cp /boot/config.txt "/boot/config-$cur.txt" &&
+	put_boot_file "/boot/config-$other.txt" /boot/config.txt &&
+	rm -f "/boot/config-$other.txt"
+	rc=$?
+	boot_ro
+	[ $rc = 0 ] || { echo "couldn't switch"; return 1; }
+	set_state done 100 "Switched to $pv (the one installed before $VERSION)."
+	sync
+	reboot
+}
+
+# a staged system (installed with -n): restart into it, once to try it
+try_staged() {
+	sed -i '/^staged=/d' "$STATE/pending"
+	set_state restarting 100 "Restarting into $(pending version) (once, to try it)"
+	sync
+	sleep 2
+	tryboot_restart
+	fail "Couldn't restart."
+}
+
+do_restart() {
+	[ "$1" = stopapp ] && /etc/init.d/S00ceapp stop >/dev/null 2>&1
+	lock
+	if [ -f "$STATE/pending" ] && [ "$(pending staged)" = yes ] && [ -f /boot/tryboot.txt ]; then
+		try_staged
+	fi
+	sync
+	reboot
+}
+
+# the version in a slot ("" = nothing usable there)
+slot_version() {
+	if [ "$1" = "$(current_slot)" ]; then echo "$VERSION"
+	elif [ -f "$STATE/pending" ] && [ "$(pending slot)" = "$1" ]; then pending version
+	elif [ -f "/boot/config-$1.txt" ] || [ "$(default_slot)" = "$1" ]; then cat "$STATE/version-$1" 2>/dev/null || echo unknown
+	fi
+}
+
+# the slot the next start uses: a staged system, else the default
+next_slot() {
+	if [ -f "$STATE/pending" ] && [ "$(pending staged)" = yes ] && [ -f /boot/tryboot.txt ]; then pending slot
+	else default_slot; fi
+}
+
+# make a slot the next start (without restarting)
+do_boot() {
+	lock
+	t=$1
+	case "$t" in a|b) ;; *) echo "error=Which system? (a or b)"; return 1 ;; esac
+	cur=$(current_slot)
+	def=$(default_slot)
+	[ -n "$cur" ] || { echo "error=This CosmosEx doesn't run from partition 2 or 3."; return 1; }
+	if [ -f "$STATE/pending" ] && [ "$(pending staged)" != yes ]; then
+		echo "error=A new system is being tried: keep it or go back first."; return 1
+	fi
+	echo "$VERSION" > "$STATE/version-$cur"
+	if [ "$t" = "$(next_slot)" ]; then echo "next=$t"; return 0; fi
+	if [ -f "$STATE/pending" ]; then
+		# a staged system: not starting it is enough (t is the default then)
+		v=$(pending version)
+		boot_rw && rm -f /boot/tryboot.txt; boot_ro
+		rm -f "$STATE/pending"
+		set_state done 100 "$v (system $(other_slot "$t" | tr ab AB)) won't be started."
+		[ "$t" = "$def" ] && { echo "next=$t"; return 0; }
+	fi
+	[ -f "/boot/config-$t.txt" ] || { echo "error=There's no usable system in slot $(echo "$t" | tr ab AB)."; return 1; }
+	boot_rw || { echo "error=Can't write to the boot partition."; return 1; }
+	cp /boot/config.txt "/boot/config-$def.txt" &&
+	put_boot_file "/boot/config-$t.txt" /boot/config.txt &&
+	rm -f "/boot/config-$t.txt"
+	rc=$?
+	boot_ro
+	[ $rc = 0 ] || { echo "error=Couldn't switch."; return 1; }
+	v=$(slot_version "$t")
+	set_state done 100 "The next start uses $v (system $(echo "$t" | tr ab AB))."
+	log "next start: slot $t ($v)"
+	echo "next=$t"
+}
+
+do_status() {
+	cur=$(current_slot)
+	other=$(other_slot "$cur")
+	echo "variant=$VARIANT"
+	echo "version=$VERSION"
+	echo "slot=$cur"
+	echo "defaultSlot=$(default_slot)"
+	echo "nextSlot=$(next_slot)"
+	echo "slotA=$(slot_version a)"
+	echo "slotB=$(slot_version b)"
+	[ -f "$STATE/pending" ] && [ "$(pending staged)" = yes ] && echo "staged=$(pending version)"
+	echo "list=$LIST"
+	echo "listDefault=$LIST_DEFAULT"
+	if [ -n "$cur" ] && [ -f "/boot/config-$other.txt" ] && [ ! -f "$STATE/pending" ]; then
+		echo "previous=$(cat "$STATE/version-$other" 2>/dev/null || echo unknown)"
+	fi
+	if [ -f "$STATE/status" ]; then
+		sed -n 's/^\(state\|progress\|message\|time\)=/\1=/p' "$STATE/status"
+	else
+		echo "state=idle"
+	fi
+	# still running? (a state left by an interrupted update)
+	if ! flock -n "$LOCK" true 2>/dev/null; then echo "busy=yes"; else echo "busy=no"; fi
+	[ -f "$STATE/pending" ] && [ "$(pending staged)" != yes ] && echo "trying=$(pending version)"
+	if [ -f "$RUN/latest.txt" ]; then
+		sed -n 's/^\(version\|size\|date\|checked\)=/latest_\1=/p' "$RUN/latest.txt"
+	fi
+	usb_images
+	w=$(workdir)
+	echo "workdir=$w"
+	echo "workdirFreeMB=$(df -m "$(dirname "$w")" | awk 'NR == 2 { print $4 }')"
+}
+
+# images on USB sticks (their top folder; not the shared drive), one line each:
+# usb=<path>|<size MB>
+usb_images() {
+	for f in /mnt/*/cosmosex-*.img.xz /mnt/*/cosmosex-*.img; do
+		[ -f "$f" ] || continue
+		case "$f" in /mnt/shared/*) continue ;; esac
+		echo "usb=$f|$(( $(fsize "$f") / 1048576 ))"
+	done
+}
+
+case "$1" in
+	usb)      usb_images ;;
+	check)    do_check ;;
+	seturl)   do_seturl "$2" ;;
+	online)   do_online ;;
+	install)  lock; DELETE_AFTER=${3:+$2}; install_image "$2" ;;
+	confirm)  do_confirm ;;
+	keep)     do_keep ;;
+	back)     do_back ;;
+	previous) do_previous ;;
+	boot)     do_boot "$2" ;;
+	restart)  do_restart "$2" ;;
+	status)   do_status ;;
+	workdir)  w=$(workdir); mkdir -p "$w"; echo "$w" ;;
+	*)
+		echo "usage: $0 check | seturl <address>|default | online | install <file> [delete] | confirm | keep | back | previous | status | workdir"
+		exit 1
+		;;
+esac

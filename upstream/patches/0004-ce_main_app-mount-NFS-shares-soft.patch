@@ -1,0 +1,35 @@
+From b73a5ed41eb2390fcd2ebd1eae7e082cb0d95212 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 23:35:01 +0200
+Subject: [PATCH 4/8] ce_main_app: mount NFS shares soft
+
+Without soft/timeo options the kernel mounts NFS hard: when the server
+becomes unreachable, every access to /mnt/shared blocks until it returns,
+including the thread that serves the Atari's shared drive, so the Atari
+freezes. This is the hang the app warns about when NFS is selected.
+
+With soft,timeo=20,retrans=2 an access fails after about 6 seconds and
+the Atari gets an error instead.
+---
+ ce_main_app/mounter.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/mounter.cpp b/ce_main_app/mounter.cpp
+index 12f6cb16..f9b15dce 100644
+--- a/ce_main_app/mounter.cpp
++++ b/ce_main_app/mounter.cpp
+@@ -273,7 +273,10 @@ bool Mounter::mountShared(const char *host, const char *hostDir, bool nfsNotSamb
+     }
+ 
+     if(nfsNotSamba) {        // for NFS
+-        len = snprintf(options, MAX_STR_SIZE, "nolock,addr=%s%s", host, auth);
++        // soft: when the server is unreachable, accesses fail after
++        // timeo * (retrans + 1) with backoff (about 6 s) instead of hanging
++        // the app - and the Atari - until the server comes back.
++        len = snprintf(options, MAX_STR_SIZE, "nolock,soft,timeo=20,retrans=2,addr=%s%s", host, auth);
+     } else {                // for Samba
+         passwd *psw = getpwnam("pi");
+ 
+-- 
+2.54.0 (Apple Git-157)
+

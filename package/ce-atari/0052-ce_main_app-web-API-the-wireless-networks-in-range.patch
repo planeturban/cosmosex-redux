@@ -1,0 +1,133 @@
+From 68ea71e99fbec92f9c46e2e91cb8e894d088408f Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 21:27:47 +0100
+Subject: [PATCH] ce_main_app: web API: the wireless networks in range
+
+GET /api/v1/system/wifiscan runs the image's /usr/libexec/ce-wifi-scan
+(signal, frequency, security and name per access point heard) and
+answers {"networks":[{ssid, signal, freq, security}]}, the strongest
+first. One scan at a time; 404 on a system without the tool, 503 with
+the tool's reason when there is nothing to scan with.
+---
+ .../webserver/api/resource/systemresource.cpp | 70 +++++++++++++++++++
+ .../webserver/api/resource/systemresource.h   |  2 +
+ 2 files changed, 72 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 097b4bfa..30e7b0fa 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <string>
+ #include <vector>
++#include <algorithm>
++#include <utility>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -296,6 +298,73 @@ void SystemResource::devMode(mg_connection *conn, mg_request_info *req_info)
+     sendJson(conn, root);
+ }
+ 
++static bool wifiStronger(const std::pair<int, cJSON *> &a, const std::pair<int, cJSON *> &b) { return a.first < b.first; }
++
++// The name of a network as iw prints it: \xNN for other bytes, \\ for a backslash
++static std::string wifiName(const std::string &in)
++{
++    std::string out;
++    for(size_t i = 0; i < in.length(); i++) {
++        if(in[i] == '\\' && i + 3 < in.length() && in[i + 1] == 'x' && isxdigit((unsigned char) in[i + 2]) && isxdigit((unsigned char) in[i + 3])) {
++            out += (char) strtol(in.substr(i + 2, 2).c_str(), NULL, 16);
++            i += 3;
++        } else if(in[i] == '\\' && i + 1 < in.length() && in[i + 1] == '\\') {
++            out += '\\';
++            i++;
++        } else {
++            out += in[i];
++        }
++    }
++    return out;
++}
++
++// GET /api/v1/system/wifiscan: the wireless networks in range, the strongest
++// first: {"networks":[{"ssid","signal" (dBm),"freq" (MHz),"security"}]}.
++// One entry per access point heard (a network on two bands comes twice).
++// Takes as long as the scan: 3 to 5 s.
++void SystemResource::wifiScan(mg_connection *conn, mg_request_info *req_info)
++{
++    static pthread_mutex_t scanMutex = PTHREAD_MUTEX_INITIALIZER;   // one scan at a time
++    if(strcmp(req_info->request_method, "GET") != 0) { sendError(conn, 405, "GET /api/v1/system/wifiscan"); return; }
++    if(access(WIFISCAN_TOOL, X_OK) != 0) { sendError(conn, 404, "This system can't scan for wireless networks."); return; }
++
++    std::string out;
++    pthread_mutex_lock(&scanMutex);
++    bool ok = runToolAt(WIFISCAN_TOOL, "", out);
++    pthread_mutex_unlock(&scanMutex);
++    if(!ok) {
++        std::string why = valueOf(out, "error");
++        sendError(conn, 503, why.empty() ? "The scan failed." : why);
++        return;
++    }
++
++    cJSON *root = cJSON_CreateObject();
++    cJSON *list = cJSON_CreateArray();
++    cJSON_AddItemToObject(root, "networks", list);
++    std::vector<std::pair<int, cJSON *> > found;
++    size_t pos = 0;
++    while(pos < out.length() && found.size() < 200) {
++        size_t nl = out.find('\n', pos);
++        if(nl == std::string::npos) nl = out.length();
++        std::string line = out.substr(pos, nl - pos);
++        pos = nl + 1;
++        size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1), t3 = t2 == std::string::npos ? t2 : line.find('\t', t2 + 1);
++        if(t3 == std::string::npos) continue;
++        std::string ssid = wifiName(line.substr(t3 + 1));
++        if(ssid.empty() || ssid.length() > 32) continue;
++        cJSON *n = cJSON_CreateObject();
++        int signal = atoi(line.substr(0, t1).c_str());
++        cJSON_AddStringToObject(n, "ssid", ssid.c_str());
++        cJSON_AddNumberToObject(n, "signal", signal);
++        cJSON_AddNumberToObject(n, "freq", atoi(line.substr(t1 + 1, t2 - t1 - 1).c_str()));
++        cJSON_AddStringToObject(n, "security", line.substr(t2 + 1, t3 - t2 - 1).c_str());
++        found.push_back(std::make_pair(-signal, n));
++    }
++    std::stable_sort(found.begin(), found.end(), wifiStronger);
++    for(size_t i = 0; i < found.size(); i++) cJSON_AddItemToArray(list, found[i].second);
++    sendJson(conn, root);
++}
++
+ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
+ {
+     std::string what = sResourceInfo;
+@@ -315,6 +384,7 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     }
+     if(what == "flash") { flash(conn, req_info); return true; }
+     if(what == "devmode") { devMode(conn, req_info); return true; }
++    if(what == "wifiscan") { wifiScan(conn, req_info); return true; }
+     if(what.compare(0, 6, "update") != 0) { sendError(conn, 404, "unknown resource"); return true; }
+     what.erase(0, 6);
+     while(!what.empty() && what[0] == '/') what.erase(0, 1);
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index b6b7873f..47ad3c8f 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -46,6 +46,7 @@
+ // request answers "available": false.
+ 
+ #define SYSUPDATE_TOOL      "/usr/sbin/ce-sysupdate"
++#define WIFISCAN_TOOL       "/usr/libexec/ce-wifi-scan"     // prints: signal TAB MHz TAB security TAB name
+ #define SYSUPDATE_MAX_MB    2048            // largest upload
+ #define BACKUP_TOOL         "/usr/sbin/ce-backup"
+ #define BACKUP_MAX_MB       4096            // largest backup upload
+@@ -67,6 +68,7 @@ private:
+     void backupRestore(mg_connection *conn);
+     void flash(mg_connection *conn, mg_request_info *req_info);
+     void devMode(mg_connection *conn, mg_request_info *req_info);
++    void wifiScan(mg_connection *conn, mg_request_info *req_info);
+     // receive the body into <tool's workdir>/<name>; false: answered with an error
+     bool receiveFile(mg_connection *conn, const char *tool, long long maxMB, const std::string &name, std::string &path);
+ };
+-- 
+2.54.0 (Apple Git-157)
+

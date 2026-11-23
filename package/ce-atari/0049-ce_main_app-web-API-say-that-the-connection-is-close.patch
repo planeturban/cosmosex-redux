@@ -1,0 +1,654 @@
+From 377f982e179d71f8d174ce6779b2db48d1222dc3 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:53:57 +0100
+Subject: [PATCH] ce_main_app: web API: say that the connection is closed
+
+The web server runs without keep-alive: it closes the connection after
+every response. The responses the app writes itself (the API and the old
+controllers) are HTTP/1.1 with a Content-Length and no Connection header,
+which a client reads as "the connection stays open". A browser then
+sends its next request on the connection the server has just closed and
+that request fails (quick clicks on the Floppy page: "Lost connection").
+
+Every response the app writes now carries "Connection: close".
+---
+ .../webserver/api/resource/configresource.cpp | 26 +++++++++----------
+ .../api/resource/downloadresource.cpp         |  4 +--
+ .../webserver/api/resource/filesresource.cpp  |  4 +--
+ .../webserver/api/resource/floppyresource.cpp | 24 ++++++++---------
+ .../webserver/api/resource/kbdresource.cpp    | 16 ++++++------
+ .../api/resource/libraryresource.cpp          |  8 +++---
+ .../webserver/api/resource/mouseresource.cpp  | 12 ++++-----
+ .../api/resource/settingsresource.cpp         |  6 ++---
+ .../webserver/api/resource/statusresource.cpp |  4 +--
+ .../webserver/api/resource/systemresource.cpp |  4 +--
+ .../webserver/api/router/apiv1router.cpp      |  4 +--
+ .../app/controller/configcontroller.cpp       |  2 +-
+ .../app/controller/debugcontroller.cpp        |  4 +--
+ .../app/controller/screencastcontroller.cpp   |  4 +--
+ .../app/controller/statuscontroller.cpp       |  2 +-
+ .../webserver/app/router/controllerrouter.cpp |  4 +--
+ ce_main_app/webserver/webauth.cpp             |  6 ++---
+ 17 files changed, 67 insertions(+), 67 deletions(-)
+
+diff --git a/ce_main_app/webserver/api/resource/configresource.cpp b/ce_main_app/webserver/api/resource/configresource.cpp
+index 0d5198d1..b838a1f2 100644
+--- a/ce_main_app/webserver/api/resource/configresource.cpp
++++ b/ce_main_app/webserver/api/resource/configresource.cpp
+@@ -72,7 +72,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     Debug::out(LOG_DEBUG, "ConfigResource::dispatch");
+ 
+     if( strstr(req_info->request_method,"GET")==0 && strstr(req_info->request_method,"POST")==0 ){
+-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\n",req_info->request_method);
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\nConnection: close\r\n",req_info->request_method);
+         return true;
+     }
+ 
+@@ -88,7 +88,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         std::string sLogLevel=std::string(loglevel);
+         if( sLogLevel!="ll1" && sLogLevel!="ll2" && sLogLevel!="ll3" && sLogLevel!="ikbdlogs" && sLogLevel!="" )
+         {
+-            mg_printf(conn, "HTTP/1.1 400 unknown loglevel\r\n");
++            mg_printf(conn, "HTTP/1.1 400 unknown loglevel\r\nConnection: close\r\n");
+             return true;
+         }
+ 
+@@ -111,7 +111,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+      
+         Debug::out(LOG_INFO, "Log level changed from web to level %d", flags.logLevel);
+ 
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\n\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+         return true;    
+     }
+ 
+@@ -129,14 +129,14 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         if( res ){
+             int realLen = strnlen((const char *) in_bfr, iReadLen);         // get real string length - might have 2 more bytes (isUpdateScreen, updateComponents) after string terminator
+         
+-            mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
++            mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n");
+             mg_printf(conn, "Cache: no-cache\r\n");
+             mg_printf(conn, "Content-Length: %d\r\n\r\n", realLen);         // Always set Content-Length
+             mg_write(conn, in_bfr, realLen);
+             return true;
+         } else{
+             Debug::out(LOG_ERROR, "could not send config command");
+-            mg_printf(conn, "HTTP/1.1 500 Server Error - could not send config command\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 500 Server Error - could not send config command\r\nConnection: close\r\n\r\n");
+             return true;
+         }                
+     }
+@@ -145,7 +145,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     if( strstr(req_info->request_method,"GET") != NULL && sResourceInfo=="" ){
+         Debug::out(LOG_DEBUG, "/config GET");
+         //const char *qs = req_info->query_string;
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n");
+         mg_printf(conn, "Cache: no-cache\r\n");
+         std::ostringstream stringStream;
+         stringStream << "{\"config\":[";
+@@ -160,7 +160,7 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     if( strstr(req_info->request_method,"GET") != NULL && sResourceInfo=="status" ){
+         Debug::out(LOG_DEBUG, "/config/status GET");
+         //const char *qs = req_info->query_string;
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n");
+         mg_printf(conn, "Cache: no-cache\r\n");
+ 		//get status report
+ 		std::string sJson;
+@@ -189,13 +189,13 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+                 cJSON *pxCJSONObject=cJSON_GetObjectItem(root,"key");
+                 if( pxCJSONObject==NULL ){
+                     Debug::out(LOG_ERROR, "key code missing");                      
+-                    mg_printf(conn, "HTTP/1.1 400 Bad Request - key code missing\r\n\r\n");
++                    mg_printf(conn, "HTTP/1.1 400 Bad Request - key code missing\r\nConnection: close\r\n\r\n");
+                     return true;
+                 }
+                 int iCode = pxCJSONObject->valueint; 
+                 if( iCode==0 ){
+                     Debug::out(LOG_ERROR, "invalid key code: %d",iCode);
+-                    mg_printf(conn, "HTTP/1.1 400 Bad Request - invalid key code\r\n\r\n");
++                    mg_printf(conn, "HTTP/1.1 400 Bad Request - invalid key code\r\nConnection: close\r\n\r\n");
+                     return true;
+                 }
+                 
+@@ -206,24 +206,24 @@ bool ConfigResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+                 if( res ){
+                     int realLen = strnlen((const char *) in_bfr, iReadLen);         // get real string length - might have 2 more bytes (isUpdateScreen, updateComponents) after string terminator
+ 
+-                    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
++                    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n");
+                     mg_printf(conn, "Cache: no-cache\r\n");
+                     mg_printf(conn, "Content-Length: %d\r\n\r\n", realLen);         // Always set Content-Length
+                     mg_write(conn, in_bfr, realLen);
+                     return true;
+                 } else{
+                     Debug::out(LOG_ERROR, "could not send config command");
+-                    mg_printf(conn, "HTTP/1.1 500 Server Error - could not send config command\r\n\r\n");
++                    mg_printf(conn, "HTTP/1.1 500 Server Error - could not send config command\r\nConnection: close\r\n\r\n");
+                     return true;
+                 }                
+             } else{
+                 Debug::out(LOG_ERROR, "json malformed");
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - json malformed\r\n\r\n");
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - json malformed\r\nConnection: close\r\n\r\n");
+                 return true;
+             }
+         } 
+     
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\n\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+         return true;    
+     }
+ 
+diff --git a/ce_main_app/webserver/api/resource/downloadresource.cpp b/ce_main_app/webserver/api/resource/downloadresource.cpp
+index 13849163..ae70b28c 100644
+--- a/ce_main_app/webserver/api/resource/downloadresource.cpp
++++ b/ce_main_app/webserver/api/resource/downloadresource.cpp
+@@ -312,14 +312,14 @@ bool DownloadResource::dispatch(mg_connection *conn, mg_request_info *req_info,
+     Debug::out(LOG_DEBUG, "DownloadResource::dispatch -- %s", path);
+ 
+     if( strstr(req_info->request_method,"GET")==0 && strstr(req_info->request_method,"POST")==0 && strstr(req_info->request_method,"PUT")==0 ){
+-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\n",req_info->request_method);
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\nConnection: close\r\n",req_info->request_method);
+         return true;
+     }
+ 
+ 	// for GET methods
+     if( strstr(req_info->request_method,"GET") != NULL ) {
+         // standard header on response
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n");
+         mg_printf(conn, "Cache: no-cache\r\n");
+ 
+         if(strcmp(path, "imagelist") == 0) {		// url: download/imagelist -- return list images which we can search trhough
+diff --git a/ce_main_app/webserver/api/resource/filesresource.cpp b/ce_main_app/webserver/api/resource/filesresource.cpp
+index 54db0e9e..703e100c 100644
+--- a/ce_main_app/webserver/api/resource/filesresource.cpp
++++ b/ce_main_app/webserver/api/resource/filesresource.cpp
+@@ -28,7 +28,7 @@ void FilesResource::sendJson(mg_connection *conn, cJSON *root, int code)
+     const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 403) ? "Forbidden" : (code == 404) ? "Not Found" :
+                        (code == 405) ? "Method Not Allowed" : (code == 409) ? "Conflict" : (code == 411) ? "Length Required" :
+                        (code == 413) ? "Payload Too Large" : (code == 415) ? "Unsupported Media Type" : "Error";
+-    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) s.length());
+     mg_write(conn, s.c_str(), s.length());
+ }
+@@ -321,7 +321,7 @@ void FilesResource::download(mg_connection *conn, const char *qs, bool zip)
+         if(!max.empty() && max.find_first_not_of("0123456789") == std::string::npos) args.push_back(max);
+         name = file.substr(file.find_last_of('/') + 1);
+     }
+-    std::string headers = std::string("HTTP/1.1 200 OK\r\nContent-Type: ") + (zip ? "application/zip" : "application/octet-stream") +
++    std::string headers = std::string("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: ") + (zip ? "application/zip" : "application/octet-stream") +
+                           "\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\n" + disposition(name) +
+                           "Transfer-Encoding: chunked\r\n\r\n";
+     std::string out;
+diff --git a/ce_main_app/webserver/api/resource/floppyresource.cpp b/ce_main_app/webserver/api/resource/floppyresource.cpp
+index 08c668f8..8ffa1f7e 100644
+--- a/ce_main_app/webserver/api/resource/floppyresource.cpp
++++ b/ce_main_app/webserver/api/resource/floppyresource.cpp
+@@ -83,24 +83,24 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         int iSlot=atoi(sResourceInfo.c_str());
+         if( sResourceInfo.empty() || iSlot<0 || iSlot>2 )
+         {
+-            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 2\r\nContent-Length: 0\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 2\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+             return true;
+         }
+         pthread_mutex_lock(&shared.mtxImages);
+         shared.imageSilo->remove(iSlot);
+         pthread_mutex_unlock(&shared.mtxImages);
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}");
+         return true;
+     }
+ 
+     if( strstr(req_info->request_method,"GET")==0 && strstr(req_info->request_method,"POST")==0 && strstr(req_info->request_method,"PUT")==0 ){
+-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\n",req_info->request_method);
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\nConnection: close\r\n",req_info->request_method);
+         return true;
+     }
+ 
+     //return slot info
+     if( strstr(req_info->request_method,"GET") != NULL ){
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n");
+         mg_printf(conn, "Cache: no-cache\r\n");
+         std::ostringstream stringStream;
+         stringStream << "{\"slots\":[";
+@@ -138,7 +138,7 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         int iSlot=atoi(sResourceInfo.c_str());        
+         if( iSlot<0 || iSlot>2 )
+         {
+-            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 2\r\n");
++            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 2\r\nConnection: close\r\n");
+             return true;
+         }
+ 
+@@ -146,7 +146,7 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         const char *len = mg_get_header(conn, "Content-Length");
+         if( !len || atoll(len) <= 0 || atoll(len) > FLOPPY_UPLOAD_MAX )
+         {
+-            mg_printf(conn, "HTTP/1.1 413 Upload too large (or no Content-Length)\r\nContent-Length: 0\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 413 Upload too large (or no Content-Length)\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+             return true;
+         }
+ 
+@@ -162,13 +162,13 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+ 
+         if( ctx.files!=1 )
+         {
+-            mg_printf(conn, "HTTP/1.1 400 No file data\r\nContent-Length: 0\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 400 No file data\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+             return true;
+         }
+ 
+         pxFloppyService->setImage(iSlot,ctx.path);
+ 
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+         mg_printf(conn, "<html><body>\n"); 
+         mg_printf(conn, "Slot %d\n",iSlot); 
+         mg_printf(conn, "File %d %s\n",ctx.files,ctx.path.c_str()); 
+@@ -183,26 +183,26 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         if(iSlot == 100) {      // special case -- slot 100 == INSERT CONFIG IMAGE
+             events.insertSpecialFloppyImageId = SPECIAL_FDD_IMAGE_CE_CONF;
+ 
+-            mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+             return true;
+         }
+ 
+         if(iSlot == 101) {      // special case -- slot 101 == INSERT FLOPPY TEST IMAGE
+             events.insertSpecialFloppyImageId = SPECIAL_FDD_IMAGE_FDD_TEST;
+ 
+-            mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+             return true;
+         }
+         
+         //slot 3=deactivated        
+         if( iSlot<0 || iSlot>3 )
+         {
+-            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 3\r\n");
++            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 3\r\nConnection: close\r\n");
+             return true;
+         }
+         
+         pxFloppyService->setActiveSlot(iSlot);
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+         return true;
+     }
+ 
+diff --git a/ce_main_app/webserver/api/resource/kbdresource.cpp b/ce_main_app/webserver/api/resource/kbdresource.cpp
+index 31817039..5a9d8e91 100644
+--- a/ce_main_app/webserver/api/resource/kbdresource.cpp
++++ b/ce_main_app/webserver/api/resource/kbdresource.cpp
+@@ -24,7 +24,7 @@ KbdResource::~KbdResource()
+ bool KbdResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo /*=""*/) 
+ {
+     if( strstr(req_info->request_method,"GET")==0 && strstr(req_info->request_method,"POST")==0 ){
+-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\n",req_info->request_method);
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\nConnection: close\r\n",req_info->request_method);
+         return true;
+     }
+ 
+@@ -50,25 +50,25 @@ bool KbdResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::
+             cJSON *pxCJSONObject=cJSON_GetObjectItem(root,"code");
+             if( pxCJSONObject==NULL ){
+                 Debug::out(LOG_ERROR, "key code missing");                      
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - key code missing\r\n\r\n");
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - key code missing\r\nConnection: close\r\n\r\n");
+                 return true;
+             }
+             int iCode = pxCJSONObject->valueint; 
+             if( iCode==0 ){
+                 Debug::out(LOG_ERROR, "invalid key code: %d",iCode);
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - invalid key code\r\n\r\n");
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - invalid key code\r\nConnection: close\r\n\r\n");
+                 return true;
+             }
+             pxCJSONObject=cJSON_GetObjectItem(root,"state");
+             if( pxCJSONObject==NULL ){
+                 Debug::out(LOG_ERROR, "key state missing");
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - key state missing\r\n\r\n");
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - key state missing\r\nConnection: close\r\n\r\n");
+                 return true;
+             }
+             char* pcState = pxCJSONObject->valuestring;
+             if( pcState==NULL ){
+                 Debug::out(LOG_ERROR, "key state missing: %s",jsonKey);
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - key state missing\r\n\r\n");
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - key state missing\r\nConnection: close\r\n\r\n");
+                 return true;
+             }
+             int iValue=-1;
+@@ -80,19 +80,19 @@ bool KbdResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::
+             }
+             if( iValue==-1 ){
+                 Debug::out(LOG_ERROR, "unknown key state : %s",pcState);
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - unknown key state '%s'\r\n\r\n",pcState);
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - unknown key state '%s'\r\nConnection: close\r\n\r\n",pcState);
+                 return true;
+             }
+             pxKbdService->sendPacket(iCode,iValue);
+         } else{
+             Debug::out(LOG_ERROR, "json malformed");
+-            mg_printf(conn, "HTTP/1.1 400 Bad Request - json malformed\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 400 Bad Request - json malformed\r\nConnection: close\r\n\r\n");
+             return true;
+         }
+     }
+ 
+     Debug::out(LOG_DEBUG, "KbdResource::dispatch");
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n");
+     mg_printf(conn, "Cache: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %d\r\n\r\n",0);        // Always set Content-Length 
+     return true;    
+diff --git a/ce_main_app/webserver/api/resource/libraryresource.cpp b/ce_main_app/webserver/api/resource/libraryresource.cpp
+index 678af0d6..9049183a 100644
+--- a/ce_main_app/webserver/api/resource/libraryresource.cpp
++++ b/ce_main_app/webserver/api/resource/libraryresource.cpp
+@@ -75,7 +75,7 @@ void LibraryResource::sendJson(mg_connection *conn, cJSON *root, int code)
+     const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 404) ? "Not Found" :
+                        (code == 405) ? "Method Not Allowed" : (code == 413) ? "Payload Too Large" :
+                        (code == 415) ? "Unsupported Media Type" : "Error";
+-    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) sJson.length());
+     mg_write(conn, sJson.c_str(), sJson.length());
+ }
+@@ -495,11 +495,11 @@ void LibraryResource::onGetList(mg_connection *conn, mg_request_info *req_info,
+     const char *inm = mg_get_header(conn, "If-None-Match");
+     if(inm && strcmp(inm, etag) == 0) {
+         fclose(f);
+-        mg_printf(conn, "HTTP/1.1 304 Not Modified\r\nETag: %s\r\nCache-Control: no-cache\r\nContent-Length: 0\r\n\r\n", etag);
++        mg_printf(conn, "HTTP/1.1 304 Not Modified\r\nConnection: close\r\nETag: %s\r\nCache-Control: no-cache\r\nContent-Length: 0\r\n\r\n", etag);
+         return;
+     }
+ 
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nX-Content-Type-Options: nosniff\r\nETag: %s\r\nCache-Control: no-cache\r\nContent-Length: %llu\r\n\r\n",
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: %s\r\nX-Content-Type-Options: nosniff\r\nETag: %s\r\nCache-Control: no-cache\r\nContent-Length: %llu\r\n\r\n",
+               format == "json" ? "application/json" : "text/csv; charset=iso-8859-1", etag, (unsigned long long) st.st_size);
+     char buf[16384];
+     size_t n;
+@@ -594,7 +594,7 @@ void LibraryResource::onGetMedia(mg_connection *conn, const std::string &sourceI
+         sendError(conn, 404, "picture not available");
+         return;
+     }
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nX-Content-Type-Options: nosniff\r\nCache-Control: max-age=86400\r\nContent-Length: %lu\r\n\r\n",
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: %s\r\nX-Content-Type-Options: nosniff\r\nCache-Control: max-age=86400\r\nContent-Length: %lu\r\n\r\n",
+               type, (unsigned long) data.length());
+     mg_write(conn, data.data(), data.length());
+ }
+diff --git a/ce_main_app/webserver/api/resource/mouseresource.cpp b/ce_main_app/webserver/api/resource/mouseresource.cpp
+index 93809b44..e9c9cb51 100644
+--- a/ce_main_app/webserver/api/resource/mouseresource.cpp
++++ b/ce_main_app/webserver/api/resource/mouseresource.cpp
+@@ -24,7 +24,7 @@ MouseResource::~MouseResource()
+ bool MouseResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo /*=""*/) 
+ {
+     if( strstr(req_info->request_method,"GET")==0 && strstr(req_info->request_method,"POST")==0 ){
+-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\n\r\n",req_info->request_method);
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\nConnection: close\r\n\r\n",req_info->request_method);
+         return true;
+     }
+ 
+@@ -48,7 +48,7 @@ bool MouseResource::dispatch(mg_connection *conn, mg_request_info *req_info, std
+             char* pcType=cJSON_GetObjectItem(root,"type")->valuestring;
+             if( pcType==NULL ){
+                 Debug::out(LOG_ERROR, "unknown mouse packet type : %s",pcType);
+-                mg_printf(conn, "HTTP/1.1 400 Bad Request - unknown mouse packet type '%s'\r\n\r\n",pcType);
++                mg_printf(conn, "HTTP/1.1 400 Bad Request - unknown mouse packet type '%s'\r\nConnection: close\r\n\r\n",pcType);
+                 return true;
+             }
+             if( strstr(pcType,"relative")!=NULL ){
+@@ -60,7 +60,7 @@ bool MouseResource::dispatch(mg_connection *conn, mg_request_info *req_info, std
+                 char* pcState=cJSON_GetObjectItem(root,"state")->valuestring;
+                 if( pcState==NULL ){
+                     Debug::out(LOG_ERROR, "mouse button state missing: %s",jsonMouseRel);
+-                    mg_printf(conn, "HTTP/1.1 400 Bad Request - mouse button state missing\r\n\r\n");
++                    mg_printf(conn, "HTTP/1.1 400 Bad Request - mouse button state missing\r\nConnection: close\r\n\r\n");
+                     return true;
+                 }
+                 int iState=-1;
+@@ -72,7 +72,7 @@ bool MouseResource::dispatch(mg_connection *conn, mg_request_info *req_info, std
+                 }
+                 if( iState==-1 ){
+                     Debug::out(LOG_ERROR, "unknown mouse button state : %s",pcState);
+-                    mg_printf(conn, "HTTP/1.1 400 Bad Request - unknown mouse button state '%s'\r\n\r\n",pcState);
++                    mg_printf(conn, "HTTP/1.1 400 Bad Request - unknown mouse button state '%s'\r\nConnection: close\r\n\r\n",pcState);
+                     return true;
+                 }
+                 if( strstr(pcType,"buttonleft")!=NULL ){
+@@ -83,12 +83,12 @@ bool MouseResource::dispatch(mg_connection *conn, mg_request_info *req_info, std
+             }
+         } else{
+             Debug::out(LOG_ERROR, "json malformed: %s",jsonMouseRel);
+-            mg_printf(conn, "HTTP/1.1 400 Bad Request - json malformed\r\n\r\n");
++            mg_printf(conn, "HTTP/1.1 400 Bad Request - json malformed\r\nConnection: close\r\n\r\n");
+             return true;
+         }
+     }
+     
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n");
+     mg_printf(conn, "Cache: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %d\r\n\r\n",0);        // Always set Content-Length 
+          
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 50663a2a..6596b414 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -1208,7 +1208,7 @@ void SettingsResource::sendJson(mg_connection *conn, cJSON *root, int code)
+     const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 404) ? "Not Found" :
+                        (code == 405) ? "Method Not Allowed" : (code == 413) ? "Payload Too Large" :
+                        (code == 415) ? "Unsupported Media Type" : "Error";
+-    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) sJson.length());
+     mg_write(conn, sJson.c_str(), sJson.length());
+ }
+@@ -1343,7 +1343,7 @@ void SettingsResource::inspectImage(mg_connection *conn, mg_request_info *req_in
+         if(!isFile) { sendError(conn, 404, "no such file"); return; }
+         std::string dn = name;
+         for(size_t i = 0; i < dn.length(); i++) if(dn[i] == '"' || dn[i] == '\\' || (unsigned char) dn[i] < 32) dn[i] = '_';
+-        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-cache\r\n"
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nCache-Control: no-cache\r\n"
+                         "Content-Disposition: attachment; filename=\"%s\"\r\nTransfer-Encoding: chunked\r\n\r\n", dn.c_str());
+         args.clear();
+         args.push_back(HDINSPECT_TOOL); args.push_back("cat"); args.push_back(real); args.push_back(part); args.push_back(w);
+@@ -1510,7 +1510,7 @@ void SettingsResource::downloadImage(mg_connection *conn, mg_request_info *req_i
+     }
+     std::string name = real.substr(real.find_last_of('/') + 1);
+     for(size_t i=0; i<name.length(); i++) if(name[i] == '"' || name[i] == '\\' || (unsigned char) name[i] < 32) name[i] = '_';
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-cache\r\n"
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nCache-Control: no-cache\r\n"
+                     "Content-Disposition: attachment; filename=\"%s\"\r\nContent-Length: %lld\r\n\r\n",
+               name.c_str(), (long long) st.st_size);
+     Debug::out(LOG_INFO, "SettingsResource: sending HDD image %s (%lld bytes)", real.c_str(), (long long) st.st_size);
+diff --git a/ce_main_app/webserver/api/resource/statusresource.cpp b/ce_main_app/webserver/api/resource/statusresource.cpp
+index a24f1ad2..177412a0 100644
+--- a/ce_main_app/webserver/api/resource/statusresource.cpp
++++ b/ce_main_app/webserver/api/resource/statusresource.cpp
+@@ -300,7 +300,7 @@ static void buildStatus(cJSON *root)
+ bool StatusResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo /*=""*/ )
+ {
+     if(strcmp(req_info->request_method, "GET") != 0) {
+-        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
++        mg_printf(conn, "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+         return true;
+     }
+ 
+@@ -312,7 +312,7 @@ bool StatusResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+     std::string sJson = json ? json : "{}";
+     free(json);
+ 
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) sJson.length());
+     mg_write(conn, sJson.c_str(), sJson.length());
+     return true;
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index d8a179f3..75b5ea39 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -132,7 +132,7 @@ void SystemResource::sendJson(mg_connection *conn, cJSON *root, int code)
+     const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 404) ? "Not Found" :
+                        (code == 405) ? "Method Not Allowed" : (code == 409) ? "Conflict" : (code == 413) ? "Payload Too Large" :
+                        (code == 415) ? "Unsupported Media Type" : (code == 502) ? "Bad Gateway" : "Error";
+-    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) s.length());
+     mg_write(conn, s.c_str(), s.length());
+ }
+@@ -647,7 +647,7 @@ void SystemResource::backupDownload(mg_connection *conn, mg_request_info *req_in
+     std::string cmd = std::string(BACKUP_TOOL " ") + args + " 2>/dev/null";
+     FILE *p = popen(cmd.c_str(), "r");
+     if(!p) { sendError(conn, 500, "Couldn't make the backup."); return; }
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nCache-Control: no-cache\r\n"
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: %s\r\nCache-Control: no-cache\r\n"
+                     "Content-Disposition: attachment; filename=\"%s\"\r\nTransfer-Encoding: chunked\r\n\r\n",
+               encrypt ? "application/octet-stream" : "application/gzip", name);
+     std::vector<char> bufv(65536);     // on the heap: per-thread (TLS) buffers made every thread need more stack than civetweb gives its workers
+diff --git a/ce_main_app/webserver/api/router/apiv1router.cpp b/ce_main_app/webserver/api/router/apiv1router.cpp
+index e90aa2e7..8a3f6a95 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.cpp
++++ b/ce_main_app/webserver/api/router/apiv1router.cpp
+@@ -143,10 +143,10 @@ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+         bool processed=pxDownload->dispatch(conn,req_info,sResourceInfo);
+         return processed;
+     }
+-    mg_printf(conn, "HTTP/1.1 404 Not Found\r\n");
++    mg_printf(conn, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n");
+     return true;
+ 
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+     mg_printf(conn, "<html><body>");
+     mg_printf(conn, "<h2>This is the Api handler</h2>");
+     mg_printf(conn, "Resource: GET ");
+diff --git a/ce_main_app/webserver/app/controller/configcontroller.cpp b/ce_main_app/webserver/app/controller/configcontroller.cpp
+index 5e10e937..fd26cbeb 100644
+--- a/ce_main_app/webserver/app/controller/configcontroller.cpp
++++ b/ce_main_app/webserver/app/controller/configcontroller.cpp
+@@ -13,7 +13,7 @@ ConfigController::~ConfigController()
+ 
+ bool ConfigController::showAction(mg_connection *conn, mg_request_info *req_info)
+ {
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+     mg_printf(conn, "<html><body>");
+     mg_printf(conn, "<h2>This is the config/show action</h2>");
+     mg_printf(conn, "<p>The request was:<br><pre>%s %s HTTP/%s</pre></p>",
+diff --git a/ce_main_app/webserver/app/controller/debugcontroller.cpp b/ce_main_app/webserver/app/controller/debugcontroller.cpp
+index 11743f73..6d2dde05 100644
+--- a/ce_main_app/webserver/app/controller/debugcontroller.cpp
++++ b/ce_main_app/webserver/app/controller/debugcontroller.cpp
+@@ -57,7 +57,7 @@ bool DebugController::indexAction(mg_connection *conn, mg_request_info *req_info
+ 	    sOutput=replaceAll(sOutput,sTemplatePlaceHolder,pxVarIter->second);
+     }
+ 
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n");
+     mg_printf(conn, "Cache: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n",(unsigned long)sOutput.length());        // Always set Content-Length
+     mg_write(conn, sOutput.c_str(), sOutput.length());
+@@ -121,7 +121,7 @@ bool DebugController::action_get_cedd(mg_connection *conn, mg_request_info *req_
+ 
+ bool DebugController::getFile(mg_connection *conn, std::string &sDownloadedFileName, std::string &sContentType, std::string &sCeFilePath, bool sendFileSize)
+ {
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\n");
+     
+     std::string sContent="Content-Type: " + sContentType + "\r\n";
+ 	mg_write(conn, sContent.c_str(), sContent.length());
+diff --git a/ce_main_app/webserver/app/controller/screencastcontroller.cpp b/ce_main_app/webserver/app/controller/screencastcontroller.cpp
+index 3ef2e585..2f973d35 100644
+--- a/ce_main_app/webserver/app/controller/screencastcontroller.cpp
++++ b/ce_main_app/webserver/app/controller/screencastcontroller.cpp
+@@ -26,7 +26,7 @@ ScreencastController::~ScreencastController()
+ 
+ bool ScreencastController::getscreenAction(mg_connection *conn, mg_request_info *req_info) 
+ {
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\n");
+ 	mg_printf(conn, "Content-Type: application/binary\r\n");
+     mg_printf(conn, "Cache: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %d\r\n",32000+32+1);        // Always set Content-Length 
+@@ -49,7 +49,7 @@ bool ScreencastController::getscreenAction(mg_connection *conn, mg_request_info
+ 
+ bool ScreencastController::getpaletteAction(mg_connection *conn, mg_request_info *req_info) 
+ {
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\n");
+ 	mg_printf(conn, "Content-Type: application/binary\r\n");
+     mg_printf(conn, "Cache: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %d\r\n",16*2);        // Always set Content-Length 
+diff --git a/ce_main_app/webserver/app/controller/statuscontroller.cpp b/ce_main_app/webserver/app/controller/statuscontroller.cpp
+index 0335202a..49c9f689 100644
+--- a/ce_main_app/webserver/app/controller/statuscontroller.cpp
++++ b/ce_main_app/webserver/app/controller/statuscontroller.cpp
+@@ -40,7 +40,7 @@ bool StatusController::indexAction(mg_connection *conn, mg_request_info *req_inf
+ 	    sOutput=replaceAll(sOutput,sTemplatePlaceHolder,pxVarIter->second);
+     }
+ 
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n");
+     mg_printf(conn, "Cache: no-cache\r\n");
+     mg_printf(conn, "Content-Length: %lu\r\n\r\n",(unsigned long)sOutput.length());        // Always set Content-Length
+     mg_write(conn, sOutput.c_str(), sOutput.length());
+diff --git a/ce_main_app/webserver/app/router/controllerrouter.cpp b/ce_main_app/webserver/app/router/controllerrouter.cpp
+index 784cac11..c065b0ea 100644
+--- a/ce_main_app/webserver/app/router/controllerrouter.cpp
++++ b/ce_main_app/webserver/app/router/controllerrouter.cpp
+@@ -147,7 +147,7 @@ bool ControllerRouter::handleGet(CivetServer *server, struct mg_connection *conn
+     }
+     return false;
+ 
+-    mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
++    mg_printf(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\n\r\n");
+     mg_printf(conn, "<html><body>");
+     mg_printf(conn, "<h2>This is the Api handler</h2>");
+     mg_printf(conn, "Resource: GET ");
+@@ -167,7 +167,7 @@ bool ControllerRouter::handlePost(CivetServer *server, struct mg_connection *con
+ void ControllerRouter::helperHttpHeader(struct mg_connection *conn, const char* pcStatus, int iLength)
+ {
+         // send HTTP header
+-        mg_printf(conn, "HTTP/1.1 %s\r\n",pcStatus);
++        mg_printf(conn, "HTTP/1.1 %s\r\nConnection: close\r\n",pcStatus);
+         mg_printf(conn, "Cache: no-cache\r\n");
+         mg_printf(conn, "Content-Type: application/json\r\n");
+         mg_printf(conn, "Content-Length: %d\r\n\r\n", iLength);  // Always set Content-Length
+diff --git a/ce_main_app/webserver/webauth.cpp b/ce_main_app/webserver/webauth.cpp
+index efd25dbd..116bfdc9 100644
+--- a/ce_main_app/webserver/webauth.cpp
++++ b/ce_main_app/webserver/webauth.cpp
+@@ -97,7 +97,7 @@ static std::string makeHash(const std::string &password)
+ 
+ static void sendJson(struct mg_connection *conn, int code, const char *status, const std::string &body, const char *extraHeaders = "")
+ {
+-    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n%sContent-Length: %lu\r\n\r\n",
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n%sContent-Length: %lu\r\n\r\n",
+               code, status, extraHeaders, (unsigned long) body.length());
+     mg_write(conn, body.c_str(), body.length());
+ }
+@@ -341,9 +341,9 @@ int WebAuth::beginRequest(struct mg_connection *conn)
+             char c = next[i];
+             if(!(isalnum((unsigned char) c) || c == '/' || c == '.' || c == '-' || c == '_')) { next = "/"; break; }
+         }
+-        mg_printf(conn, "HTTP/1.1 302 Found\r\nLocation: /login.html?next=%s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n", next.c_str());
++        mg_printf(conn, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: /login.html?next=%s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n", next.c_str());
+         return 1;
+     }
+-    mg_printf(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\nlogin required\n");
++    mg_printf(conn, "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\nlogin required\n");
+     return 1;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

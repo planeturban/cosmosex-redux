@@ -1,0 +1,36 @@
+From 0c3da1feae2424c5c52e1c2d5f024ffcfa242b5a Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:11:07 +0200
+Subject: [PATCH] flash_xilinx: use matching printf formats for size_t and long
+
+Two debug messages print sizeof() and a long with %d. On 64-bit both are
+64-bit values; use %zu and %ld, which are correct on 32-bit as well.
+---
+ flash_xilinx/micro.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/flash_xilinx/micro.c b/flash_xilinx/micro.c
+index e7c72d13..a61e4281 100644
+--- a/flash_xilinx/micro.c
++++ b/flash_xilinx/micro.c
+@@ -432,7 +432,7 @@ void xsvfPrintLenVal( lenVal *plv )
+ *****************************************************************************/
+ int xsvfInfoInit( SXsvfInfo* pXsvfInfo )
+ {
+-    XSVFDBG_PRINTF1( 4, "    sizeof( SXsvfInfo ) = %d bytes\n",
++    XSVFDBG_PRINTF1( 4, "    sizeof( SXsvfInfo ) = %zu bytes\n",
+                      sizeof( SXsvfInfo ) );
+ 
+     pXsvfInfo->ucComplete       = 0;
+@@ -1159,7 +1159,7 @@ int xsvfDoXSIR2( SXsvfInfo* pXsvfInfo )
+     readVal( &(pXsvfInfo->lvTdi), 2 );
+     lShiftIrBits    = value( &(pXsvfInfo->lvTdi) );
+     sShiftIrBytes   = xsvfGetAsNumBytes( lShiftIrBits );
+-    XSVFDBG_PRINTF1( 3, "   XSIR2 length = %d\n", lShiftIrBits);
++    XSVFDBG_PRINTF1( 3, "   XSIR2 length = %ld\n", lShiftIrBits);
+ 
+     if ( sShiftIrBytes > MAX_LEN )
+     {
+-- 
+2.54.0 (Apple Git-157)
+

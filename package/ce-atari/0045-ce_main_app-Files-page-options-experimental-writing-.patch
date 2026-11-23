@@ -1,0 +1,97 @@
+From d2e54549e5c59641f08d4f40ed32691fb0c00072 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:11:09 +0100
+Subject: [PATCH] ce_main_app: Files page options (experimental writing to big
+ GEMDOS partitions), read-only reasons
+
+GET/POST /api/v1/files/options {gemdosWrite}: writing to GEMDOS partitions
+with logical sectors over 4 KB and to byte-swapped images, through the
+image's ce-gemdosfs translator, is an experimental setting (off: they're
+read-only). The list says why an image partition is read-only (readOnly:
+attached, experimental, rootfill, file).
+---
+ .../webserver/api/resource/filesresource.cpp  | 31 +++++++++++++++++++
+ .../webserver/api/resource/filesresource.h    |  4 +++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/filesresource.cpp b/ce_main_app/webserver/api/resource/filesresource.cpp
+index 760899f3..54db0e9e 100644
+--- a/ce_main_app/webserver/api/resource/filesresource.cpp
++++ b/ce_main_app/webserver/api/resource/filesresource.cpp
+@@ -274,6 +274,7 @@ void FilesResource::list(mg_connection *conn, const char *qs)
+         else if(l.compare(0, 7, "freeKB=") == 0) cJSON_AddNumberToObject(root, "freeKB", atof(l.substr(7).c_str()));
+         else if(l.compare(0, 8, "totalKB=") == 0) cJSON_AddNumberToObject(root, "totalKB", atof(l.substr(8).c_str()));
+         else if(l == "more=yes") cJSON_AddBoolToObject(root, "more", true);
++        else if(l.compare(0, 9, "readonly=") == 0) cJSON_AddStringToObject(root, "readOnly", l.substr(9).c_str());
+     }
+     cJSON_AddItemToObject(root, "entries", entries);
+     sendJson(conn, root);
+@@ -508,6 +509,35 @@ void FilesResource::job(mg_connection *conn, const std::string &what)
+     sendJson(conn, root);
+ }
+ 
++// GET /api/v1/files/options, POST {gemdosWrite: bool} (Config, Experimental)
++void FilesResource::options(mg_connection *conn, bool set)
++{
++    std::vector<std::string> args;
++    args.push_back(FILES_TOOL);
++    if(set) {
++        const char *ctype = mg_get_header(conn, "Content-Type");
++        if(!ctype || strncasecmp(ctype, "application/json", 16) != 0) { sendError(conn, 415, "Content-Type must be application/json"); return; }
++        std::string body;
++        char b[512];
++        int n;
++        while((n = mg_read(conn, b, sizeof(b))) > 0) if(body.length() < 4096) body.append(b, n);
++        cJSON *in = cJSON_Parse(body.c_str());
++        cJSON *g = in ? cJSON_GetObjectItem(in, "gemdosWrite") : NULL;
++        if(!g || (g->type != cJSON_True && g->type != cJSON_False)) { if(in) cJSON_Delete(in); sendError(conn, 400, "gemdosWrite: true or false"); return; }
++        args.push_back("option-set"); args.push_back("gemdosWrite"); args.push_back(g->type == cJSON_True ? "yes" : "no");
++        cJSON_Delete(in);
++    } else {
++        args.push_back("options");
++    }
++    std::string out;
++    int rc = runTool(args, out, NULL, 0, NULL, "", NULL);
++    if(rc != 0) { sendToolError(conn, rc, out); return; }
++    if(set) Debug::out(LOG_INFO, "FilesResource: gemdosWrite %s", lineValue(out, "gemdosWrite").c_str());
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddBoolToObject(root, "gemdosWrite", lineValue(out, "gemdosWrite") == "yes");
++    sendJson(conn, root);
++}
++
+ bool FilesResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
+ {
+     std::string what = sResourceInfo;
+@@ -523,6 +553,7 @@ bool FilesResource::dispatch(mg_connection *conn, mg_request_info *req_info, std
+     else if(post && what == "write") write(conn, qs);
+     else if(post && (what == "mkdir" || what == "delete" || what == "rename")) change(conn, what);
+     else if((get && what == "job") || (post && (what == "copy" || what == "conflicts" || what == "job/cancel"))) job(conn, what);
++    else if((get || post) && what == "options") options(conn, post);
+     else if(what == "places" || what == "list" || what == "read" || what == "zip" || what == "write" || what == "mkdir" || what == "delete" || what == "rename"
+             || what == "copy" || what == "conflicts" || what == "job" || what == "job/cancel")
+         sendError(conn, 405, "method not allowed");
+diff --git a/ce_main_app/webserver/api/resource/filesresource.h b/ce_main_app/webserver/api/resource/filesresource.h
+index 6de29f24..91cd4546 100644
+--- a/ce_main_app/webserver/api/resource/filesresource.h
++++ b/ce_main_app/webserver/api/resource/filesresource.h
+@@ -35,6 +35,9 @@
+ //                                                  renamed: [{from, to}]}
+ //   POST /api/v1/files/job/cancel
+ //   GET  /api/v1/files/read?...&max=<bytes>       only the start of the file (the viewer)
++//   GET  /api/v1/files/options, POST {gemdosWrite: bool}   writing through ce-gemdosfs (big GEMDOS
++//                                                 partitions, byte-swapped images): experimental, off
++//   (list: "readOnly": attached | experimental | rootfill | file, when an image partition is read-only)
+ //
+ // Errors: 400, 404, 409 (a name already there: {"error", "exists"}), 403
+ // (read-only, or an image the ST has attached). The POSTs other than write
+@@ -60,6 +63,7 @@ private:
+     void write(mg_connection *conn, const char *qs);
+     void change(mg_connection *conn, const std::string &what);
+     void job(mg_connection *conn, const std::string &what);
++    void options(mg_connection *conn, bool set);
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

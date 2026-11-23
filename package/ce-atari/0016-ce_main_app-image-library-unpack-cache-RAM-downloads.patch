@@ -1,0 +1,1258 @@
+From 971c3afee3415528e3d2728381bcb0f6da21a9d4 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:44:49 +0100
+Subject: [PATCH] ce_main_app: image library: unpack cache, RAM downloads,
+ IMAGE_STORAGE
+
+Floppy library stage 6.2, second part (cosmosex-floppy-library.md,
+items 4 and 5):
+
+- Zipped images are unpacked on insert into a RAM disk cache
+  (UNPACK_CACHE_DIR, /run/ce-floppy, a 16 MB tmpfs on the Buildroot
+  image): one folder per zip (path, size and time), reused when the same
+  zip is inserted again; the unpacked size is read from the zip's
+  central directory first and the least recently inserted folders are
+  evicted to make room, never one an inserted image comes from; a full
+  RAM disk or a bad zip fails the insert with a reason, half unpacks are
+  removed (also at start). Fixes the /tmp/zipedfloppy bug: that folder
+  was emptied on every zip insert, so the saves of a zipped disk were
+  lost when another zip was inserted. unzip runs without a shell (file
+  names with quotes broke the old command).
+- Floppy image downloads go to RAM (/tmp/ce-download) and are unzipped
+  there, then copied to the storage as <name>.tmp, synced and renamed
+  (no more 'mv' through the shell).
+- IMAGE_STORAGE: auto (first USB drive, else the shared drive, as
+  before, else /pi/img_download, else RAM), shared (the shared drive even
+  with a USB stick), or share:/usb:/local: folders. When the place isn't
+  available, downloads go to RAM (/tmp/floppy_images) instead of
+  failing. GET/PUT /api/v1/settings/floppy "imageStorage"; the library
+  search answer says where downloads go ("downloads").
+- local:<path>: a folder on the CosmosEx's own storage (/pi), for
+  IMAGELIB_SOURCES and IMAGE_STORAGE.
+- A share: / usb: / local: source that goes away keeps its images in
+  the list, flagged unavailable ("available": false in search results,
+  shown greyed out), after all usable images, so the same image from
+  another source wins; they aren't offered on the Atari or downloaded.
+---
+ ce_main_app/downloader.cpp                    |  62 +++-
+ ce_main_app/downloader.h                      |   4 +
+ ce_main_app/floppy/floppyencoder.cpp          |  10 +-
+ ce_main_app/floppy/floppyimagefactory.cpp     |  12 +-
+ ce_main_app/floppy/floppyimagefactory.h       |   7 +-
+ ce_main_app/floppy/imagelibsources.cpp        |   7 +
+ ce_main_app/floppy/imagelibsources.h          |   6 +-
+ ce_main_app/floppy/imagelist.cpp              |  32 +-
+ ce_main_app/floppy/imagelist.h                |   2 +
+ ce_main_app/floppy/imagestorage.cpp           | 139 +++++---
+ ce_main_app/floppy/imagestorage.h             |  25 ++
+ ce_main_app/floppy/unpackcache.cpp            | 317 ++++++++++++++++++
+ ce_main_app/floppy/unpackcache.h              |  47 +++
+ ce_main_app/floppy/ziputil.cpp                |  86 +++++
+ ce_main_app/floppy/ziputil.h                  |  38 +++
+ .../api/resource/libraryresource.cpp          |  14 +-
+ .../api/resource/settingsresource.cpp         |  22 ++
+ 17 files changed, 780 insertions(+), 50 deletions(-)
+ create mode 100644 ce_main_app/floppy/unpackcache.cpp
+ create mode 100644 ce_main_app/floppy/unpackcache.h
+ create mode 100644 ce_main_app/floppy/ziputil.cpp
+ create mode 100644 ce_main_app/floppy/ziputil.h
+
+diff --git a/ce_main_app/downloader.cpp b/ce_main_app/downloader.cpp
+index 579711d9..0cd3af4f 100644
+--- a/ce_main_app/downloader.cpp
++++ b/ce_main_app/downloader.cpp
+@@ -20,6 +20,7 @@
+ #include "global.h"
+ #include "debug.h"
+ #include "downloader.h"
++#include "floppy/unpackcache.h"
+ #include "utils.h"
+ #include "version.h"
+ 
+@@ -246,6 +247,52 @@ bool Downloader::verifyChecksum(const char *filename, WORD checksum)
+     return checksumIsGood;                // return if the calculated cs is equal to the provided cs
+ }
+ 
++// A downloaded floppy image (in RAM, tmpFile): if it's a zip, unpack it and
++// keep its first image (named like the zip, with the image's extension, as
++// before). Copy it to its place in the storage (finalFile's folder) as
++// <name>.tmp, sync, rename. The RAM copies are removed in any case.
++bool Downloader::finishFloppyDownload(const std::string &tmpFile, const std::string &finalFile)
++{
++    std::string src = tmpFile;
++    std::string dst = finalFile;
++    std::string unzDir = std::string(DOWNLOAD_RAM_DIR "/unpack");
++    bool ok = true;
++
++    if(Utils::isZIPfile(finalFile.c_str())) {
++        UnpackCache::removeTree(unzDir);
++        mkdir(unzDir.c_str(), 0755);
++        std::string image;
++        if(!UnpackCache::runUnzip(tmpFile, unzDir) || !UnpackCache::findFirstImage(unzDir, image)) {
++            Debug::out(LOG_ERROR, "Downloader - no .st / .msa image in the downloaded zip %s", finalFile.c_str());
++            ok = false;
++        } else {
++            const char *ext = Utils::getExtension(image.c_str());
++            std::string extLower = ext ? ext : "st";
++            std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::tolower);
++            std::string zipName = finalFile;
++            Utils::createPathWithOtherExtension(zipName, extLower.c_str(), dst);
++            src = image;
++        }
++    }
++
++    if(ok) {
++        if(dst.compare(0, strlen(DOWNLOAD_RAM_DIR), DOWNLOAD_RAM_DIR) == 0 || dst.compare(0, 5, "/tmp/") == 0) {
++            ok = rename(src.c_str(), dst.c_str()) == 0;             // storage is in RAM too (no USB stick or share)
++        } else {
++            ok = UnpackCache::copyFileSafely(src, dst);
++        }
++        if(!ok) {
++            Debug::out(LOG_ERROR, "Downloader - failed to store %s: %s", dst.c_str(), strerror(errno));
++        } else {
++            Debug::out(LOG_DEBUG, "Downloader - stored %s", dst.c_str());
++        }
++    }
++
++    unlink(tmpFile.c_str());
++    UnpackCache::removeTree(unzDir);
++    return ok;
++}
++
+ // ZIPed floppy file image needs some extracting, searching and renaming of content
+ void Downloader::handleZIPedFloppyImage(std::string &zipFileName)
+ {
+@@ -536,6 +583,16 @@ void Downloader::run(void)
+         Utils::mergeHostPaths(finalFile, fileName);         // create final local filename with path
+ 
+         tmpFile = finalFile + "_dwnldng";                   // create temp local filename with path
++
++        // Floppy images are downloaded (and unzipped) in RAM first, then copied
++        // to the storage (USB stick, share) as <name>.tmp, synced and renamed:
++        // a stick pulled out or a share gone mid-download leaves no half file
++        bool floppyViaRam = (downloadCurrent.downloadType == DWNTYPE_FLOPPYIMG);
++        if(floppyViaRam) {
++            mkdir(DOWNLOAD_RAM_DIR, 0755);
++            tmpFile = std::string(DOWNLOAD_RAM_DIR "/") + fileName + "_dwnldng";
++        }
++
+         outfile = fopen(tmpFile.c_str(), "wb");    // try to open the tmp file
+ 
+         if(!outfile) {
+@@ -567,7 +624,10 @@ void Downloader::run(void)
+ 
+             bool b = Downloader::verifyChecksum(tmpFile.c_str(), downloadCurrent.checksum);
+ 
+-            if(b) {             // checksum is OK?
++            if(b && floppyViaRam) {     // checksum is OK, floppy image: unzip in RAM, then put it in place
++                bool ok = finishFloppyDownload(tmpFile, finalFile);
++                updateStatusByte(downloadCurrent, ok ? DWNSTATUS_DOWNLOAD_OK : DWNSTATUS_DOWNLOAD_FAIL);
++            } else if(b) {             // checksum is OK?
+                 bool isZIPfile = Utils::isZIPfile(finalFile.c_str());
+ 
+                 Debug::out(LOG_ERROR, "Downloader - finalFile: %s, isZIPfile: %d", finalFile.c_str(), isZIPfile);
+diff --git a/ce_main_app/downloader.h b/ce_main_app/downloader.h
+index 52d10ee0..8d944c88 100644
+--- a/ce_main_app/downloader.h
++++ b/ce_main_app/downloader.h
+@@ -9,6 +9,9 @@
+ #include <sstream>
+ #include <iostream>
+ 
++// floppy image downloads are made (and unzipped) here, in RAM, then copied to the storage
++#define DOWNLOAD_RAM_DIR        "/tmp/ce-download"
++
+ #define DWNTYPE_ANY             0xff
+ #define DWNTYPE_UNKNOWN         0x00
+ #define DWNTYPE_UPDATE_LIST     0x01
+@@ -71,6 +74,7 @@ private:
+     static int my_progress_func(void *clientp, double downTotal, double downNow, double upTotal, double upNow);
+ 
+     static void handleZIPedFloppyImage(std::string &fileName);
++    static bool finishFloppyDownload(const std::string &tmpFile, const std::string &finalFile);
+ 
+     static pthread_mutex_t                  downloadQueueMutex;
+     static pthread_cond_t                   downloadQueueNotEmpty;
+diff --git a/ce_main_app/floppy/floppyencoder.cpp b/ce_main_app/floppy/floppyencoder.cpp
+index fdb3e1b1..0a717532 100644
+--- a/ce_main_app/floppy/floppyencoder.cpp
++++ b/ce_main_app/floppy/floppyencoder.cpp
+@@ -175,8 +175,16 @@ static void floppyEncoder_handleLoadFiles(void)
+             delete slot->image;                             // floppy image destructor will check if something needs to be written and does write if some changes need to be written
+         }
+ 
++        // the images open in the other slots (their unpacked zips are kept)
++        std::vector<std::string> inUse;
++        for(int j=0; j<SLOT_COUNT; j++) {
++            if(j != i && slots[j].image && slots[j].image->getFileName()) {
++                inUse.push_back(slots[j].image->getFileName());
++            }
++        }
++
+         // try to load image from disk
+-        slot->image = FloppyImageFactory::getImage(imageFileName.c_str());
++        slot->image = FloppyImageFactory::getImage(imageFileName.c_str(), inUse);
+ 
+         if(!slot->image || !slot->image->isLoaded()) { // not supported image format or failed to open file?
+             Debug::out(LOG_DEBUG, "floppyEncoder_handleLoadFiles - failed to load image %s", imageFileName.c_str());
+diff --git a/ce_main_app/floppy/floppyimagefactory.cpp b/ce_main_app/floppy/floppyimagefactory.cpp
+index 9e715449..e7bb7dcc 100644
+--- a/ce_main_app/floppy/floppyimagefactory.cpp
++++ b/ce_main_app/floppy/floppyimagefactory.cpp
+@@ -9,8 +9,9 @@
+ #include "floppyimagemsa.h"
+ #include "../debug.h"
+ #include "../utils.h"
++#include "unpackcache.h"
+ 
+-FloppyImage *FloppyImageFactory::getImage(const char *fileName)
++FloppyImage *FloppyImageFactory::getImage(const char *fileName, const std::vector<std::string> &inUse)
+ {
+     FloppyImage *img = NULL;
+     const char *ext = Utils::getExtension(fileName);    // find extensions
+@@ -26,11 +27,12 @@ FloppyImage *FloppyImageFactory::getImage(const char *fileName)
+     if(strcasecmp(ext, "zip") == 0) {       // if it's a ZIP file
+         Debug::out(LOG_DEBUG, "FloppyImageFactory -- file %s is a ZIP file, will search for supported image inside", fileName);
+ 
+-                                            // decompress the ZIP file and search for floppy image inside, return path to first valid image
+-        bool foundValidImage = Utils::unZIPfloppyImageAndReturnFirstImage(fileName, fileNameInZip);
++        // unpack into the RAM disk cache (or reuse an earlier unpack) and get the first image
++        std::string error;
++        bool foundValidImage = UnpackCache::getImage(fileName, inUse, fileNameInZip, error);
+ 
+-        if(!foundValidImage) {              // image not found in ZIP file, fail
+-            Debug::out(LOG_DEBUG, "FloppyImageFactory -- ZIP file %s doesn't contain supported image inside", fileName);
++        if(!foundValidImage) {              // image not found in ZIP file, or no room: fail
++            Debug::out(LOG_ERROR, "FloppyImageFactory -- ZIP file %s: %s", fileName, error.c_str());
+             return NULL;
+         }
+ 
+diff --git a/ce_main_app/floppy/floppyimagefactory.h b/ce_main_app/floppy/floppyimagefactory.h
+index 7b996798..42c3b494 100644
+--- a/ce_main_app/floppy/floppyimagefactory.h
++++ b/ce_main_app/floppy/floppyimagefactory.h
+@@ -2,12 +2,17 @@
+ #ifndef FLOPPYIMAGEFACTORY_H
+ #define FLOPPYIMAGEFACTORY_H
+ 
++#include <string>
++#include <vector>
++
+ #include "floppyimage.h"
+ 
+ class FloppyImageFactory
+ {
+ public:
+-    static FloppyImage *getImage(const char *fileName);
++    // inUse: image files open in the other slots (a zip is unpacked into a
++    // RAM disk cache, see unpackcache.h, which keeps their folders)
++    static FloppyImage *getImage(const char *fileName, const std::vector<std::string> &inUse = std::vector<std::string>());
+ 
+ private:
+     static void toLowerCase(char *orig, char *lower);
+diff --git a/ce_main_app/floppy/imagelibsources.cpp b/ce_main_app/floppy/imagelibsources.cpp
+index 0a9ca63e..50e39d2e 100644
+--- a/ce_main_app/floppy/imagelibsources.cpp
++++ b/ce_main_app/floppy/imagelibsources.cpp
+@@ -112,6 +112,9 @@ bool ImageLibSources::parseLocation(const std::string &spec, int &type, std::str
+             if(c < 0x21 || c > 0x7e || c == '/' || c == ',') return false;
+         }
+         rest = spec.substr(colon + 1);
++    } else if(startsWith(spec, "local:")) {
++        type = IMAGELIB_TYPE_LOCAL;
++        rest = spec.substr(6);
+     } else {
+         return false;
+     }
+@@ -151,6 +154,9 @@ bool ImageLibSources::parseEntry(const std::string &entry, ImageLibSource &src)
+     if(type == IMAGELIB_TYPE_SHARE) {
+         src.id    = "share-" + shortHash(src.path);
+         src.label = "SHARE " + src.path;
++    } else if(type == IMAGELIB_TYPE_LOCAL) {
++        src.id    = "local-" + shortHash(src.path);
++        src.label = "LOCAL /pi" + (src.path == "/" ? std::string("") : src.path);
+     } else {
+         src.id    = sanitizeId("usb-" + src.serial);
+         std::string shortSerial = src.serial.length() > 8 ? src.serial.substr(0, 8) + "..." : src.serial;
+@@ -215,6 +221,7 @@ std::string ImageLibSources::join(const std::vector<ImageLibSource> &sources)
+         std::string entry;
+         if(s.type == IMAGELIB_TYPE_WEB)        entry = s.url;
+         else if(s.type == IMAGELIB_TYPE_SHARE) entry = "share:" + encodeComma(s.path);
++        else if(s.type == IMAGELIB_TYPE_LOCAL) entry = "local:" + encodeComma(s.path);
+         else                                   entry = "usb:" + s.serial + ":" + encodeComma(s.path);
+ 
+         if(!out.empty()) out += ", ";
+diff --git a/ce_main_app/floppy/imagelibsources.h b/ce_main_app/floppy/imagelibsources.h
+index 71960df4..3fb430ac 100644
+--- a/ce_main_app/floppy/imagelibsources.h
++++ b/ce_main_app/floppy/imagelibsources.h
+@@ -7,6 +7,7 @@
+ //   http://... / https://...   a remote imagelist.csv (the original list or a mirror)
+ //   share:<path>               a folder on the shared drive
+ //   usb:<serial>:<path>        a folder on the USB stick with this USB serial number
++//   local:<path>               a folder on the CosmosEx's own storage (/pi)
+ // An entry starting with '!' is disabled: kept in place, but not used.
+ // A comma inside a share:/usb: path is written as %2C (decoded); URLs are
+ // passed through unchanged. Empty entries are ignored, unknown ones skipped,
+@@ -25,6 +26,7 @@
+ #define IMAGELIB_TYPE_WEB           0
+ #define IMAGELIB_TYPE_SHARE         1
+ #define IMAGELIB_TYPE_USB           2
++#define IMAGELIB_TYPE_LOCAL         3       // local:<path>, a folder on the CosmosEx's own storage (/pi)
+ 
+ typedef struct {
+     int         type;       // IMAGELIB_TYPE_*
+@@ -32,7 +34,7 @@ typedef struct {
+     std::string spec;       // the entry as configured, without '!' (e.g. "usb:4C53:/atari")
+     std::string url;        // web: the list URL
+     std::string serial;     // usb: the USB serial number
+-    std::string path;       // share/usb: folder, %2C decoded, starts with '/'
++    std::string path;       // share/usb/local: folder, %2C decoded, starts with '/'
+     std::string id;         // stable short id, [A-Za-z0-9._-] (file names, save paths)
+     std::string label;      // for the UI, e.g. "WEB joo.kie.sk", "SHARE /atari", "USB 4C53..."
+ } ImageLibSource;
+@@ -50,7 +52,7 @@ public:
+     // The setting value for these sources (inverse of parse()).
+     static std::string join(const std::vector<ImageLibSource> &sources);
+ 
+-    // "share:/a/b" / "usb:SERIAL:/a/b": type, serial and path (decoded).
++    // "share:/a/b" / "usb:SERIAL:/a/b" / "local:/a/b": type, serial and path (decoded).
+     // Used for IMAGELIB_SOURCES, IMAGE_STORAGE and FLOPPY_SAVES.
+     static bool parseLocation(const std::string &spec, int &type, std::string &serial, std::string &path);
+ 
+diff --git a/ce_main_app/floppy/imagelist.cpp b/ce_main_app/floppy/imagelist.cpp
+index 599ace16..7d898611 100644
+--- a/ce_main_app/floppy/imagelist.cpp
++++ b/ce_main_app/floppy/imagelist.cpp
+@@ -269,6 +269,7 @@ bool ImageList::loadList(void)
+     bool anyWeb     = false;
+ 
+     localImages.clear();
++    std::vector<int> gone;                  // share: / usb: sources whose drive went away
+ 
+     for(int i=0; i<(int) sources.size(); i++) {
+         sources[i].entries = 0;
+@@ -276,7 +277,12 @@ bool ImageList::loadList(void)
+             continue;
+         }
+         if(sources[i].src.type != IMAGELIB_TYPE_WEB) {  // share: / usb: folder, if its drive is attached
+-            loadLocalSource(i, seen);
++            size_t before = vectorOfImages.size();
++            if(loadLocalSource(i, seen)) {
++                sources[i].lastItems.assign(vectorOfImages.begin() + before, vectorOfImages.end());
++            } else if(sources[i].resolvedPath.empty()) {
++                gone.push_back(i);
++            }
+             continue;
+         }
+         anyWeb = true;
+@@ -285,6 +291,19 @@ bool ImageList::loadList(void)
+         }
+     }
+ 
++    // A folder that was there before and went away (stick unplugged, share
++    // down): its images stay listed, greyed out, after everything that can be
++    // used, so the same image from another source wins
++    for(size_t g=0; g<gone.size(); g++) {
++        std::vector<ImageListItem> &last = sources[gone[g]].lastItems;
++        for(size_t k=0; k<last.size(); k++) {
++            ImageListItem li = last[k];
++            li.available = false;
++            addItem(li, seen);
++        }
++        sources[gone[g]].entries = 0;
++    }
++
+     if(anyWeb && !anyLoaded) {
+         return false;
+     }
+@@ -339,6 +358,7 @@ bool ImageList::loadOneList(int sourceIndex, std::map<std::string, bool> &seen,
+     }
+ 
+     ImageListItem li;                                   // store url and checksum in structure
++    li.available = true;
+     int n=0;
+ 
+     while(!feof(f)) {
+@@ -450,6 +470,9 @@ bool ImageList::addItem(ImageListItem &li, std::map<std::string, bool> &seen)
+     seen[key] = true;
+ 
+     vectorOfImages.push_back(li);
++    if(!li.available) {                     // greyed out: not used, not counted
++        return true;
++    }
+     if(!li.localPath.empty()) {
+         localImages[li.imageName] = li.localPath;
+     }
+@@ -530,6 +553,7 @@ bool ImageList::loadLocalSource(int sourceIndex, std::map<std::string, bool> &se
+ 
+     for(size_t i=0; i<found.size(); i++) {
+         ImageListItem li;
++        li.available = true;
+         std::string path, file;
+         Utils::splitFilenameFromPath(found[i], path, file);
+         li.imageName    = file;
+@@ -629,6 +653,9 @@ void ImageList::search(const char *part)
+ 
+     // go through the list of images, copy the right ones
+     for(int i=0; i<cnt; i++) {
++        if(!vectorOfImages[i].available) {          // greyed out in the web UI; not offered on the Atari
++            continue;
++        }
+         std::string &games = vectorOfImages[i].games;
+         std::string game;
+         SearchResult sr;
+@@ -676,6 +703,9 @@ bool ImageList::getImageUrl(const char *imageFileName, std::string &url)
+     // go through the list of images, look for filename
+     for(int i=0; i<cnt; i++) {
+         if(filename.compare(vectorOfImages[i].imageName) == 0) {    // if input filename and image name in list match, success
++            if(!vectorOfImages[i].available || vectorOfImages[i].url.empty()) {    // its folder went away / a local image: nothing to download
++                return false;
++            }
+             url = vectorOfImages[i].url;                            // copy url and quit
+             return true;
+         }
+diff --git a/ce_main_app/floppy/imagelist.h b/ce_main_app/floppy/imagelist.h
+index 4fe77f02..f68286b2 100644
+--- a/ce_main_app/floppy/imagelist.h
++++ b/ce_main_app/floppy/imagelist.h
+@@ -37,6 +37,7 @@ typedef struct {
+     std::string gamesDisplay;   // original case, for showing
+     int         sourceIndex;    // index in the source list
+     std::string localPath;      // share: / usb: sources: the image on the drive (no download); "" for web
++    bool        available;      // false: from a share: / usb: folder that went away (listed greyed out, can't be inserted)
+     bool        marked;
+ } ImageListItem;
+ 
+@@ -55,6 +56,7 @@ typedef struct {
+     time_t      updated;        // cached list's modification time (0: none)
+     int         lastResult;     // DWNSTATUS_* of the last download this session, -1: none
+     DWORD       lastAttempt;    // Utils::getCurrentMs() of the last download request
++    std::vector<ImageListItem> lastItems;   // share/usb: its images at the last load while attached (shown unavailable when it goes away)
+ } ImageListSource;
+ 
+ class ImageList
+diff --git a/ce_main_app/floppy/imagestorage.cpp b/ce_main_app/floppy/imagestorage.cpp
+index 7bdfc1bd..d02640ac 100644
+--- a/ce_main_app/floppy/imagestorage.cpp
++++ b/ce_main_app/floppy/imagestorage.cpp
+@@ -11,8 +11,10 @@
+ #include <algorithm>
+ 
+ #include <unistd.h>
++#include <pthread.h>
+ 
+ #include "imagestorage.h"
++#include "../settings.h"
+ #include "../utils.h"
+ #include "../downloader.h"
+ #include "../debug.h"
+@@ -39,58 +41,113 @@ bool ImageStorage::doWeHaveStorage(void)                         // returns true
+     return res;
+ }
+ 
+-bool ImageStorage::getStoragePath(std::string &storagePath)             // returns where the images are now stored
++bool ImageStorage::localStorageAvailable(void)
+ {
+-    static DWORD lastStorageCheck = 0;
+-    static bool  lastGotStorage = false;
+-    static std::string lastStoragePath;
+-
+-    DWORD now = Utils::getCurrentMs();      // get current time
+-
+-    if((now - lastStorageCheck) < 3000) {   // if last check was done less then 3 seconds ago, just reuse last results
+-        storagePath = lastStoragePath;      // return last storage path
+-        return lastGotStorage;              // return last got storage
++    FILE *f = fopen("/proc/mounts", "r");
++    if(!f) return false;
++    char line[512];
++    bool found = false;
++    while(!found && fgets(line, sizeof(line), f)) {
++        char dev[256], mnt[256];
++        if(sscanf(line, "%255s %255s", dev, mnt) == 2 && strcmp(mnt, LOCAL_STORAGE_ROOT) == 0) found = true;
+     }
+-    lastStorageCheck = now;                 // last check was some time ago, so let's check it now
+-
+-    storagePath.clear();                    // clear new path
+-
+-    lastStoragePath.clear();                // clear last storage path and flag
+-    lastGotStorage = false;
+-
+-    TranslatedDisk * translated = TranslatedDisk::getInstance();
++    fclose(f);
++    return found;
++}
+ 
+-    if(!translated) {           // no translated disk instance? no storage
+-        return false;
++static bool usableDir(const std::string &path)
++{
++    if(!Utils::fileExists(path.c_str())) {
++        if(Utils::mkpath(path.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) == -1) {     // mod: 0x775
++            return false;
++        }
+     }
++    return access(path.c_str(), W_OK) == 0;
++}
+ 
+-    translated->mutexLock();
+-    bool gotStorage = translated->getPathToUsbDriveOrSharedDrive(storagePath);  // get path of first USB drive or to shared drive
+-    translated->mutexUnlock();
+-
+-    if(!gotStorage) {           // don't have storage? quit
+-        return false;
++void ImageStorage::getStorageInfo(StorageInfo &info)
++{
++    static DWORD lastCheck = 0;
++    static StorageInfo last;
++    static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;     // called from the web, core and floppy threads
++    pthread_mutex_lock(&mtx);
++
++    Settings s;
++    std::string setting;
++    s.getStringLong(IMAGE_STORAGE_KEY, setting, "auto");
++    if(setting.empty()) setting = "auto";
++
++    DWORD now = Utils::getCurrentMs();
++    if((now - lastCheck) < 3000 && last.setting == setting) {     // checked less than 3 s ago with this setting: reuse
++        info = last;
++        pthread_mutex_unlock(&mtx);
++        return;
+     }
++    lastCheck = now;
+ 
+-    std::string subdir = IMAGE_STORAGE_SUBDIR;
+-    Utils::mergeHostPaths(storagePath, subdir);     // to the storage root path add the subdir
++    info.setting  = setting;
++    info.path.clear();
++    info.kind.clear();
++    info.fallback = false;
+ 
+-    // try to access the dir
+-    int ires;
+-    bool exists = Utils::fileExists(storagePath.c_str());
++    std::string path;
++    TranslatedDisk *translated = TranslatedDisk::getInstance();
+ 
+-    if(!exists) {           // can't access? try to create it
+-        ires = Utils::mkpath(storagePath.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);        // mod: 0x775
++    if(setting == "auto") {
++        bool got = false;
++        if(translated) {
++            translated->mutexLock();
++            got = translated->getPathToUsbDriveOrSharedDrive(path);    // first USB drive, else the shared drive
++            translated->mutexUnlock();
++        }
++        if(got) {
++            info.kind = (path.compare(0, 11, "/mnt/shared") == 0) ? "share" : "usb";
++            std::string subdir = IMAGE_STORAGE_SUBDIR;
++            Utils::mergeHostPaths(path, subdir);
++        } else if(localStorageAvailable()) {
++            path = LOCAL_STORAGE_ROOT LOCAL_STORAGE_DOWNLOADS;
++            info.kind = "local";
++        }
++    } else if(setting == "shared") {
++        bool got = false;
++        if(translated) {
++            translated->mutexLock();
++            got = translated->getSharedDrivePath(path);
++            translated->mutexUnlock();
++        }
++        if(got) {
++            info.kind = "share";
++            std::string subdir = IMAGE_STORAGE_SUBDIR;
++            Utils::mergeHostPaths(path, subdir);
++        }
++    } else if(resolveLocation(setting, path)) {
++        int type;
++        std::string serial, p;
++        ImageLibSources::parseLocation(setting, type, serial, p);
++        info.kind = type == IMAGELIB_TYPE_SHARE ? "share" : type == IMAGELIB_TYPE_USB ? "usb" : "local";
++    }
+ 
+-        if(ires == -1) {    // failed to create dir? fail
+-            return false;
++    if(info.kind.empty() || !usableDir(path)) {
++        if(!info.kind.empty()) {
++            Debug::out(LOG_ERROR, "ImageStorage: can't use %s for downloads", path.c_str());
+         }
++        info.fallback = (setting != "auto") || !info.kind.empty();
++        info.kind = "ram";
++        path = IMAGE_STORAGE_RAM_DIR;
++        usableDir(path);
+     }
+ 
+-    lastStoragePath = storagePath;  // store last returned storage path and result for faster use next time
+-    lastGotStorage = true;
++    info.path = path;
++    last = info;
++    pthread_mutex_unlock(&mtx);
++    Debug::out(LOG_DEBUG, "ImageStorage: downloads go to %s (%s%s)", info.path.c_str(), info.kind.c_str(), info.fallback ? ", fallback" : "");
++}
+ 
+-    Debug::out(LOG_DEBUG, "ImageStorage::getStoragePath() -> %s", storagePath.c_str());
++bool ImageStorage::getStoragePath(std::string &storagePath)             // returns where the images are now stored
++{
++    StorageInfo info;
++    getStorageInfo(info);
++    storagePath = info.path;    // always somewhere: RAM when nothing else is available
+     return true;
+ }
+ 
+@@ -211,6 +268,12 @@ bool ImageStorage::resolveLocation(const std::string &spec, std::string &hostPat
+             Debug::out(LOG_DEBUG, "ImageStorage::resolveLocation() - %s: the shared drive isn't available", spec.c_str());
+             return false;
+         }
++    } else if(type == IMAGELIB_TYPE_LOCAL) {
++        if(!localStorageAvailable()) {
++            Debug::out(LOG_DEBUG, "ImageStorage::resolveLocation() - %s: %s isn't mounted", spec.c_str(), LOCAL_STORAGE_ROOT);
++            return false;
++        }
++        root = LOCAL_STORAGE_ROOT;
+     } else {
+         if(!findMountForUsbSerial(serial, root)) {
+             Debug::out(LOG_DEBUG, "ImageStorage::resolveLocation() - %s: no USB drive with serial %s attached", spec.c_str(), serial.c_str());
+diff --git a/ce_main_app/floppy/imagestorage.h b/ce_main_app/floppy/imagestorage.h
+index 61a08903..8b073815 100644
+--- a/ce_main_app/floppy/imagestorage.h
++++ b/ce_main_app/floppy/imagestorage.h
+@@ -8,6 +8,25 @@
+ 
+ #define IMAGE_STORAGE_SUBDIR  "floppy_images"
+ 
++// IMAGE_STORAGE: where downloaded floppy images go.
++//   auto (default)     first USB stick, else the shared drive (as before), else
++//                      the CosmosEx's own storage (/pi/img_download), else RAM
++//   shared             the shared drive (even with a USB stick attached)
++//   share:<path>, usb:<serial>:<path>, local:<path>   that folder
++// When the chosen place isn't available, downloads go to RAM
++// (IMAGE_STORAGE_RAM_DIR): usable until a reboot, saves to them are lost.
++#define IMAGE_STORAGE_KEY       "IMAGE_STORAGE"
++#define IMAGE_STORAGE_RAM_DIR   "/tmp/floppy_images"
++#define LOCAL_STORAGE_ROOT      "/pi"
++#define LOCAL_STORAGE_DOWNLOADS "/img_download"
++
++typedef struct {
++    std::string setting;        // IMAGE_STORAGE as set ("auto" if not set)
++    std::string path;           // where downloads go now
++    std::string kind;           // usb / share / local / ram
++    bool        fallback;       // the configured place isn't available, RAM is used
++} StorageInfo;
++
+ typedef struct {
+     char        letter;         // drive letter on the ST
+     std::string device;         // e.g. /dev/sda1
+@@ -34,6 +53,12 @@ public:
+     // False (and a log line) if that drive isn't attached right now.
+     static bool resolveLocation(const std::string &spec, std::string &hostPath);
+ 
++    // Where downloads go now and why (for the web UI)
++    static void getStorageInfo(StorageInfo &info);
++
++    // /pi (the CosmosEx's own storage) is mounted
++    static bool localStorageAvailable(void);
++
+ private:
+ 
+ };
+diff --git a/ce_main_app/floppy/unpackcache.cpp b/ce_main_app/floppy/unpackcache.cpp
+new file mode 100644
+index 00000000..96119401
+--- /dev/null
++++ b/ce_main_app/floppy/unpackcache.cpp
+@@ -0,0 +1,317 @@
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/statvfs.h>
++#include <sys/time.h>
++#include <sys/wait.h>
++#include <strings.h>
++#include <algorithm>
++
++#include "unpackcache.h"
++#include "ziputil.h"
++#include "imagelibsources.h"
++#include "../debug.h"
++
++std::string UnpackCache::lastErr;
++
++// tmpfs rounds every file up to a page; leave a little room for that
++#define UNPACK_MARGIN   (64 * 1024)
++
++static bool isDir(const std::string &p)
++{
++    struct stat st;
++    return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
++}
++
++static int64_t treeSize(const std::string &path)
++{
++    struct stat st;
++    if(lstat(path.c_str(), &st) != 0) return 0;
++    if(!S_ISDIR(st.st_mode)) return (int64_t) st.st_blocks * 512;
++
++    int64_t total = 0;
++    DIR *d = opendir(path.c_str());
++    if(!d) return 0;
++    struct dirent *de;
++    while((de = readdir(d)) != NULL) {
++        if(strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
++        total += treeSize(path + "/" + de->d_name);
++    }
++    closedir(d);
++    return total;
++}
++
++bool UnpackCache::removeTree(const std::string &path)
++{
++    struct stat st;
++    if(lstat(path.c_str(), &st) != 0) return errno == ENOENT;
++    if(!S_ISDIR(st.st_mode)) return unlink(path.c_str()) == 0;
++
++    DIR *d = opendir(path.c_str());
++    if(d) {
++        struct dirent *de;
++        while((de = readdir(d)) != NULL) {
++            if(strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
++            removeTree(path + "/" + de->d_name);
++        }
++        closedir(d);
++    }
++    return rmdir(path.c_str()) == 0;
++}
++
++bool UnpackCache::runUnzip(const std::string &zipPath, const std::string &destDir)
++{
++    pid_t pid = fork();
++    if(pid < 0) return false;
++
++    if(pid == 0) {                                  // child: quiet, no shell (names may contain quotes)
++        int nul = open("/dev/null", O_RDWR);
++        if(nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
++        execlp("unzip", "unzip", "-o", "-q", zipPath.c_str(), "-d", destDir.c_str(), (char *) NULL);
++        _exit(127);
++    }
++
++    int status = 0;
++    while(waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
++    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
++}
++
++static bool hasImageExt(const char *name)
++{
++    const char *ext = strrchr(name, '.');
++    return ext && (strcasecmp(ext, ".st") == 0 || strcasecmp(ext, ".msa") == 0) && strlen(name) >= 4;
++}
++
++bool UnpackCache::findFirstImage(const std::string &dir, std::string &imagePath, int depth)
++{
++    std::vector<std::string> files, dirs;
++    DIR *d = opendir(dir.c_str());
++    if(!d) return false;
++    struct dirent *de;
++    while((de = readdir(d)) != NULL) {
++        if(de->d_name[0] == '.') continue;          // ., .., our marker, __MACOSX-style hidden files
++        std::string p = dir + "/" + de->d_name;
++        struct stat st;
++        if(lstat(p.c_str(), &st) != 0) continue;
++        if(S_ISREG(st.st_mode) && hasImageExt(de->d_name)) files.push_back(p);
++        else if(S_ISDIR(st.st_mode) && strcmp(de->d_name, "__MACOSX") != 0) dirs.push_back(p);
++    }
++    closedir(d);
++
++    std::sort(files.begin(), files.end());          // stable choice: first by name
++    std::sort(dirs.begin(), dirs.end());
++    if(!files.empty()) { imagePath = files[0]; return true; }
++    if(depth >= 2) return false;
++    for(size_t i = 0; i < dirs.size(); i++) {
++        if(findFirstImage(dirs[i], imagePath, depth + 1)) return true;
++    }
++    return false;
++}
++
++bool UnpackCache::copyFileSafely(const std::string &src, const std::string &dst)
++{
++    std::string tmp = dst + ".tmp";
++    int in = open(src.c_str(), O_RDONLY);
++    if(in < 0) return false;
++    int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    if(out < 0) { close(in); return false; }
++
++    bool ok = true;
++    char buf[65536];
++    ssize_t n;
++    while((n = read(in, buf, sizeof(buf))) > 0) {
++        ssize_t off = 0;
++        while(off < n) {
++            ssize_t w = write(out, buf + off, n - off);
++            if(w <= 0) { ok = false; break; }
++            off += w;
++        }
++        if(!ok) break;
++    }
++    if(n < 0) ok = false;
++    if(fsync(out) != 0) ok = false;
++    if(close(out) != 0) ok = false;
++    close(in);
++
++    if(ok && rename(tmp.c_str(), dst.c_str()) != 0) ok = false;
++    if(!ok) unlink(tmp.c_str());
++    return ok;
++}
++
++// On the first use after app start: remove half-done unpacks
++void UnpackCache::cleanupOnce(void)
++{
++    static bool done = false;
++    if(done) return;
++    done = true;
++
++    mkdir(UNPACK_CACHE_DIR, 0755);
++    DIR *d = opendir(UNPACK_CACHE_DIR);
++    if(!d) return;
++    struct dirent *de;
++    std::vector<std::string> remove;
++    while((de = readdir(d)) != NULL) {
++        if(de->d_name[0] == '.') continue;
++        std::string p = std::string(UNPACK_CACHE_DIR "/") + de->d_name;
++        struct stat st;
++        if(!isDir(p) || stat((p + "/" UNPACK_DONE_MARKER).c_str(), &st) != 0) remove.push_back(p);
++    }
++    closedir(d);
++    for(size_t i = 0; i < remove.size(); i++) {
++        Debug::out(LOG_DEBUG, "UnpackCache: removing unfinished %s", remove[i].c_str());
++        removeTree(remove[i]);
++    }
++}
++
++std::string UnpackCache::lastError(void)
++{
++    return lastErr;
++}
++
++static bool readMarker(const std::string &dir, std::string &image)
++{
++    FILE *f = fopen((dir + "/" UNPACK_DONE_MARKER).c_str(), "r");
++    if(!f) return false;
++    char line[1024];
++    bool ok = fgets(line, sizeof(line), f) != NULL;
++    fclose(f);
++    if(!ok) return false;
++    line[strcspn(line, "\r\n")] = 0;
++    if(!line[0] || strstr(line, "..") || line[0] == '/') return false;
++    image = dir + "/" + line;
++    struct stat st;
++    return stat(image.c_str(), &st) == 0 && S_ISREG(st.st_mode);
++}
++
++bool UnpackCache::getImage(const std::string &zipPath, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error)
++{
++    cleanupOnce();
++    error.clear();
++
++    struct stat zst;
++    if(stat(zipPath.c_str(), &zst) != 0) {
++        error = "zip file not found";
++        lastErr = error;
++        return false;
++    }
++
++    // The folder name changes when the zip does (size, time), so a changed
++    // zip is unpacked again; the old folder ages out
++    char key[96];
++    snprintf(key, sizeof(key), "%s%s-%lld-%lld", "", ImageLibSources::shortHash(zipPath).c_str(), (long long) zst.st_size, (long long) zst.st_mtime);
++    std::string dir = std::string(UNPACK_CACHE_DIR "/") + key;
++
++    if(isDir(dir) && readMarker(dir, imagePath)) {
++        utimes(dir.c_str(), NULL);                  // used now (least recently inserted goes first)
++        Debug::out(LOG_DEBUG, "UnpackCache: %s already unpacked: %s", zipPath.c_str(), imagePath.c_str());
++        lastErr.clear();
++        return true;
++    }
++    removeTree(dir);
++
++    int entries = 0;
++    int64_t need = ZipUtil::unpackedSize(zipPath.c_str(), &entries);
++    if(need < 0) {
++        Debug::out(LOG_DEBUG, "UnpackCache: can't read the size from %s, unpacking anyway", zipPath.c_str());
++        need = 0;
++    }
++    need += UNPACK_MARGIN + (int64_t) entries * 4096;  // per-file rounding up to a page
++
++    struct statvfs vfs;
++    if(statvfs(UNPACK_CACHE_DIR, &vfs) != 0) {
++        error = "unpack RAM disk not available";
++        lastErr = error;
++        return false;
++    }
++    int64_t total = (int64_t) vfs.f_blocks * vfs.f_frsize;
++    int64_t freeB = (int64_t) vfs.f_bavail * vfs.f_frsize;
++
++    if(need > total) {
++        error = "the zip unpacks to more than the unpack RAM disk holds";
++        Debug::out(LOG_ERROR, "UnpackCache: %s needs %lld bytes, the RAM disk has %lld", zipPath.c_str(), (long long) need, (long long) total);
++        lastErr = error;
++        return false;
++    }
++
++    if(need > freeB) {
++        // what's in the cache, and which of it is in a slot
++        std::vector<UnpackCacheEntry> entriesNow;
++        DIR *d = opendir(UNPACK_CACHE_DIR);
++        if(d) {
++            struct dirent *de;
++            while((de = readdir(d)) != NULL) {
++                if(de->d_name[0] == '.') continue;
++                std::string p = std::string(UNPACK_CACHE_DIR "/") + de->d_name;
++                struct stat st;
++                if(stat(p.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
++                UnpackCacheEntry e;
++                e.name     = de->d_name;
++                e.size     = treeSize(p);
++                e.lastUsed = st.st_mtime;
++                e.inSlot   = false;
++                for(size_t i = 0; i < inUse.size(); i++) {
++                    if(inUse[i].compare(0, p.length() + 1, p + "/") == 0) e.inSlot = true;
++                }
++                entriesNow.push_back(e);
++            }
++            closedir(d);
++        }
++
++        std::vector<std::string> evict;
++        if(!UnpackCachePolicy::pickEvictions(entriesNow, freeB, need, evict)) {
++            error = "no room in the unpack RAM disk (the inserted disks use it)";
++            Debug::out(LOG_ERROR, "UnpackCache: %s: %s", zipPath.c_str(), error.c_str());
++            lastErr = error;
++            return false;
++        }
++        for(size_t i = 0; i < evict.size(); i++) {
++            Debug::out(LOG_INFO, "UnpackCache: evicting %s (least recently inserted)", evict[i].c_str());
++            removeTree(std::string(UNPACK_CACHE_DIR "/") + evict[i]);
++        }
++    }
++
++    std::string part = dir + ".part";
++    removeTree(part);
++    if(mkdir(part.c_str(), 0755) != 0) {
++        error = "can't create the unpack folder";
++        lastErr = error;
++        return false;
++    }
++
++    bool ok = runUnzip(zipPath, part);
++    std::string found;
++    if(ok) ok = findFirstImage(part, found);
++
++    if(!ok) {
++        statvfs(UNPACK_CACHE_DIR, &vfs);
++        bool full = (int64_t) vfs.f_bavail * vfs.f_frsize < UNPACK_MARGIN;
++        error = full ? "the unpack RAM disk filled up while unpacking" : "no .st or .msa image in the zip (or a damaged zip)";
++        Debug::out(LOG_ERROR, "UnpackCache: %s: %s", zipPath.c_str(), error.c_str());
++        removeTree(part);
++        lastErr = error;
++        return false;
++    }
++
++    // marker: the image's path inside the folder
++    std::string rel = found.substr(part.length() + 1);
++    FILE *f = fopen((part + "/" UNPACK_DONE_MARKER).c_str(), "w");
++    bool markerOk = f && fprintf(f, "%s\n", rel.c_str()) > 0;
++    if(f && fclose(f) != 0) markerOk = false;
++    if(!markerOk || rename(part.c_str(), dir.c_str()) != 0) {
++        error = "the unpack RAM disk filled up while unpacking";
++        removeTree(part);
++        lastErr = error;
++        return false;
++    }
++
++    imagePath = dir + "/" + rel;
++    Debug::out(LOG_DEBUG, "UnpackCache: unpacked %s -> %s", zipPath.c_str(), imagePath.c_str());
++    lastErr.clear();
++    return true;
++}
+diff --git a/ce_main_app/floppy/unpackcache.h b/ce_main_app/floppy/unpackcache.h
+new file mode 100644
+index 00000000..436d09f8
+--- /dev/null
++++ b/ce_main_app/floppy/unpackcache.h
+@@ -0,0 +1,47 @@
++#ifndef _UNPACKCACHE_H_
++#define _UNPACKCACHE_H_
++
++// Zipped floppy images are unpacked on insert into a small RAM disk (a 16 MB
++// tmpfs at UNPACK_CACHE_DIR, mounted by the image; created as a plain folder
++// otherwise). One folder per zip (named from its path, size and time), kept
++// after eject: inserting the same zip again reuses it. When space runs out,
++// the least recently inserted folders are deleted first; a folder an
++// inserted image comes from is never deleted (its saves go there).
++//
++// Replaces the single /tmp/zipedfloppy folder, which was emptied on every
++// zip insert, so the saves of a zipped disk in one slot were lost when a zip
++// went into another slot.
++//
++// Used only from the floppy encoder thread (which opens all images).
++
++#include <string>
++#include <vector>
++
++#ifndef UNPACK_CACHE_DIR
++#define UNPACK_CACHE_DIR    "/run/ce-floppy"
++#endif
++#define UNPACK_DONE_MARKER  ".ce-unpacked"
++
++class UnpackCache
++{
++public:
++    // Unpacks zipPath (or reuses an earlier unpack) and returns the first
++    // floppy image in it. inUse: image files open in the slots now (their
++    // folders are kept). False with a reason in error.
++    static bool getImage(const std::string &zipPath, const std::vector<std::string> &inUse, std::string &imagePath, std::string &error);
++
++    // Last problem, for the web UI ("" if the last insert worked)
++    static std::string lastError(void);
++
++    // Helpers (also used by the downloader)
++    static bool runUnzip(const std::string &zipPath, const std::string &destDir);      // busybox/info-zip unzip, no shell
++    static bool removeTree(const std::string &path);
++    static bool findFirstImage(const std::string &dir, std::string &imagePath, int depth = 0);     // first .st / .msa (top level first)
++    static bool copyFileSafely(const std::string &src, const std::string &dst);        // dst.tmp, fsync, rename
++
++private:
++    static void cleanupOnce(void);
++    static std::string lastErr;
++};
++
++#endif
+diff --git a/ce_main_app/floppy/ziputil.cpp b/ce_main_app/floppy/ziputil.cpp
+new file mode 100644
+index 00000000..5196a42d
+--- /dev/null
++++ b/ce_main_app/floppy/ziputil.cpp
+@@ -0,0 +1,86 @@
++#include <stdio.h>
++#include <string.h>
++#include <algorithm>
++
++#include "ziputil.h"
++
++static uint32_t rd16(const unsigned char *p) { return p[0] | (p[1] << 8); }
++static uint32_t rd32(const unsigned char *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t) p[3] << 24); }
++
++int64_t ZipUtil::unpackedSize(const char *zipPath, int *entries)
++{
++    if(entries) *entries = 0;
++
++    FILE *f = fopen(zipPath, "rb");
++    if(!f) return -1;
++
++    // End of central directory record: 22 bytes + up to 64 KB comment, at the end
++    if(fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
++    long fileSize = ftell(f);
++    if(fileSize < 22) { fclose(f); return -1; }
++
++    long tailLen = fileSize < (22 + 65535) ? fileSize : (22 + 65535);
++    std::vector<unsigned char> tail(tailLen);
++    if(fseek(f, fileSize - tailLen, SEEK_SET) != 0 || fread(&tail[0], 1, tailLen, f) != (size_t) tailLen) { fclose(f); return -1; }
++
++    long eocd = -1;
++    for(long i = tailLen - 22; i >= 0; i--) {
++        if(rd32(&tail[i]) == 0x06054b50) { eocd = i; break; }
++    }
++    if(eocd < 0) { fclose(f); return -1; }
++
++    uint32_t count    = rd16(&tail[eocd + 10]);
++    uint32_t cdSize   = rd32(&tail[eocd + 12]);
++    uint32_t cdOffset = rd32(&tail[eocd + 16]);
++    if(count == 0xffff || cdSize == 0xffffffff || cdOffset == 0xffffffff) { fclose(f); return -1; }    // zip64
++    if((long) cdOffset + (long) cdSize > fileSize || cdSize > 16 * 1024 * 1024) { fclose(f); return -1; }
++
++    std::vector<unsigned char> cd(cdSize + 1);
++    if(fseek(f, cdOffset, SEEK_SET) != 0 || (cdSize > 0 && fread(&cd[0], 1, cdSize, f) != cdSize)) { fclose(f); return -1; }
++    fclose(f);
++
++    int64_t total = 0;
++    uint32_t pos = 0;
++    uint32_t n;
++    for(n = 0; n < count; n++) {
++        if(pos + 46 > cdSize || rd32(&cd[pos]) != 0x02014b50) return -1;
++        uint32_t usize = rd32(&cd[pos + 24]);
++        uint32_t csize = rd32(&cd[pos + 20]);
++        if(usize == 0xffffffff || csize == 0xffffffff) return -1;              // zip64 entry
++        total += usize;
++        pos += 46 + rd16(&cd[pos + 28]) + rd16(&cd[pos + 30]) + rd16(&cd[pos + 32]);
++    }
++
++    if(entries) *entries = (int) count;
++    return total;
++}
++
++static bool olderFirst(const UnpackCacheEntry &a, const UnpackCacheEntry &b)
++{
++    if(a.lastUsed != b.lastUsed) return a.lastUsed < b.lastUsed;
++    return a.name < b.name;
++}
++
++bool UnpackCachePolicy::pickEvictions(const std::vector<UnpackCacheEntry> &entries, int64_t freeBytes, int64_t need, std::vector<std::string> &evict)
++{
++    evict.clear();
++    if(need <= freeBytes) return true;
++
++    std::vector<UnpackCacheEntry> candidates;
++    for(size_t i = 0; i < entries.size(); i++) {
++        if(!entries[i].inSlot) candidates.push_back(entries[i]);
++    }
++    std::sort(candidates.begin(), candidates.end(), olderFirst);
++
++    int64_t avail = freeBytes;
++    for(size_t i = 0; i < candidates.size() && avail < need; i++) {
++        evict.push_back(candidates[i].name);
++        avail += candidates[i].size;
++    }
++
++    if(avail < need) {
++        evict.clear();
++        return false;
++    }
++    return true;
++}
+diff --git a/ce_main_app/floppy/ziputil.h b/ce_main_app/floppy/ziputil.h
+new file mode 100644
+index 00000000..3b34f5a3
+--- /dev/null
++++ b/ce_main_app/floppy/ziputil.h
+@@ -0,0 +1,38 @@
++#ifndef _ZIPUTIL_H_
++#define _ZIPUTIL_H_
++
++// Helpers for the floppy unpack cache (unpackcache.cpp) that don't depend on
++// the rest of the app (unit-tested on the build host).
++
++#include <string>
++#include <vector>
++#include <stdint.h>
++#include <time.h>
++
++class ZipUtil
++{
++public:
++    // Total unpacked size of all files in a zip, from its central directory
++    // (no unpacking). -1: not a zip, damaged, or zip64 (size unknown).
++    // entries (if given): number of files.
++    static int64_t unpackedSize(const char *zipPath, int *entries = NULL);
++};
++
++// One unpacked image in the cache
++typedef struct {
++    std::string name;       // directory name in the cache
++    int64_t     size;       // bytes used
++    time_t      lastUsed;   // last insert (directory mtime)
++    bool        inSlot;     // an inserted image comes from it: never evicted
++} UnpackCacheEntry;
++
++class UnpackCachePolicy
++{
++public:
++    // Which entries to delete so that 'need' bytes fit: oldest first, never
++    // one that is in a slot. Returns false (and nothing to delete) if even
++    // deleting all allowed entries doesn't make room.
++    static bool pickEvictions(const std::vector<UnpackCacheEntry> &entries, int64_t freeBytes, int64_t need, std::vector<std::string> &evict);
++};
++
++#endif
+diff --git a/ce_main_app/webserver/api/resource/libraryresource.cpp b/ce_main_app/webserver/api/resource/libraryresource.cpp
+index f13a38a1..fce309de 100644
+--- a/ce_main_app/webserver/api/resource/libraryresource.cpp
++++ b/ce_main_app/webserver/api/resource/libraryresource.cpp
+@@ -37,6 +37,7 @@ static const char *typeName(int type)
+     case IMAGELIB_TYPE_WEB:     return "web";
+     case IMAGELIB_TYPE_SHARE:   return "share";
+     case IMAGELIB_TYPE_USB:     return "usb";
++    case IMAGELIB_TYPE_LOCAL:   return "local";
+     }
+     return "unknown";
+ }
+@@ -309,6 +310,16 @@ void LibraryResource::onSearch(mg_connection *conn, mg_request_info *req_info)
+     cJSON_AddItemToObject(root, "slots", slots);
+     cJSON_AddBoolToObject(root, "storage", shared.imageStorage->doWeHaveStorage());
+ 
++    // where downloads go (IMAGE_STORAGE), so the page can warn about RAM
++    StorageInfo si;
++    ImageStorage::getStorageInfo(si);
++    cJSON *st = cJSON_CreateObject();
++    cJSON_AddStringToObject(st, "setting",  si.setting.c_str());
++    cJSON_AddStringToObject(st, "path",     si.path.c_str());
++    cJSON_AddStringToObject(st, "kind",     si.kind.c_str());
++    cJSON_AddBoolToObject(st,   "fallback", si.fallback);
++    cJSON_AddItemToObject(root, "downloads", st);
++
+     if(!il->exists()) {                             // no list yet: downloading
+         cJSON_AddStringToObject(root, "status", "downloading");
+         cJSON_AddNumberToObject(root, "total", 0);
+@@ -370,7 +381,8 @@ void LibraryResource::onSearch(mg_connection *conn, mg_request_info *req_info)
+             cJSON_AddStringToObject(o, "source", sources[img->sourceIndex].src.label.c_str());
+         }
+ 
+-        cJSON_AddBoolToObject(o, "haveIt", shared.imageStorage->weHaveThisImage(img->imageName.c_str()));
++        cJSON_AddBoolToObject(o, "available", img->available);         // false: its folder's drive went away (greyed out)
++        cJSON_AddBoolToObject(o, "haveIt", img->available && shared.imageStorage->weHaveThisImage(img->imageName.c_str()));
+         cJSON_AddBoolToObject(o, "local", !img->localPath.empty());     // from a share: / usb: folder, used in place
+ 
+         char inSlots[3];
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 9dd4e559..fe0cb378 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -20,6 +20,8 @@
+ #include "debug.h"
+ #include "global.h"
+ #include "settingsresource.h"
++#include "../../../floppy/imagelibsources.h"
++#include "../../../floppy/imagestorage.h"
+ #include "../../../settings.h"
+ #include "../../../settingsreloadproxy.h"
+ #include "../../../utils.h"
+@@ -199,6 +201,13 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+         cJSON_AddNumberToObject(out, "driveId",         fc.id);
+         cJSON_AddBoolToObject(out,   "writeProtected",  fc.writeProtected);
+         cJSON_AddBoolToObject(out,   "soundEnabled",    fc.soundEnabled);
++        std::string storage;
++        s.getStringLong(IMAGE_STORAGE_KEY, storage, "auto");
++        cJSON_AddStringToObject(out, "imageStorage",    storage.empty() ? "auto" : storage.c_str());
++        StorageInfo si;
++        ImageStorage::getStorageInfo(si);
++        cJSON_AddStringToObject(out, "imageStoragePath", si.path.c_str());     // where downloads go now
++        cJSON_AddStringToObject(out, "imageStorageKind", si.kind.c_str());     // usb / share / local / ram
+         return true;
+     }
+ 
+@@ -375,6 +384,19 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+         getBool(in, "soundEnabled", fc.soundEnabled);
+         if(getNumber(in, "driveId", id) && id != 0 && id != 1) { msg = "driveId: 0 or 1"; return false; }
+         fc.id = (int) id;
++        std::string storage;
++        bool setStorage = getString(in, "imageStorage", storage);
++        if(setStorage) {
++            int type;
++            std::string serial, path;
++            if(storage.empty()) storage = "auto";
++            if(storage != "auto" && storage != "shared" &&
++               (!safeText(storage, ",") || storage.length() > 200 || !ImageLibSources::parseLocation(storage, type, serial, path))) {
++                msg = "Image storage: auto, shared, share:<folder>, usb:<serial>:<folder> or local:<folder>.";
++                return false;
++            }
++        }
++        if(setStorage) s.setString(IMAGE_STORAGE_KEY, storage.c_str());
+         s.saveFloppyConfig(&fc);
+         reload(SETTINGSUSER_FLOPPYCONF);
+         Utils::forceSync();
+-- 
+2.54.0 (Apple Git-157)
+

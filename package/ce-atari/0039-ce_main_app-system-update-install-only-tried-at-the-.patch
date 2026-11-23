@@ -1,0 +1,109 @@
+From c47fcfb5ea0541202c23c778371186f0a5591702 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:16:00 +0100
+Subject: [PATCH] ce_main_app: system update: install only (tried at the next
+ start), choose the next start, restart
+
+POST /api/v1/system/update/online and /usb take "restart": false and the
+upload X-Restart: no: the tool installs with -n, the new system is tried at
+the next start. New: /boot {"slot"} (the system the next start uses) and
+/restart.
+---
+ .../webserver/api/resource/systemresource.cpp | 31 +++++++++++++++----
+ .../webserver/api/resource/systemresource.h   | 14 ++++++---
+ 2 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index bfb098b4..7a692219 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -236,7 +236,9 @@ void SystemResource::upload(mg_connection *conn)
+         sendError(conn, 400, ok ? "The upload was cut short." : "Writing the upload failed (full?).");
+         return;
+     }
+-    bool started = startTool("install '" + path + "' delete");
++    const char *rs = mg_get_header(conn, "X-Restart");      // "no": install only, tried at the next start
++    bool restart = !(rs && strcasecmp(rs, "no") == 0);
++    bool started = startTool(std::string(restart ? "" : "-n ") + "install '" + path + "' delete");
+     pthread_mutex_unlock(&uploadMutex);
+     if(!started) { unlink(path.c_str()); sendError(conn, 500, "Couldn't start the update."); return; }
+     usleep(300 * 1000);                     // the tool has set its state
+@@ -283,10 +285,17 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         sendError(conn, 415, "Content-Type must be application/json");
+         return true;
+     }
+-    std::string body;                                       // small JSON (only "usb" uses it)
++    std::string body;                                       // small JSON: path, restart, slot
+     char drain[256];
+     int dn;
+     while((dn = mg_read(conn, drain, sizeof(drain))) > 0) if(body.length() < 4096) body.append(drain, dn);
++    cJSON *jin = cJSON_Parse(body.c_str());
++    cJSON *jr = jin ? cJSON_GetObjectItem(jin, "restart") : NULL;
++    bool restart = !(jr && jr->type == cJSON_False);        // "restart": false -> install only (-n)
++    cJSON *js = jin ? cJSON_GetObjectItem(jin, "slot") : NULL;
++    std::string slot = (js && js->type == cJSON_String && js->valuestring) ? js->valuestring : "";
++    if(jin) cJSON_Delete(jin);
++    std::string opt = restart ? "" : "-n ";
+ 
+     if(what == "check") {
+         std::string out;
+@@ -310,14 +319,24 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+             return true;
+         }
+         if(isBusy()) { sendError(conn, 409, "An update is running."); return true; }
+-        if(!startTool(std::string("install '") + real + "'")) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
++        if(!startTool(opt + "install '" + real + "'")) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
+         usleep(300 * 1000);
+         sendStatus(conn);
+         return true;
+     }
+-    if(what == "online" || what == "keep" || what == "back" || what == "previous") {
+-        if(what == "online" && isBusy()) { sendError(conn, 409, "An update is running."); return true; }
+-        if(!startTool(what)) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
++    if(what == "boot") {                                    // {"slot": "a" | "b"}: the next start, no restart
++        if(slot != "a" && slot != "b") { sendError(conn, 400, "Which system? slot a or b"); return true; }
++        if(isBusy()) { sendError(conn, 409, "An update is running."); return true; }
++        std::string out;
++        runTool((std::string("boot ") + slot).c_str(), out);
++        std::string err = valueOf(out, "error");
++        if(!err.empty()) { sendError(conn, 400, err); return true; }
++        sendStatus(conn);
++        return true;
++    }
++    if(what == "online" || what == "keep" || what == "back" || what == "previous" || what == "restart") {
++        if((what == "online" || what == "restart") && isBusy()) { sendError(conn, 409, "An update is running."); return true; }
++        if(!startTool(what == "online" ? opt + what : what)) { sendError(conn, 500, "Couldn't start the update tool."); return true; }
+         usleep(300 * 1000);
+         sendStatus(conn);
+         return true;
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index 18d17ed0..9e56f406 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -10,13 +10,19 @@
+ // System updates for the web interface, done by the image's SYSUPDATE_TOOL
+ // (Buildroot image: /usr/sbin/ce-sysupdate, A/B root partitions; see there).
+ //
+-//   GET  /api/v1/system/update            state: version, slot, progress, newest published ...
++//   GET  /api/v1/system/update            state: version, slot, progress, newest published,
++//                                         slotA/slotB (versions), nextSlot, staged ...
+ //   POST /api/v1/system/update/check      look for the newest published image (waits for it)
+-//   POST /api/v1/system/update/online     download and install it (runs on; poll GET)
++//   POST /api/v1/system/update/online     {"restart"}: download and install it (runs on; poll GET)
+ //   POST /api/v1/system/update/upload     the body is an SD card image (.img or .img.xz),
+ //                                         Content-Type application/octet-stream,
+-//                                         X-File-Name: its name; installed like online
+-//   POST /api/v1/system/update/usb        {"path"}: an image on a USB stick (status: usbImages)
++//                                         X-File-Name: its name, X-Restart: no (install only);
++//                                         installed like online
++//   POST /api/v1/system/update/usb        {"path", "restart"}: an image on a USB stick (status: usbImages)
++//                                         "restart": false: install only; the new system is
++//                                         tried at the next start (state "staged")
++//   POST /api/v1/system/update/boot       {"slot": "a"|"b"}: the system the next start uses
++//   POST /api/v1/system/update/restart    restart (into a staged system: tried once)
+ //   POST /api/v1/system/update/keep       while trying a new system: keep it
+ //   POST /api/v1/system/update/back       ... or restart into the old one
+ //   POST /api/v1/system/update/previous   restart into the system installed before
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,97 @@
+From 278d7c4b35dbcbf58e3cfa528c1df90286c0d383 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:19:48 +0200
+Subject: [PATCH] ce_main_app: make the web root directory a build-time setting
+
+The web UI's document root and the status/debug templates were hardcoded
+as /ce/app/webroot/ in three places. Define it once as CE_WEBROOT in
+webserver.h, defaulting to the same path, so a system can serve the web
+UI from elsewhere (e.g. a read-only system directory that software
+updates of /ce don't overwrite):
+
+  -DCE_WEBROOT='"/usr/share/cosmosex/webroot/"'
+
+Without the define nothing changes.
+---
+ ce_main_app/webserver/app/controller/debugcontroller.cpp  | 5 +++--
+ ce_main_app/webserver/app/controller/statuscontroller.cpp | 5 +++--
+ ce_main_app/webserver/webserver.cpp                       | 2 +-
+ ce_main_app/webserver/webserver.h                         | 7 +++++++
+ 4 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/ce_main_app/webserver/app/controller/debugcontroller.cpp b/ce_main_app/webserver/app/controller/debugcontroller.cpp
+index 5e8ed3ce..11743f73 100644
+--- a/ce_main_app/webserver/app/controller/debugcontroller.cpp
++++ b/ce_main_app/webserver/app/controller/debugcontroller.cpp
+@@ -1,3 +1,4 @@
++#include "../../webserver.h"
+ #include "debugcontroller.h"
+ #include <string>
+ #include <sstream>
+@@ -18,9 +19,9 @@ DebugController::~DebugController()
+ 
+ bool DebugController::indexAction(mg_connection *conn, mg_request_info *req_info)
+ {
+-	std::ifstream fileTemplateLayout("/ce/app/webroot/templates/layout.tpl");
++	std::ifstream fileTemplateLayout(CE_WEBROOT "templates/layout.tpl");
+ 	std::string sTemplateLayout((std::istreambuf_iterator<char>(fileTemplateLayout)),std::istreambuf_iterator<char>());
+-	std::ifstream fileTemplateDebug("/ce/app/webroot/templates/debug.tpl");
++	std::ifstream fileTemplateDebug(CE_WEBROOT "templates/debug.tpl");
+ 	std::string sTemplateDebug((std::istreambuf_iterator<char>(fileTemplateDebug)),std::istreambuf_iterator<char>());
+ 
+  	std::ostringstream stringStream;
+diff --git a/ce_main_app/webserver/app/controller/statuscontroller.cpp b/ce_main_app/webserver/app/controller/statuscontroller.cpp
+index 99d26236..0335202a 100644
+--- a/ce_main_app/webserver/app/controller/statuscontroller.cpp
++++ b/ce_main_app/webserver/app/controller/statuscontroller.cpp
+@@ -1,3 +1,4 @@
++#include "../../webserver.h"
+ #include "statuscontroller.h"
+ #include <string>
+ #include <sstream>
+@@ -16,9 +17,9 @@ StatusController::~StatusController()
+ 
+ bool StatusController::indexAction(mg_connection *conn, mg_request_info *req_info)
+ {
+-	std::ifstream fileTemplateLayout("/ce/app/webroot/templates/layout.tpl");
++	std::ifstream fileTemplateLayout(CE_WEBROOT "templates/layout.tpl");
+ 	std::string sTemplateLayout((std::istreambuf_iterator<char>(fileTemplateLayout)),std::istreambuf_iterator<char>());
+-	std::ifstream fileTemplateDebug("/ce/app/webroot/templates/status.tpl");
++	std::ifstream fileTemplateDebug(CE_WEBROOT "templates/status.tpl");
+ 	std::string sTemplateDebug((std::istreambuf_iterator<char>(fileTemplateDebug)),std::istreambuf_iterator<char>());
+ 
+ 	std::map<std::string, std::string> mapVariables;
+diff --git a/ce_main_app/webserver/webserver.cpp b/ce_main_app/webserver/webserver.cpp
+index 2af15748..837cdba2 100644
+--- a/ce_main_app/webserver/webserver.cpp
++++ b/ce_main_app/webserver/webserver.cpp
+@@ -5,7 +5,7 @@
+ 
+ #include "../debug.h"
+ 
+-#define DOCUMENT_ROOT "/ce/app/webroot/"
++#define DOCUMENT_ROOT CE_WEBROOT
+ #define PORT "80"
+ 
+ std::string WebServer::sLastUploadedFile;
+diff --git a/ce_main_app/webserver/webserver.h b/ce_main_app/webserver/webserver.h
+index b6870f5f..461506ef 100644
+--- a/ce_main_app/webserver/webserver.h
++++ b/ce_main_app/webserver/webserver.h
+@@ -1,6 +1,13 @@
+ #ifndef _WEBSERVER_H_
+ #define _WEBSERVER_H_
+ 
++// Directory the web UI is served from (with trailing slash), including the
++// templates/ the status and debug pages use. Override at build time, e.g.
++// -DCE_WEBROOT='"/usr/share/cosmosex/webroot/"'.
++#ifndef CE_WEBROOT
++#define CE_WEBROOT "/ce/app/webroot/"
++#endif
++
+ #include <list> 
+ 
+ #include "CivetServer.h"
+-- 
+2.54.0 (Apple Git-157)
+

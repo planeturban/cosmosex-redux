@@ -1,0 +1,21 @@
+#!/bin/sh
+# Run by getty on tty1 instead of /bin/login (getty -n -l). Shows the status
+# banner (/run/issue): with -n, BusyBox getty skips printing the issue file.
+#   ce has no password: wait for Enter, then log in as ce without a password.
+#   ce has a password ("sudo passwd ce"): normal login prompt.
+# Waiting for Enter (instead of starting a shell at boot) keeps the banner
+# refreshable: ce-issue restarts this process while nobody is logged in.
+
+cat /run/issue 2>/dev/null
+
+pw=$(awk -F: '$1 == "ce" { print $2 }' /etc/shadow)
+case "$pw" in
+"" | "*" | "!"*)
+	printf 'Press Enter to log in (keyboard on the Atari: see "Keyboard" above). '
+	read -r _
+	exec /bin/login -f ce
+	;;
+*)
+	exec /bin/login
+	;;
+esac

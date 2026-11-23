@@ -1,0 +1,544 @@
+From da995d442507a370e6f9fa2e24d81bf5d02cdc36 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 14:54:29 +0100
+Subject: [PATCH] ce_main_app: login for the web interface
+
+The web interface (port 80) had no login: anyone on the network could
+change every setting. Now every request goes through
+WebAuth::beginRequest (civetweb begin_request): a page without a session
+is sent to /login.html, an API call gets 401. Open without a login: the
+login page and what it loads, /api/v1/auth/*, and requests from the
+CosmosEx itself (127.0.0.1).
+
+- On by default (WEBUI_LOGIN), password "thisisinsecure" until one is
+  set; stored as PBKDF2-SHA256 with a random salt (WEBUI_PWHASH, libcrypto),
+  compared in constant time.
+- insecure.txt on the boot partition (WEBUI_INSECURE_FILE) switches the
+  login off: the way back in when the password is forgotten.
+- POST /api/v1/auth/login {"password"} sets a session cookie (128 random
+  bits, HttpOnly, SameSite=Strict, 30 days without use); POST
+  /api/v1/auth/logout; GET /api/v1/auth/status. A wrong password waits
+  1 s; 10 in a minute lock the login for a minute.
+- Settings section "weblogin": enabled, insecureFile, defaultPassword;
+  PUT {"enabled", "password"} (a new password ends the other logins).
+- Links with -lcrypto.
+---
+ ce_main_app/makefile                          |   2 +-
+ .../api/resource/settingsresource.cpp         |  31 +-
+ ce_main_app/webserver/webauth.cpp             | 338 ++++++++++++++++++
+ ce_main_app/webserver/webauth.h               |  49 +++
+ ce_main_app/webserver/webserver.cpp           |   2 +
+ 5 files changed, 420 insertions(+), 2 deletions(-)
+ create mode 100644 ce_main_app/webserver/webauth.cpp
+ create mode 100644 ce_main_app/webserver/webauth.h
+
+diff --git a/ce_main_app/makefile b/ce_main_app/makefile
+index 764ffac8..8d890106 100644
+--- a/ce_main_app/makefile
++++ b/ce_main_app/makefile
+@@ -17,7 +17,7 @@ DEPFLAGS = -MM -MT $(patsubst %.d,%.o,$@) -MT $@
+ 
+ VPATH = ./lib
+ LDFLAGS	= -Llib $(CPU_FLAGS)
+-LDLIBS = -lrt -lanl -lpthread -lcurl -ldl -lutil
++LDLIBS = -lrt -lanl -lpthread -lcurl -ldl -lutil -lcrypto
+ 
+ ifeq ($(ONPC),yes)
+     OBJDIR = obj/onpc
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index ecf0c1a3..e893a1d1 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -24,6 +24,7 @@
+ #include "global.h"
+ #include "settingsresource.h"
+ #include "pishare.h"
++#include "../../webauth.h"
+ #include "../../../floppy/imagelibsources.h"
+ #include "../../../floppy/imagestorage.h"
+ #include "../../../settings.h"
+@@ -49,11 +50,15 @@ extern volatile bool do_loadIkbdConfig;
+ #define HDD_IMAGES_DIR      "/pi/hdd_images"
+ #endif
+ 
+-static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage", "pishare" };
++static const char *SECTIONS[] = { "acsi", "translated", "shared", "floppy", "network", "ikbd", "other", "hddimage", "pishare", "weblogin" };
+ #define SECTION_COUNT   (int) (sizeof(SECTIONS) / sizeof(SECTIONS[0]))
+ 
+ static const char *ACSI_MODES[4] = { "off", "sd", "raw", "translated" };    // index = DEVTYPE_*
+ 
++// the request being handled (this thread): changing the web password keeps
++// that browser logged in
++static __thread mg_connection *currentConn = NULL;
++
+ /* --------------------------------------------------------------- helpers */
+ 
+ static SettingsReloadProxy *reloadProxy(void)
+@@ -221,6 +226,13 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+         return pishareBuild(out);
+     }
+ 
++    if(name == "weblogin") {                                // the web interface's login (webauth.cpp)
++        cJSON_AddBoolToObject(out, "enabled",         WebAuth::enabled());
++        cJSON_AddBoolToObject(out, "insecureFile",    WebAuth::insecureFile());    // insecure.txt switches it off
++        cJSON_AddBoolToObject(out, "defaultPassword", WebAuth::defaultPassword());
++        return true;
++    }
++
+     Settings s;
+ 
+     if(name == "acsi") {
+@@ -400,6 +412,21 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+         return pishareSave(in, msg);
+     }
+ 
++    if(name == "weblogin") {
++        std::string pw;
++        bool on;
++        if(getString(in, "password", pw) && !pw.empty()) {     // absent or empty: keep the password
++            if(pw.length() < 6 || pw.length() > 128) { msg = "The password must be 6 to 128 characters long."; return false; }
++            for(size_t i=0; i<pw.length(); i++) {
++                if((unsigned char) pw[i] < 0x20) { msg = "The password can't contain control characters."; return false; }
++            }
++            if(!WebAuth::setPassword(pw, currentConn)) { msg = "Couldn't save the password."; return false; }
++        }
++        if(getBool(in, "enabled", on)) WebAuth::setEnabled(on);
++        Utils::forceSync();
++        return true;
++    }
++
+     Settings s;
+ 
+     if(name == "acsi") {                                    // onAcsiConfig_save()
+@@ -817,7 +844,9 @@ bool SettingsResource::dispatch(mg_connection *conn, mg_request_info *req_info,
+     }
+ 
+     std::string msg, warning;
++    currentConn = conn;
+     bool ok = saveSection(section, in, msg, warning);
++    currentConn = NULL;
+     cJSON_Delete(in);
+ 
+     if(!ok) {
+diff --git a/ce_main_app/webserver/webauth.cpp b/ce_main_app/webserver/webauth.cpp
+new file mode 100644
+index 00000000..e94cd050
+--- /dev/null
++++ b/ce_main_app/webserver/webauth.cpp
+@@ -0,0 +1,338 @@
++// Web interface login (see webauth.h)
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <time.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <pthread.h>
++#include <sys/stat.h>
++
++#include <map>
++#include <string>
++
++#include <openssl/evp.h>
++
++#include "civetweb.h"
++#include "webauth.h"
++#include "../settings.h"
++#include "../debug.h"
++#include "../lib/cjson-code-58/cJSON.h"
++
++#define SESSION_COOKIE      "ce_session"
++#define SESSION_SECONDS     (30 * 24 * 3600)        // a login lasts 30 days (without use)
++#define SESSION_MAX         64
++#define PBKDF2_ROUNDS       20000
++#define FAILS_MAX           10                      // wrong passwords per minute, then a minute's pause
++
++static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
++static std::map<std::string, time_t> sessions;     // token -> last use
++static int    failCount = 0;
++static time_t failWindowStart = 0;
++static time_t lockedUntil = 0;
++
++/* ------------------------------------------------------------- helpers */
++
++static std::string hex(const unsigned char *b, size_t n)
++{
++    static const char *h = "0123456789abcdef";
++    std::string s;
++    for(size_t i = 0; i < n; i++) { s += h[b[i] >> 4]; s += h[b[i] & 15]; }
++    return s;
++}
++
++static bool unhex(const std::string &s, unsigned char *out, size_t n)
++{
++    if(s.length() != n * 2) return false;
++    for(size_t i = 0; i < n; i++) {
++        unsigned v;
++        if(sscanf(s.c_str() + i * 2, "%2x", &v) != 1) return false;
++        out[i] = (unsigned char) v;
++    }
++    return true;
++}
++
++static bool randomBytes(unsigned char *b, size_t n)
++{
++    int fd = open("/dev/urandom", O_RDONLY);
++    if(fd < 0) return false;
++    size_t got = 0;
++    while(got < n) {
++        ssize_t r = read(fd, b + got, n - got);
++        if(r <= 0) { close(fd); return false; }
++        got += r;
++    }
++    close(fd);
++    return true;
++}
++
++static bool equalConstTime(const unsigned char *a, const unsigned char *b, size_t n)
++{
++    unsigned char d = 0;
++    for(size_t i = 0; i < n; i++) d |= a[i] ^ b[i];
++    return d == 0;
++}
++
++// "pbkdf2-sha256$<rounds>$<salt hex>$<hash hex>"
++static std::string makeHash(const std::string &password)
++{
++    unsigned char salt[16], key[32];
++    if(!randomBytes(salt, sizeof(salt))) return "";
++    if(!PKCS5_PBKDF2_HMAC(password.c_str(), password.length(), salt, sizeof(salt), PBKDF2_ROUNDS, EVP_sha256(), sizeof(key), key)) return "";
++    char rounds[16];
++    snprintf(rounds, sizeof(rounds), "%d", PBKDF2_ROUNDS);
++    return std::string("pbkdf2-sha256$") + rounds + "$" + hex(salt, sizeof(salt)) + "$" + hex(key, sizeof(key));
++}
++
++static void sendJson(struct mg_connection *conn, int code, const char *status, const std::string &body, const char *extraHeaders = "")
++{
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n%sContent-Length: %lu\r\n\r\n",
++              code, status, extraHeaders, (unsigned long) body.length());
++    mg_write(conn, body.c_str(), body.length());
++}
++
++static std::string readBody(struct mg_connection *conn, size_t max)
++{
++    const char *cl = mg_get_header(conn, "Content-Length");
++    size_t len = cl ? strtoul(cl, NULL, 10) : 0;
++    if(len > max) return "";
++    std::string body(len, '\0');
++    size_t got = 0;
++    while(got < len) {
++        int r = mg_read(conn, &body[got], len - got);
++        if(r <= 0) break;
++        got += r;
++    }
++    body.resize(got);
++    return body;
++}
++
++/* ------------------------------------------------------------ settings */
++
++bool WebAuth::enabled(void)
++{
++    Settings s;
++    return s.getBool(WEBUI_LOGIN_KEY, true);
++}
++
++bool WebAuth::insecureFile(void)
++{
++    static time_t checked = 0;
++    static bool present = false;
++    time_t now = time(NULL);
++    pthread_mutex_lock(&mtx);
++    if(now - checked >= 5 || now < checked) {           // the boot partition: look every 5 s at most
++        struct stat st;
++        present = stat(WEBUI_INSECURE_FILE, &st) == 0;
++        checked = now;
++    }
++    bool p = present;
++    pthread_mutex_unlock(&mtx);
++    return p;
++}
++
++bool WebAuth::defaultPassword(void)
++{
++    Settings s;
++    std::string h;
++    s.getStringLong(WEBUI_PWHASH_KEY, h, "");
++    return h.empty();
++}
++
++bool WebAuth::required(void)
++{
++    return enabled() && !insecureFile();
++}
++
++bool WebAuth::setEnabled(bool on)
++{
++    Settings s;
++    s.setBool(WEBUI_LOGIN_KEY, on);
++    return true;
++}
++
++bool WebAuth::setPassword(const std::string &password, struct mg_connection *keepSessionOf)
++{
++    std::string h = makeHash(password);
++    if(h.empty()) return false;
++    Settings s;
++    s.setString(WEBUI_PWHASH_KEY, h.c_str());
++
++    // other logins end; the one that changed it stays
++    std::string keep;
++    validSession(keepSessionOf, &keep);
++    pthread_mutex_lock(&mtx);
++    for(std::map<std::string, time_t>::iterator it = sessions.begin(); it != sessions.end(); ) {
++        if(it->first != keep) sessions.erase(it++); else ++it;
++    }
++    pthread_mutex_unlock(&mtx);
++    Debug::out(LOG_INFO, "WebAuth: web interface password changed");
++    return true;
++}
++
++bool WebAuth::checkPassword(const std::string &password)
++{
++    Settings s;
++    std::string stored;
++    s.getStringLong(WEBUI_PWHASH_KEY, stored, "");
++
++    if(stored.empty()) {                                // not set yet: the default
++        std::string def = WEBUI_DEFAULT_PASSWORD;
++        return password.length() == def.length() &&
++               equalConstTime((const unsigned char *) password.c_str(), (const unsigned char *) def.c_str(), def.length());
++    }
++
++    // pbkdf2-sha256$rounds$salt$hash
++    size_t p1 = stored.find('$'), p2 = stored.find('$', p1 + 1), p3 = stored.find('$', p2 + 1);
++    if(p1 == std::string::npos || p2 == std::string::npos || p3 == std::string::npos || stored.substr(0, p1) != "pbkdf2-sha256") return false;
++    int rounds = atoi(stored.substr(p1 + 1, p2 - p1 - 1).c_str());
++    unsigned char salt[16], want[32], got[32];
++    if(rounds < 1000 || !unhex(stored.substr(p2 + 1, p3 - p2 - 1), salt, sizeof(salt)) || !unhex(stored.substr(p3 + 1), want, sizeof(want))) return false;
++    if(!PKCS5_PBKDF2_HMAC(password.c_str(), password.length(), salt, sizeof(salt), rounds, EVP_sha256(), sizeof(got), got)) return false;
++    return equalConstTime(got, want, sizeof(want));
++}
++
++/* ------------------------------------------------------------ sessions */
++
++bool WebAuth::validSession(struct mg_connection *conn, std::string *token)
++{
++    if(!conn) return false;
++    const char *cookies = mg_get_header(conn, "Cookie");
++    char tok[80];
++    if(!cookies || mg_get_cookie(cookies, SESSION_COOKIE, tok, sizeof(tok)) <= 0) return false;
++
++    time_t now = time(NULL);
++    bool ok = false;
++    pthread_mutex_lock(&mtx);
++    std::map<std::string, time_t>::iterator it = sessions.find(tok);
++    if(it != sessions.end()) {
++        if(now - it->second < SESSION_SECONDS) {
++            it->second = now;                           // in use: lasts another 30 days
++            ok = true;
++        } else {
++            sessions.erase(it);
++        }
++    }
++    pthread_mutex_unlock(&mtx);
++    if(ok && token) *token = tok;
++    return ok;
++}
++
++/* --------------------------------------------------------------- http */
++
++static bool startsWith(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
++
++int WebAuth::beginRequest(struct mg_connection *conn)
++{
++    const struct mg_request_info *ri = mg_get_request_info(conn);
++    const char *uri = ri->uri ? ri->uri : "/";
++
++    // the login API: always reachable
++    if(startsWith(uri, "/api/v1/auth/")) {
++        std::string what = uri + 13;
++        bool post = strcmp(ri->request_method, "POST") == 0;
++
++        if(what == "status" && strcmp(ri->request_method, "GET") == 0) {
++            char b[256];
++            snprintf(b, sizeof(b), "{\"required\":%s,\"loggedIn\":%s,\"enabled\":%s,\"insecureFile\":%s,\"defaultPassword\":%s}",
++                     required() ? "true" : "false", validSession(conn, NULL) ? "true" : "false",
++                     enabled() ? "true" : "false", insecureFile() ? "true" : "false", defaultPassword() ? "true" : "false");
++            sendJson(conn, 200, "OK", b);
++            return 1;
++        }
++
++        if(what == "login" && post) {
++            time_t now = time(NULL);
++            pthread_mutex_lock(&mtx);
++            bool locked = now < lockedUntil;
++            pthread_mutex_unlock(&mtx);
++            if(locked) {
++                sendJson(conn, 429, "Too Many Requests", "{\"status\":\"error\",\"error\":\"Too many wrong passwords: wait a minute.\"}");
++                return 1;
++            }
++
++            std::string body = readBody(conn, 4096), password;
++            cJSON *j = cJSON_Parse(body.c_str());
++            cJSON *pw = j ? cJSON_GetObjectItem(j, "password") : NULL;
++            if(pw && pw->type == cJSON_String && pw->valuestring) password = pw->valuestring;
++            if(j) cJSON_Delete(j);
++
++            if(!checkPassword(password)) {
++                pthread_mutex_lock(&mtx);
++                if(now - failWindowStart >= 60) { failWindowStart = now; failCount = 0; }
++                if(++failCount >= FAILS_MAX) lockedUntil = now + 60;
++                pthread_mutex_unlock(&mtx);
++                Debug::out(LOG_INFO, "WebAuth: wrong password from %ld.%ld.%ld.%ld", (ri->remote_ip >> 24) & 255, (ri->remote_ip >> 16) & 255, (ri->remote_ip >> 8) & 255, ri->remote_ip & 255);
++                sleep(1);                               // slows down guessing
++                sendJson(conn, 401, "Unauthorized", "{\"status\":\"error\",\"error\":\"Wrong password.\"}");
++                return 1;
++            }
++
++            unsigned char rnd[16];
++            if(!randomBytes(rnd, sizeof(rnd))) {
++                sendJson(conn, 500, "Internal Server Error", "{\"status\":\"error\",\"error\":\"no random numbers\"}");
++                return 1;
++            }
++            std::string tok = hex(rnd, sizeof(rnd));
++            pthread_mutex_lock(&mtx);
++            if(sessions.size() >= SESSION_MAX) {        // too many: drop the least recently used
++                std::map<std::string, time_t>::iterator oldest = sessions.begin();
++                for(std::map<std::string, time_t>::iterator it = sessions.begin(); it != sessions.end(); ++it) {
++                    if(it->second < oldest->second) oldest = it;
++                }
++                sessions.erase(oldest);
++            }
++            sessions[tok] = now;
++            failCount = 0;
++            pthread_mutex_unlock(&mtx);
++
++            char hdr[200];
++            snprintf(hdr, sizeof(hdr), "Set-Cookie: %s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict\r\n", SESSION_COOKIE, tok.c_str(), SESSION_SECONDS);
++            sendJson(conn, 200, "OK", "{\"status\":\"ok\"}", hdr);
++            return 1;
++        }
++
++        if(what == "logout" && post) {
++            std::string tok;
++            if(validSession(conn, &tok)) {
++                pthread_mutex_lock(&mtx);
++                sessions.erase(tok);
++                pthread_mutex_unlock(&mtx);
++            }
++            sendJson(conn, 200, "OK", "{\"status\":\"ok\"}", "Set-Cookie: " SESSION_COOKIE "=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict\r\n");
++            return 1;
++        }
++
++        sendJson(conn, 404, "Not Found", "{\"status\":\"error\",\"error\":\"unknown\"}");
++        return 1;
++    }
++
++    if(!required()) return 0;                           // login off (setting, or insecure.txt)
++    if(ri->remote_ip == 0x7f000001L) return 0;          // from the CosmosEx itself
++
++    // what the login page needs
++    if(strcmp(uri, "/login.html") == 0 || strcmp(uri, "/css/app.css") == 0 || startsWith(uri, "/fonts/")) return 0;
++
++    if(validSession(conn, NULL)) return 0;
++
++    if(startsWith(uri, "/api/") || startsWith(uri, "/app/")) {
++        sendJson(conn, 401, "Unauthorized", "{\"status\":\"error\",\"error\":\"login required\"}");
++        return 1;
++    }
++    const char *dot = strrchr(uri, '.');
++    const char *slash = strrchr(uri, '/');
++    bool page = !dot || dot < slash || strcmp(dot, ".html") == 0;
++    if(page && strcmp(ri->request_method, "GET") == 0) {
++        // back to this page after logging in (a path only: no other site)
++        std::string next = uri;
++        for(size_t i = 0; i < next.length(); i++) {
++            char c = next[i];
++            if(!(isalnum((unsigned char) c) || c == '/' || c == '.' || c == '-' || c == '_')) { next = "/"; break; }
++        }
++        mg_printf(conn, "HTTP/1.1 302 Found\r\nLocation: /login.html?next=%s\r\nCache-Control: no-store\r\nContent-Length: 0\r\n\r\n", next.c_str());
++        return 1;
++    }
++    mg_printf(conn, "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: 15\r\n\r\nlogin required\n");
++    return 1;
++}
+diff --git a/ce_main_app/webserver/webauth.h b/ce_main_app/webserver/webauth.h
+new file mode 100644
+index 00000000..50e42671
+--- /dev/null
++++ b/ce_main_app/webserver/webauth.h
+@@ -0,0 +1,49 @@
++#ifndef WEBAUTH_H
++#define WEBAUTH_H
++
++// Login for the web interface. On by default (setting WEBUI_LOGIN), with the
++// password WEBUI_DEFAULT_PASSWORD until one is set (WEBUI_PWHASH: PBKDF2-
++// SHA256, salted). A file WEBUI_INSECURE_FILE (insecure.txt on the boot
++// partition, where the SSH keys go) switches the login off: the way back in
++// when the password is forgotten.
++//
++// Checked for every request before civetweb handles it (begin_request): a
++// page without a session goes to /login.html, an API call gets 401. Open
++// without a login: the login page and what it loads, /api/v1/auth/*, and
++// requests from the CosmosEx itself (127.0.0.1: the screen saver, scripts).
++//
++//   POST /api/v1/auth/login   {"password": "..."} -> session cookie
++//   POST /api/v1/auth/logout
++//   GET  /api/v1/auth/status  {"required", "loggedIn", "enabled", "insecureFile", "defaultPassword"}
++
++#include <string>
++
++struct mg_connection;
++
++#define WEBUI_LOGIN_KEY         "WEBUI_LOGIN"
++#define WEBUI_PWHASH_KEY        "WEBUI_PWHASH"
++#define WEBUI_DEFAULT_PASSWORD  "thisisinsecure"
++#ifndef WEBUI_INSECURE_FILE
++#define WEBUI_INSECURE_FILE     "/boot/insecure.txt"
++#endif
++
++class WebAuth
++{
++public:
++    // civetweb begin_request callback: 0 = go on, 1 = answered here
++    static int beginRequest(struct mg_connection *conn);
++
++    // for the settings API (section "weblogin")
++    static bool enabled(void);              // WEBUI_LOGIN
++    static bool insecureFile(void);         // insecure.txt present
++    static bool defaultPassword(void);      // no password set yet
++    static bool setEnabled(bool on);
++    static bool setPassword(const std::string &password, struct mg_connection *keepSessionOf);
++
++private:
++    static bool required(void);
++    static bool checkPassword(const std::string &password);
++    static bool validSession(struct mg_connection *conn, std::string *token);
++};
++
++#endif
+diff --git a/ce_main_app/webserver/webserver.cpp b/ce_main_app/webserver/webserver.cpp
+index a9fee64b..7ebf7975 100644
+--- a/ce_main_app/webserver/webserver.cpp
++++ b/ce_main_app/webserver/webserver.cpp
+@@ -2,6 +2,7 @@
+ #include <list>
+ 
+ #include "webserver.h"
++#include "webauth.h"
+ 
+ #include "../debug.h"
+ 
+@@ -33,6 +34,7 @@ void WebServer::start()
+     struct mg_callbacks callbacks;
+     memset(&callbacks, 0, sizeof(callbacks));
+     callbacks.upload = WebServer::onUpload; 
++    callbacks.begin_request = WebAuth::beginRequest;       // login for the web interface (webauth.h)
+ 
+     pxServer=new CivetServer(options,&callbacks);
+     if( pxServer->getContext()==NULL ){
+-- 
+2.54.0 (Apple Git-157)
+

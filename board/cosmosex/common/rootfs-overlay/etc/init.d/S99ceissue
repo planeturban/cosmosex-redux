@@ -1,0 +1,24 @@
+#!/bin/sh
+# HDMI login banner: write it before getty starts, again once the app and
+# network have had time to come up, and from then on at the start of every
+# minute (it shows the time, which may only get set long after the start:
+# no network at first). dhcpcd also refreshes it on address changes.
+
+case "$1" in
+start)
+	/usr/bin/ce-issue
+	(
+		sleep 15
+		while :; do
+			/usr/bin/ce-issue refresh
+			sleep $((60 - $(date +%s) % 60))
+		done
+	) &
+	;;
+stop|restart)
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac

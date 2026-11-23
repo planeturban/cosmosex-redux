@@ -1,0 +1,123 @@
+From d54f002059c41f73a110f59ea732a4999df92433 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:01:17 +0100
+Subject: [PATCH] ce_main_app: find USB drives when /dev/disk/by-uuid appears
+ later
+
+The app watches /dev/disk/by-uuid (by-id for raw mounts) with inotify.
+udev makes that folder, so when the app starts before udev has run (the
+Buildroot image starts the app first), the watch fails and USB drives
+are never found until the app is restarted; a stick plugged in at boot
+stays invisible.
+
+Retry the watch every second of the periodic loop while it's missing
+and look for devices once the folder is there; drop the watch on
+IN_IGNORED (folder removed) and watch again when it's back; go through
+all events of one read; and treat a missing folder as "all devices
+detached" (lookForDevChanges() returned before detaching anything).
+---
+ ce_main_app/devfinder.cpp      |  9 +++----
+ ce_main_app/periodicthread.cpp | 44 +++++++++++++++++++++++++++++-----
+ 2 files changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/ce_main_app/devfinder.cpp b/ce_main_app/devfinder.cpp
+index 077701d1..fc23c14c 100644
+--- a/ce_main_app/devfinder.cpp
++++ b/ce_main_app/devfinder.cpp
+@@ -37,12 +37,13 @@ void DevFinder::lookForDevChanges(void)
+     devpath = shared.mountRawNotTrans ? DISK_LINKS_PATH_ID : DISK_LINKS_PATH_UUID;
+ 	
+ 	DIR *dir = opendir(devpath);							// try to open the dir
+-	
+-    if(dir == NULL) {                                 				// not found?
+-        return;
+-    }
+ 
+ 	clearFoundFlags();												// mark all items in map as not found yet
++
++    if(dir == NULL) {                                 				// not found? (udev removes it with the last disk) then all are gone
++        findAndSignalDettached();
++        return;
++    }
+ 	
+ 	while(1) {                                                  	// while there are more files, store them
+ 		struct dirent *de = readdir(dir);							// read the next directory entry
+diff --git a/ce_main_app/periodicthread.cpp b/ce_main_app/periodicthread.cpp
+index c6183202..bb854966 100644
+--- a/ce_main_app/periodicthread.cpp
++++ b/ce_main_app/periodicthread.cpp
+@@ -58,6 +58,20 @@ static void fillNetworkDisplayLines(void);
+ 
+ volatile DWORD whenCanStartInstall;         // if this DWORD has non-zero value, then it's a time when this app should be terminated for installing update
+ 
++// Watch the disk links folder for devices coming and going; -1 while it
++// doesn't exist (logged only when logMissing)
++static int addDiskLinksWatch(int inotifyFd, bool logMissing)
++{
++    const char * path = shared.mountRawNotTrans ? DISK_LINKS_PATH_ID : DISK_LINKS_PATH_UUID;
++    int wd = inotify_add_watch(inotifyFd, path, IN_CREATE|IN_DELETE);
++    if(wd < 0) {
++        if(logMissing) Debug::out(LOG_DEBUG, "inotify_add_watch(%s): %s, will watch when it appears", path, strerror(errno));
++    } else if(!logMissing) {
++        Debug::out(LOG_DEBUG, "inotify_add_watch(%s): folder appeared, watching it", path);
++    }
++    return wd;
++}
++
+ void *periodicThreadCode(void *ptr)
+ {
+     fd_set readfds;
+@@ -79,9 +93,7 @@ void *periodicThreadCode(void *ptr)
+         Debug::out(LOG_ERROR, "inotify_init() failed");
+     } else {
+         // TODO : update wd when configuration is changed
+-        const char * path = shared.mountRawNotTrans ? DISK_LINKS_PATH_ID : DISK_LINKS_PATH_UUID;
+-        wd = inotify_add_watch(inotifyFd, path, IN_CREATE|IN_DELETE);
+-        if(wd < 0) Debug::out(LOG_ERROR, "inotify_add_watch(%s, IN_CREATE|IN_DELETE) failed", path);
++        wd = addDiskLinksWatch(inotifyFd, true);
+     }
+ 
+     fillNetworkDisplayLines();
+@@ -109,6 +121,19 @@ void *periodicThreadCode(void *ptr)
+             }
+         }
+ 
++        //------------------------------------
++        // The disk links folder (/dev/disk/by-uuid or by-id) is made by udev
++        // only while a disk with such a link is attached, and removed with the
++        // last one: it's missing when the app starts before udev or with no
++        // USB disk, and goes away when the last disk is unplugged. Watch for
++        // it to (re)appear, then look for the devices that came with it.
++        if(inotifyFd >= 0 && wd < 0) {
++            wd = addDiskLinksWatch(inotifyFd, false);
++            if(wd >= 0) {
++                devFinder.lookForDevChanges();
++            }
++        }
++
+         //------------------------------------
+         // should we do something related to devFinder?
+         if(shared.devFinder_detachAndLook || shared.devFinder_look) {   // detach devices & look for them again, or just look for them?
+@@ -201,9 +226,16 @@ void *periodicThreadCode(void *ptr)
+             if(res < 0) {
+                 Debug::out(LOG_ERROR, "read(inotifyFd) : %s", strerror(errno));
+             } else {
+-                struct inotify_event *iev = (struct inotify_event *)buf;
+-                Debug::out(LOG_DEBUG, "inotify msg %dbytes wd=%d mask=%04x name=%s", (int)res, iev->wd, iev->mask, (iev->len > 0) ? iev->name : "");
+-                // if(iev->mask & IN_DELETE) / & IN_CREATE
++                // one read can return several events
++                for(ssize_t off = 0; off + (ssize_t) sizeof(struct inotify_event) <= res; ) {
++                    struct inotify_event *iev = (struct inotify_event *)(buf + off);
++                    Debug::out(LOG_DEBUG, "inotify msg %dbytes wd=%d mask=%04x name=%s", (int)res, iev->wd, iev->mask, (iev->len > 0) ? iev->name : "");
++                    if(iev->wd == wd && (iev->mask & IN_IGNORED)) {     // the folder was removed (last disk unplugged): watch again when it's back
++                        Debug::out(LOG_DEBUG, "disk links folder removed, waiting for it to come back");
++                        wd = -1;
++                    }
++                    off += sizeof(struct inotify_event) + iev->len;
++                }
+                 devFinder.lookForDevChanges();                          // look for devices attached / detached
+             }
+         }
+-- 
+2.54.0 (Apple Git-157)
+

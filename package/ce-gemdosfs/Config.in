@@ -1,0 +1,10 @@
+config BR2_PACKAGE_CE_GEMDOSFS
+	bool "ce-gemdosfs"
+	depends on !BR2_STATIC_LIBS
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_LIBFUSE3
+	help
+	  FUSE translator for Atari hard disk images: GEMDOS partitions
+	  with logical sectors over 4 KB shown with a 512-byte-sector boot
+	  sector (the same file system for Linux's FAT driver), and
+	  byte-swapped images swapped back. Used by ce-hdinspect.

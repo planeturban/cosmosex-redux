@@ -1,0 +1,6 @@
+config BR2_PACKAGE_CE_WEBUI_FONTS
+	bool
+	help
+	  Fonts for the CosmosEx web UI (Barlow, Barlow Condensed,
+	  JetBrains Mono; Fontsource woff2, Latin subset, OFL).
+	  Downloaded only; the ce-webui package installs them.

@@ -1,0 +1,78 @@
+#!/bin/sh
+# Collect diagnostics into one file for the developer.
+# Writes /tmp/ce-report.txt and copies it to the boot partition, so it can be
+# read on a PC even when networking doesn't work.
+
+# Needs root (logs, dmesg, boot partition); user ce re-runs itself via sudo.
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+
+OUT=/tmp/ce-report.txt
+
+section() {
+	echo
+	echo "===== $* ====="
+}
+
+{
+	section "date / uptime / kernel"
+	date; uptime; uname -a; cat /proc/cmdline
+
+	section "image"
+	cat /etc/os-release 2>/dev/null; lsb_release -a
+
+	section "processes"
+	ps -A -o pid,ppid,etime,args
+
+	section "devices"
+	ls -l /dev/serial0 /dev/ttyAMA0 /dev/ttyS0 2>&1
+	ls -l /dev/disk/by-uuid /dev/disk/by-id /dev/disk/by-label /dev/input/by-path 2>&1
+
+	section "mounts / disk"
+	cat /proc/mounts; df -h
+
+	section "network"
+	ip addr 2>/dev/null || ifconfig -a; ip route 2>/dev/null || route -n; cat /etc/resolv.conf 2>&1
+
+	section "chip firmware versions (/ce/update)"
+	for f in /ce/update/*.version /ce/update/*.current; do
+		[ -e "$f" ] && echo "$f: $(cat "$f")"
+	done
+	ls -l /ce/update/xilinx_used.version 2>&1
+
+	section "settings (/ce/settings)"
+	for f in /ce/settings/*; do
+		[ -e "$f" ] || continue
+		case "$(basename "$f")" in
+		*PASSWORD*|*PWHASH*|*PSK*) echo "$(basename "$f")=(hidden)" ;;
+		*) echo "$(basename "$f")=$(cat "$f")" ;;
+		esac
+	done
+
+	section "/var/log/ceapp-init.log"
+	cat /var/log/ceapp-init.log 2>&1
+
+	section "/var/log/ce.log (last 300 lines)"
+	tail -n 300 /var/log/ce.log 2>&1
+
+	section "/var/log/ce_update.log (last 100 lines)"
+	tail -n 100 /var/log/ce_update.log 2>&1
+
+	section "/var/log/messages (last 200 lines)"
+	tail -n 200 /var/log/messages 2>&1
+
+	section "dmesg"
+	dmesg
+} > "$OUT" 2>&1
+
+# Run via sudo: give the report to the user who asked for it (for scp)
+[ -n "$SUDO_UID" ] && chown "$SUDO_UID:$SUDO_GID" "$OUT"
+chmod 600 "$OUT"
+
+if mount -o remount,rw /boot 2>/dev/null; then
+	cp "$OUT" /boot/ce-report.txt
+	sync
+	mount -o remount,ro /boot
+	echo "Report written to $OUT and to the boot partition (ce-report.txt)."
+else
+	echo "Report written to $OUT (could not write to the boot partition)."
+fi

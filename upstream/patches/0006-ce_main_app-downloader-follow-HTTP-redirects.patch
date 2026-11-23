@@ -1,0 +1,42 @@
+From b11921b46e11ea8029a8ead20748130df68576b0 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 12:18:58 +0100
+Subject: [PATCH 6/8] ce_main_app: downloader: follow HTTP redirects
+
+The downloader didn't follow redirects, so a moved file was saved as the
+server's "301 Moved Permanently" page. Floppy images in the current
+upstream image list on exxosforum.co.uk now redirect to
+www.exxosforum.co.uk: every such download "worked" but gave a 162-byte
+HTML page instead of the zip (and the insert failed). Follow up to 5
+redirects, to http/https only.
+
+On a libcurl older than 7.85 the same limit is set with
+CURLOPT_REDIR_PROTOCOLS.
+---
+ ce_main_app/downloader.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/ce_main_app/downloader.cpp b/ce_main_app/downloader.cpp
+index 7f81bf2c..2977911c 100644
+--- a/ce_main_app/downloader.cpp
++++ b/ce_main_app/downloader.cpp
+@@ -551,6 +551,16 @@ void Downloader::run(void)
+         curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION,    my_progress_func);
+         curl_easy_setopt(curl, CURLOPT_PROGRESSDATA,        &downloadCurrent);
+         curl_easy_setopt(curl, CURLOPT_FAILONERROR,         true);
++        // Follow redirects (e.g. exxosforum.co.uk -> www.exxosforum.co.uk,
++        // where many library images are): without this the "moved" page was
++        // saved as the image. Only to http/https, at most 5.
++        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,      1L);
++        curl_easy_setopt(curl, CURLOPT_MAXREDIRS,           5L);
++#if LIBCURL_VERSION_NUM >= 0x075500
++        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
++#else
++        curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,     (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
++#endif
+ 
+         cres = curl_easy_perform(curl);                      // start the transfer
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,7 @@
+# Sourced by dhcpcd-run-hooks: refresh the HDMI login banner when an address
+# appears or goes away (renewals don't change it).
+case "$reason" in
+BOUND|REBOOT|STATIC|IPV4LL|EXPIRE|RELEASE|STOP|NOCARRIER|CARRIER|TIMEOUT|FAIL)
+	/usr/bin/ce-issue refresh &
+	;;
+esac

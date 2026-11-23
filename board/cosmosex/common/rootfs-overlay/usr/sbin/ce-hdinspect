@@ -1,0 +1,501 @@
+#!/bin/sh
+# Look inside a hard disk image: its partitions (PC/MBR or Atari AHDI/ICD
+# root sector), and the files of those the Linux kernel can read (FAT/GEMDOS
+# with logical sectors up to 4096 bytes, ext2/3/4 as used by MiNT). For the
+# web interface (the app's /api/v1/settings/hddimage/inspect); read-only all
+# the way: the image through a read-only loop device, each partition mounted
+# ro (and nodev, nosuid, noexec) below /run. Closed after 5 idle minutes.
+#
+#   ce-hdinspect parts <image>                 key=value lines; one "part=" line per partition:
+#                                              part=<n>|<start sector>|<size MB>|<type>|<label>
+#   ce-hdinspect ls <image> <part> <dir>       one line per entry: <d|f|l|o>\t<size>\t<mtime>\t<name>
+#   ce-hdinspect cat <image> <part> <file>     the file on stdout
+#   ce-hdinspect close [<image>]               unmount and detach (all without an image)
+#   ce-hdinspect mount <image> <part>          for ce-files (Files page): root=, writable=, fs=fat|ext
+#
+# Changing an image (only when the ST has it attached on no ID at all: the ST
+# keeps its own copy of the FAT and folders and would overwrite the changes):
+#   ce-hdinspect put <image> <part> <dir> <name> <size> [overwrite]
+#                                              stdin -> a new file; name=<as stored>
+#   ce-hdinspect mkdir <image> <part> <dir> <name>
+#   ce-hdinspect rm <image> <part> <path>      a file, or a folder with what's in it
+# Each opens the image writable just for that change (its own loop device and
+# mount), writes, syncs and closes it again; one change at a time (flock), and
+# $RUN/writing names the image meanwhile (the app refuses to attach it). On
+# FAT (GEMDOS) partitions names become 8.3 in capitals, as TOS needs them (no
+# long-name entries); ext2 (MiNT) keeps them.
+#
+# Refuses an image the ST has attached read-write (HDDIMAGE_<id> without RO):
+# the ST caches and writes it, so a view would be inconsistent. Partition 0
+# is the whole image (a disk without a partition table).
+
+RUN=/run/ce-hdinspect
+IDLE=300
+LIST_MAX=2000
+GEMDOSFS=/usr/sbin/ce-gemdosfs
+CONF=/data/ce-files.conf
+
+mkdir -p "$RUN"
+chmod 700 "$RUN"
+
+# a file's size without reading it (no stat in this image)
+fsize() { ls -ln "$1" 2>/dev/null | awk '{ print $5 + 0 }'; }
+
+die() { echo "error=$*"; exit 1; }
+
+key_of() { echo "$1" | md5sum | cut -c1-16; }
+
+# attached read-write to an ID?
+attached_rw() {
+	for f in /ce/settings/HDDIMAGE_[0-7] /ce/settings/HDDIMAGE; do
+		[ -f "$f" ] || continue
+		v=$(cat "$f"); v=${v%% }
+		case "$v" in
+			"$1") return 0 ;;                  # no " RO": the ST may write
+		esac
+	done
+	return 1
+}
+
+# attached to an ID at all (also read-only)?
+attached_any() {
+	for f in /ce/settings/HDDIMAGE_[0-7] /ce/settings/HDDIMAGE; do
+		[ -f "$f" ] || continue
+		v=$(cat "$f"); v=${v%% }
+		for suffix in " RO" " READONLY" " READ_ONLY"; do v=${v%"$suffix"}; done
+		[ "$v" = "$1" ] && return 0
+	done
+	return 1
+}
+
+# Writing through ce-gemdosfs (GEMDOS partitions with logical sectors over
+# 4 KB, byte-swapped images) is an experimental setting (Config, Files page:
+# GEMDOS_WRITE=yes in $CONF); reading them is always on.
+gemdos_write() { grep -qx 'GEMDOS_WRITE=yes' "$CONF" 2>/dev/null; }
+
+# byte-swapped (some IDE/Falcon images made by emulators): the PC boot
+# signature, or the Atari root sector's partition IDs, only make sense swapped
+is_swapped() {
+	[ "$(od -An -tx1 -j 510 -N2 "$1" | tr -d ' ')" = aa55 ] && return 0
+	set -- $(od -An -tx1 -j 454 -N4 "$1")
+	case "$1:$3:$4" in 47:4d:45|42:4d:47|58:4d:47) return 0 ;; esac   # GEM, BGM, XGM swapped
+	return 1
+}
+
+# unmount (a FUSE mount right after its loop device is let go: maybe a moment)
+unmount_retry() {
+	mountpoint -q "$1" || return 0
+	umount "$1" 2>/dev/null && return 0
+	sleep 0.5
+	umount "$1" 2>/dev/null
+}
+
+# (returns 1 and keeps the session when a partition can't be unmounted, e.g.
+# a file in it is open: never rm -rf through a mounted, maybe writable, one)
+close_session() {     # session folder
+	d=$1
+	[ -d "$d" ] || return 0
+	sync
+	for m in "$d"/mnt-*; do
+		[ -d "$m" ] || continue
+		if mountpoint -q "$m"; then umount "$m" 2>/dev/null || return 1; fi
+		rmdir "$m" 2>/dev/null
+	done
+	for m in "$d"/mnt-*; do mountpoint -q "$m" 2>/dev/null && return 1; done
+	# big-sector partitions: their loop device, then their translator
+	for b in "$d"/big-*.loop; do [ -f "$b" ] && losetup -d "$(cat "$b")" 2>/dev/null; rm -f "$b" "${b%.loop}.mode" "${b%.loop}.why"; done
+	for m in "$d"/big-*; do
+		[ -d "$m" ] || continue
+		unmount_retry "$m" || return 1
+		rmdir "$m" 2>/dev/null
+	done
+	[ -f "$d/loop" ] && losetup -d "$(cat "$d/loop")" 2>/dev/null
+	rm -f "$d/loop"
+	if [ -d "$d/swap" ]; then unmount_retry "$d/swap" || return 1; rmdir "$d/swap" 2>/dev/null; fi
+	rm -f "$d/image" "$d/stamp" "$d/mode" "$d/idle" "$d/src" "$d"/mnt-*.mode "$d"/mnt-*.why
+	rmdir "$d" 2>/dev/null
+	return 0
+}
+
+# opening and closing sessions, one at a time
+session_lock() {
+	exec 8> "$RUN/session.lock"
+	flock -w 30 8 || die "Busy: try again."
+}
+
+# the session's loop device with the image's partitions (mode ro|rw) -> LOOP;
+# a byte-swapped image through ce-gemdosfs --swap first
+loop_image() {     # image mode
+	src=$1
+	if is_swapped "$1"; then
+		[ -x "$GEMDOSFS" ] || return 1
+		mkdir -p "$S/swap"
+		sw=; [ "$2" = rw ] && sw=--rw
+		# (the translator stays as a daemon: without the locks this script holds)
+		mountpoint -q "$S/swap" || "$GEMDOSFS" --swap $sw "$1" 0 "$(fsize "$1")" "$S/swap" 8>&- 9>&- || return 1
+		src=$S/swap/part
+	fi
+	echo "$src" > "$S/src"
+	LOOP=$(losetup -f 2>/dev/null)
+	ro=-r; [ "$2" = rw ] && ro=
+	[ -n "$LOOP" ] && losetup $ro -P "$LOOP" "$src" 2>/dev/null
+}
+
+# the session for an image: loop device with partitions, read-only
+open_session() {     # image -> sets S (folder) and LOOP
+	img=$1
+	[ -f "$img" ] || die "No such image."
+	attached_rw "$img" && die "The ST has this image attached (read-write): detach it or make it read-only first."
+	[ "$(cat "$RUN/writing" 2>/dev/null)" = "$img" ] && die "A change is being written to this image: try again in a moment."
+	S=$RUN/$(key_of "$img")
+	if [ -f "$S/loop" ] && [ -b "$(cat "$S/loop")" ]; then
+		LOOP=$(cat "$S/loop")                   # (also a writable one of the Files page: reading is fine)
+	else
+		session_lock
+		close_session "$S" || die "The image is in use: try again in a moment."
+		mkdir -p "$S"
+		loop_image "$img" ro || { close_session "$S"; die "Can't open the image (no free loop device?)."; }
+		echo "$LOOP" > "$S/loop"
+		echo "$img" > "$S/image"
+		echo ro > "$S/mode"
+		sleep 1                                 # the partitions appear
+	fi
+	touch "$S/stamp"
+	start_watch
+}
+
+part_dev() {     # part number -> device
+	if [ "$1" = 0 ]; then echo "$LOOP"; else echo "${LOOP}p$1"; fi
+}
+
+fstype() { blkid "$1" 2>/dev/null | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p'; }
+fslabel() { blkid "$1" 2>/dev/null | sed -n 's/.* LABEL="\([^"]*\)".*/\1/p'; }
+probe_val() { echo "$PROBE" | sed -n "s/^$1=//p"; }
+
+# a partition as Linux can mount it (part, mode ro|rw) -> DEV, FS (fat|ext),
+# RW (rw|ro: a big-sector one is writable only with the experimental setting
+# and a root folder that fills its sectors)
+part_mountable() {
+	dev=$(part_dev "$1")
+	[ -b "$dev" ] || die "No partition $1 in this image."
+	DEV=$dev; RW=$2
+	t=$(fstype "$dev")
+	case "$t" in
+		vfat|msdos) FS=fat; return 0 ;;
+		ext2|ext3|ext4) FS=ext; return 0 ;;
+		'') ;;
+		*) die "This CosmosEx can't read $t partitions." ;;
+	esac
+	# GEMDOS that Linux doesn't read as it is (logical sectors over 4 KB, or
+	# a FAT16 with under 4085 clusters): through ce-gemdosfs --bpb
+	[ -x "$GEMDOSFS" ] || die "No file system found on partition $1 (maybe an Atari partition Linux can't read)."
+	B=$S/big-$1
+	FS=fat
+	if [ -f "$B.loop" ] && [ -b "$(cat "$B.loop")" ]; then DEV=$(cat "$B.loop"); RW=$(cat "$B.mode"); RO_WHY=$(cat "$B.why" 2>/dev/null); return 0; fi
+	PROBE=$("$GEMDOSFS" --probe "$dev" 0 2>/dev/null)
+	if [ "$(probe_val ok)" != yes ]; then
+		why=$(probe_val why)
+		die "No file system Linux can read on partition $1${why:+: $why}."
+	fi
+	if [ "$RW" = rw ]; then
+		if ! gemdos_write; then RW=ro; RO_WHY=experimental
+		elif [ "$(probe_val rootfill)" != yes ]; then RW=ro; RO_WHY=rootfill; fi
+	fi
+	mkdir -p "$B"
+	sz=$(( $(cat "/sys/class/block/${dev##*/}/size") * 512 ))
+	w=; [ "$RW" = rw ] && w=--rw
+	mountpoint -q "$B" || "$GEMDOSFS" --bpb $w "$dev" 0 "$sz" "$B" 8>&- 9>&- || die "Can't open partition $1 (big sectors)."
+	L=$(losetup -f 2>/dev/null)
+	ro=-r; [ "$RW" = rw ] && ro=
+	[ -n "$L" ] && losetup $ro "$L" "$B/part" 2>/dev/null || die "Can't open partition $1 (no free loop device?)."
+	echo "$L" > "$B.loop"
+	echo "$RW" > "$B.mode"
+	echo "$RO_WHY" > "$B.why"
+	DEV=$L
+}
+
+# mount a partition read-only (once) -> sets M
+mount_part() {     # part
+	case "$1" in ''|*[!0-9]*) die "Which partition?" ;; esac
+	M=$S/mnt-$1
+	mountpoint -q "$M" && return 0
+	part_mountable "$1" ro
+	mkdir -p "$M"
+	case "$FS" in
+		fat) mount -t vfat -o ro,nodev,nosuid,noexec,shortname=mixed,uid=0,gid=0,fmask=0222,dmask=0222 "$DEV" "$M" 2>/dev/null ||
+			die "Can't read this FAT partition." ;;
+		ext) mount -t ext4 -o ro,noload,nodev,nosuid,noexec "$DEV" "$M" 2>/dev/null || die "Can't read this ext partition." ;;
+	esac
+}
+
+# a path inside the mounted partition (no way out, also not through symlinks)
+inside() {     # path in the partition -> sets P
+	case "$1" in *..*) die "No .. in paths." ;; esac
+	P=$(realpath "$M/${1#/}" 2>/dev/null) || die "No such file or folder."
+	case "$P" in "$M"|"$M"/*) ;; *) die "That leads outside the partition." ;; esac
+}
+
+start_watch() {
+	[ -f "$RUN/watch.pid" ] && kill -0 "$(cat "$RUN/watch.pid")" 2>/dev/null && return 0
+	( while :; do
+		sleep 30
+		left=0
+		for d in "$RUN"/*/; do
+			[ -f "$d/stamp" ] || continue
+			age=$(( $(date +%s) - $(date -r "$d/stamp" +%s) ))
+			idle=$(cat "$d/idle" 2>/dev/null); idle=${idle:-$IDLE}
+			if [ "$age" -ge "$idle" ]; then
+				( flock -w 10 8 && close_session "${d%/}" ) 8> "$RUN/session.lock" || left=1
+			else
+				left=1
+			fi
+		done
+		[ $left = 0 ] && { rm -f "$RUN/watch.pid"; exit 0; }
+	done ) > /dev/null 2>&1 8>&- 9>&- &     # (not holding the callers' locks)
+	echo $! > "$RUN/watch.pid"
+}
+
+# a partition's type|label for the list: big GEMDOS sectors through the probe
+# (unreadable: no type, why in the label)
+ptype() {
+	t=$(fstype "$1")
+	if [ -n "$t" ]; then echo "$t|$(fslabel "$1")"; return; fi
+	[ -x "$GEMDOSFS" ] || { echo "|"; return; }
+	PROBE=$("$GEMDOSFS" --probe "$1" 0 2>/dev/null)
+	if [ "$(probe_val ok)" = yes ]; then
+		b=$(probe_val bps)
+		[ "$b" -ge 1024 ] && b="$((b / 1024)) KB" || b="$b-byte"
+		[ "$(probe_val few)" = yes ] && b="$b sectors, small FAT16" || b="$b sectors"
+		echo "gemdos $b|"
+	elif [ "$(probe_val bps)" != 0 ] && [ -n "$(probe_val bps)" ]; then echo "|$(probe_val why)"
+	else echo "|"; fi
+}
+
+do_parts() {
+	open_session "$1"
+	size=$(fsize "$1")              # (no stat in this image)
+	echo "image=$1"
+	echo "sizeMB=$((size / 1048576))"
+	# byte-swapped (some IDE/Falcon images made by emulators): the boot
+	# signature only matches swapped
+	src=$(cat "$S/src" 2>/dev/null); src=${src:-$1}
+	[ "$src" != "$1" ] && echo "swapped=yes"     # (read through ce-gemdosfs --swap)
+	n=0
+	for p in /sys/block/${LOOP##*/}/${LOOP##*/}p*; do
+		[ -d "$p" ] || continue
+		num=${p##*p}
+		dev=/dev/${p##*/}
+		echo "part=$num|$(cat "$p/start")|$(( $(cat "$p/size") / 2048 ))|$(ptype "$dev")"
+		n=$((n + 1))
+	done
+	if [ $n = 0 ]; then                         # no table: a file system on the whole image?
+		t=$(ptype "$LOOP")
+		[ "${t%%|*}" != "" ] && echo "part=0|0|$((size / 1048576))|$t"
+	fi
+	# the partition table type, from the first sector
+	if od -An -c -j 455 -N3 "$src" | tr -d ' ' | grep -qE 'GEM|BGM|XGM'; then echo "table=atari"
+	elif [ "$(od -An -tx1 -j 510 -N2 "$src" | tr -d ' ')" = 55aa ]; then echo "table=pc"
+	else echo "table=none"; fi
+}
+
+do_ls() {
+	open_session "$1"; mount_part "$2"; inside "${3:-/}"
+	[ -d "$P" ] || die "Not a folder."
+	n=0
+	for f in "$P"/* "$P"/.[!.]* "$P"/..?*; do
+		[ -e "$f" ] || [ -L "$f" ] || continue
+		n=$((n + 1)); [ $n -gt $LIST_MAX ] && { echo "more=yes"; break; }
+		if [ -L "$f" ]; then t=l; elif [ -d "$f" ]; then t=d; elif [ -f "$f" ]; then t=f; else t=o; fi
+		sz=0; [ "$t" = f ] && sz=$(fsize "$f")
+		# date -r follows symlinks: a link's time would be its target's,
+		# maybe a file of the CosmosEx itself (/etc/shadow): none for links
+		mt=0; [ "$t" = l ] || mt=$(date -r "$f" +%s 2>/dev/null || echo 0)
+		printf '%s\t%s\t%s\t%s\n' "$t" "${sz:-0}" "$mt" "${f##*/}"
+	done
+}
+
+do_cat() {
+	open_session "$1"; mount_part "$2"; inside "$3"
+	[ -f "$P" ] || die "Not a file."
+	cat "$P"
+}
+
+# ---------------------------------------------------------------- mount (Files page)
+
+# a partition for ce-files: writable while the ST has the image on no ID,
+# read-only while it's attached read-only (refused read-write, as browsing);
+# a writable session closes after 2 idle minutes
+do_mount() {     # image part -> root=, writable=, fs=
+	img=$1
+	[ -f "$img" ] || die "No such image."
+	case "$2" in ''|*[!0-9]*) die "Which partition?" ;; esac
+	attached_rw "$img" && die "The ST has this image attached (read-write): detach it or make it read-only first."
+	[ "$(cat "$RUN/writing" 2>/dev/null)" = "$img" ] && die "A change is being written to this image: try again in a moment."
+	want=ro; RO_WHY=
+	if attached_any "$img"; then RO_WHY=attached
+	elif ! [ -w "$img" ]; then RO_WHY=file
+	else want=rw; fi
+	if [ "$want" = rw ] && is_swapped "$img" && ! gemdos_write; then want=ro; RO_WHY=experimental; fi   # (writing through --swap)
+	session_lock
+	S=$RUN/$(key_of "$img")
+	have=$(cat "$S/mode" 2>/dev/null); have=${have:-ro}
+	if [ -f "$S/loop" ] && [ -b "$(cat "$S/loop")" ] && [ "$have" = "$want" ]; then
+		LOOP=$(cat "$S/loop")
+	else
+		close_session "$S" || die "The image is in use (a file in it is open): try again in a moment."
+		mkdir -p "$S"
+		loop_image "$img" "$want" || { close_session "$S"; die "Can't open the image (no free loop device?)."; }
+		echo "$LOOP" > "$S/loop"
+		echo "$img" > "$S/image"
+		echo "$want" > "$S/mode"
+		[ "$want" = rw ] && echo 120 > "$S/idle"
+		for i in 1 2 3 4 5 6 7 8 9 10; do                 # the partitions appear
+			[ "$2" = 0 ] || [ -b "${LOOP}p$2" ] && break
+			sleep 0.2
+		done
+	fi
+	touch "$S/stamp"
+	start_watch
+	M=$S/mnt-$2
+	part_mountable "$2" "$want"
+	if mountpoint -q "$M"; then
+		RW=$(cat "$M.mode" 2>/dev/null || echo "$RW")
+		RO_WHY=$(cat "$M.why" 2>/dev/null)
+	else
+		mkdir -p "$M"
+		if [ "$RW" = rw ]; then
+			case $FS in
+				fat) mount -t vfat -o rw,nodev,nosuid,noexec,flush,shortname=winnt,uid=0,gid=0 "$DEV" "$M" 2>/dev/null ;;
+				ext) mount -t ext4 -o rw,nodev,nosuid,noexec "$DEV" "$M" 2>/dev/null ;;
+			esac
+		else
+			case $FS in
+				fat) mount -t vfat -o ro,nodev,nosuid,noexec,shortname=mixed,uid=0,gid=0,fmask=0222,dmask=0222 "$DEV" "$M" 2>/dev/null ;;
+				ext) mount -t ext4 -o ro,noload,nodev,nosuid,noexec "$DEV" "$M" 2>/dev/null ;;
+			esac
+		fi || { rmdir "$M"; die "Can't read this partition."; }
+		echo "$RW" > "$M.mode"
+		echo "$RO_WHY" > "$M.why"
+	fi
+	echo "root=$M"
+	echo "writable=$([ "$RW" = rw ] && echo yes || echo no)"
+	[ "$RW" = rw ] || echo "why_ro=${RO_WHY:-attached}"
+	echo "fs=$FS"
+}
+
+# ---------------------------------------------------------------- changes
+
+WLOOP=
+end_write() {
+	sync
+	[ -n "$W" ] && mountpoint -q "$W" && umount "$W" 2>/dev/null
+	[ -n "$WLOOP" ] && losetup -d "$WLOOP" 2>/dev/null
+	[ -n "$W" ] && rmdir "$W" 2>/dev/null
+	rm -f "$RUN/writing" "$RUN/upload.tmp"
+}
+
+# open a partition writable -> sets M (mounted), FS (fat|ext)
+open_write() {     # image part
+	img=$1
+	[ -f "$img" ] || die "No such image."
+	case "$2" in ''|*[!0-9]*) die "Which partition?" ;; esac
+	attached_any "$img" && die "The ST has this image attached: detach it first (the ST keeps its own copy of the folders and would undo the change)."
+	[ -w "$img" ] || die "This image can't be written (read-only file or drive)."
+	[ "$(od -An -tx1 -j 510 -N2 "$img" | tr -d ' ')" = aa55 ] && die "This image looks byte-swapped: it can only be looked at."
+	exec 9> "$RUN/write.lock"
+	flock -w 30 9 || die "Another change is being written: try again."
+	echo "$img" > "$RUN/writing"
+	trap end_write EXIT
+	close_session "$RUN/$(key_of "$img")" ||   # its read-only view would be out of date
+		die "The image is in use (a file in it is open): try again in a moment." 
+	WLOOP=$(losetup -f 2>/dev/null)
+	[ -n "$WLOOP" ] && losetup -P "$WLOOP" "$img" 2>/dev/null || { WLOOP=; die "Can't open the image (no free loop device?)."; }
+	sleep 1                                     # the partitions appear
+	if [ "$2" = 0 ]; then dev=$WLOOP; else dev=${WLOOP}p$2; fi
+	[ -b "$dev" ] || die "No partition $2 in this image."
+	W=$RUN/w-$$; mkdir -p "$W"
+	t=$(fstype "$dev")
+	case "$t" in
+		vfat|msdos) FS=fat
+			# shortname=winnt: a name in capitals that fits 8.3 gets no long-name entry
+			mount -t vfat -o rw,nodev,nosuid,noexec,shortname=winnt,uid=0,gid=0 "$dev" "$W" 2>/dev/null ||
+				die "Can't write this FAT partition (Atari partitions with logical sectors over 4 KB are beyond Linux)." ;;
+		ext2|ext3|ext4) FS=ext
+			mount -t ext4 -o rw,nodev,nosuid,noexec "$dev" "$W" 2>/dev/null || die "Can't write this ext partition." ;;
+		'') die "No file system found on partition $2." ;;
+		*) die "This CosmosEx can't write $t partitions." ;;
+	esac
+	M=$W
+}
+
+# a name as the partition stores it: FAT -> GEMDOS 8.3 in capitals
+fit_name() {
+	n=$1
+	case "$n" in ''|.|..|*/*) echo "Not a valid name."; return 1 ;; esac
+	if [ "$FS" = ext ]; then
+		[ ${#n} -le 255 ] || { echo "The name is too long."; return 1; }
+		echo "$n"; return 0
+	fi
+	u=$(printf '%s' "$n" | LC_ALL=C tr 'a-z' 'A-Z' | LC_ALL=C sed "s/[^A-Z0-9!#\$%&'()@^_\`{}~.-]/_/g")
+	case "$u" in *.*) b=${u%.*}; e=${u##*.} ;; *) b=$u; e= ;; esac
+	b=$(printf '%s' "$b" | tr -d . | cut -c1-8)
+	e=$(printf '%s' "$e" | cut -c1-3)
+	[ -n "$b" ] || { echo "Not a valid name."; return 1; }
+	echo "$b${e:+.$e}"
+}
+
+do_put() {     # image part dir name size [overwrite]
+	case "$5" in ''|*[!0-9]*) die "How big is the file?" ;; esac
+	open_write "$1" "$2"; inside "${3:-/}"
+	[ -d "$P" ] || die "Not a folder."
+	n=$(fit_name "$4") || die "$n"
+	if [ -e "$P/$n" ]; then
+		[ -d "$P/$n" ] && die "$n is a folder."
+		[ "$6" = overwrite ] || { echo "exists=$n"; die "$n is already there."; }
+	fi
+	freek=$(df -k "$M" | awk 'NR == 2 { print $4 }')
+	have=0; [ -f "$P/$n" ] && have=$(fsize "$P/$n")
+	[ $(( ($5 + 1023) / 1024 )) -le $(( freek + have / 1024 )) ] || die "Not enough room on this partition: $freek KB free."
+	tmp=$P/CEUPLOAD.TMP
+	head -c "$5" > "$tmp" || { rm -f "$tmp"; die "Writing the file failed (full?)."; }
+	[ "$(fsize "$tmp")" = "$5" ] || { rm -f "$tmp"; die "The upload was cut short."; }
+	mv -f "$tmp" "$P/$n" || { rm -f "$tmp"; die "Writing the file failed."; }
+	sync
+	echo "name=$n"
+	echo "size=$5"
+}
+
+do_mkdir() {     # image part dir name
+	open_write "$1" "$2"; inside "${3:-/}"
+	[ -d "$P" ] || die "Not a folder."
+	n=$(fit_name "$4") || die "$n"
+	[ -e "$P/$n" ] && die "$n is already there."
+	mkdir "$P/$n" || die "Can't make the folder."
+	sync
+	echo "name=$n"
+}
+
+do_rm() {     # image part path
+	open_write "$1" "$2"; inside "$3"
+	[ "$P" = "$M" ] && die "That's the whole partition."
+	[ -e "$P" ] || [ -L "$P" ] || die "No such file or folder."
+	rm -rf "$P" || die "Can't delete it."
+	sync
+	echo "deleted=${3##*/}"
+}
+
+case "$1" in
+	mount) do_mount "$2" "$3" ;;
+	put)   do_put "$2" "$3" "$4" "$5" "$6" "$7" ;;
+	mkdir) do_mkdir "$2" "$3" "$4" "$5" ;;
+	rm)    do_rm "$2" "$3" "$4" ;;
+	parts) [ -n "$2" ] || die "Which image?"; do_parts "$2" ;;
+	ls)    do_ls "$2" "$3" "$4" ;;
+	cat)   do_cat "$2" "$3" "$4" ;;
+	close)
+		session_lock
+		if [ -n "$2" ]; then close_session "$RUN/$(key_of "$2")" || die "The image is in use: a file in it is open."
+		else for d in "$RUN"/*/; do [ -d "$d" ] && close_session "${d%/}"; done; fi ;;
+	*) echo "usage: $0 parts <image> | ls <image> <part> <dir> | cat <image> <part> <file> | close [<image>]"
+	   echo "       $0 put <image> <part> <dir> <name> <size> [overwrite] | mkdir <image> <part> <dir> <name> | rm <image> <part> <path>"; exit 1 ;;
+esac

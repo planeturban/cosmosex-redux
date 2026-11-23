@@ -1,0 +1,1 @@
+root=/dev/mmcblk0p2 rootfstype=ext4 ro rootwait init=/sbin/ce-preinit console=tty1 quiet loglevel=3 logo.nologo consoleblank=0

@@ -1,0 +1,192 @@
+From 1d5005f9343b037233bb0f342d321841f64b61e8 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 09:53:17 +0100
+Subject: [PATCH] ce_main_app: local folders as translated drives
+ (/pi/translated_<letter>)
+
+Each folder /pi/translated_<letter> on the CosmosEx's own storage (the
+Buildroot image's /pi partition) becomes a translated drive with that
+letter on the Atari, e.g. /pi/translated_G is G:. Letters C to P only
+(GEMDOS has 16 drives). A folder whose letter is the shared or config
+drive's is skipped with a log line; USB drives skip the letters used by
+local folders. Scanned at start and when the translated drive settings
+change (new folders appear then). The Atari's "unmount drive" leaves
+them attached, as it does the shared and config drives. Status report:
+"local folder /pi/translated_G".
+
+LOCAL_DRIVES_ROOT (default /pi) is a define; without that folder nothing
+changes.
+---
+ ce_main_app/translated/translateddisk.h       | 10 +++
+ .../translated/translateddisk_general.cpp     | 74 ++++++++++++++++++-
+ 2 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/ce_main_app/translated/translateddisk.h b/ce_main_app/translated/translateddisk.h
+index c020a810..568d4cd1 100644
+--- a/ce_main_app/translated/translateddisk.h
++++ b/ce_main_app/translated/translateddisk.h
+@@ -73,6 +73,14 @@ typedef struct {
+ #define TRANSLATEDTYPE_NORMAL           0
+ #define TRANSLATEDTYPE_SHAREDDRIVE      1
+ #define TRANSLATEDTYPE_CONFIGDRIVE      2
++#define TRANSLATEDTYPE_LOCALFOLDER      3       // a folder on the CosmosEx's own storage: /pi/translated_<letter>
++
++// Local folders as drives: /pi/translated_G is G: on the Atari (letters C-P).
++// Their letters are reserved: USB drives skip them.
++#ifndef LOCAL_DRIVES_ROOT
++#define LOCAL_DRIVES_ROOT               "/pi"
++#endif
++#define LOCAL_DRIVES_PREFIX             "translated_"
+ 
+ #define MAX_FIND_STORAGES               32
+ 
+@@ -183,6 +191,7 @@ public:
+ private:
+ 	void mountAndAttachSharedDrive(void);
+ 	void attachConfigDrive(void);
++	void attachLocalFolders(void);
+ 
+     AcsiDataTrans       *dataTrans;
+     SettingsReloadProxy *reloadProxy;
+@@ -202,6 +211,7 @@ private:
+         int confDrive;
+ 
+         WORD readOnly;
++        WORD localFolders;                  // bit per letter used by a local folder (attachLocalFolders())
+     } driveLetters;
+ 
+     char asciiAtariToPc[256];
+diff --git a/ce_main_app/translated/translateddisk_general.cpp b/ce_main_app/translated/translateddisk_general.cpp
+index ef5a302b..4b9647f4 100644
+--- a/ce_main_app/translated/translateddisk_general.cpp
++++ b/ce_main_app/translated/translateddisk_general.cpp
+@@ -93,6 +93,7 @@ TranslatedDisk::TranslatedDisk(AcsiDataTrans *dt, ConfigService *cs, ScreencastS
+ 
+     loadSettings();
+ 
++    attachLocalFolders();                                               // /pi/translated_<letter> folders: their letters first
+     mountAndAttachSharedDrive();                                        // if shared drive is enabled, try to mount it and attach it
+     attachConfigDrive();                                                // if config drive is enabled, attach it
+ 
+@@ -179,11 +180,13 @@ void TranslatedDisk::reloadSettings(int type)
+ 
+     detachAll();                                // then deinit the conf structures
+ 
++    attachLocalFolders();                       // local folders keep their letters (scanned again: new folders appear)
++
+     int good = 0, bad = 0;
+     bool res;
+ 
+     for(int i=2; i<MAX_DRIVES; i++) {           // and now find new places
+-        if(!tmpConf[i].enabled) {       // skip the not used positions
++        if(!tmpConf[i].enabled || tmpConf[i].translatedType == TRANSLATEDTYPE_LOCALFOLDER) {       // skip the not used positions, local folders are done
+             continue;
+         }
+ 
+@@ -298,6 +301,62 @@ void TranslatedDisk::attachConfigDrive(void)
+     }
+ }
+ 
++// /pi/translated_<letter> folders become drives with that letter (C-P). A
++// letter that is the shared or config drive's is skipped (logged); USB
++// drives skip the letters used here.
++void TranslatedDisk::attachLocalFolders(void)
++{
++    driveLetters.localFolders = 0;
++
++    DIR *dir = opendir(LOCAL_DRIVES_ROOT);
++    if(!dir) {
++        return;
++    }
++
++    std::vector<std::string> names;
++    struct dirent *de;
++    while((de = readdir(dir)) != NULL) {
++        if(strncasecmp(de->d_name, LOCAL_DRIVES_PREFIX, strlen(LOCAL_DRIVES_PREFIX)) == 0 &&
++           strlen(de->d_name) == strlen(LOCAL_DRIVES_PREFIX) + 1) {
++            names.push_back(de->d_name);
++        }
++    }
++    closedir(dir);
++    std::sort(names.begin(), names.end());
++
++    for(size_t n=0; n<names.size(); n++) {
++        std::string path = std::string(LOCAL_DRIVES_ROOT "/") + names[n];
++        struct stat st;
++        if(stat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
++            continue;
++        }
++
++        char letter = toupper(names[n][names[n].length() - 1]);
++        if(letter < 'C' || letter > 'P') {
++            Debug::out(LOG_ERROR, "attachLocalFolders: %s: the letter must be C to P, skipped", path.c_str());
++            continue;
++        }
++        int index = letter - 'A';
++        if(index == driveLetters.shared || index == driveLetters.confDrive) {
++            Debug::out(LOG_ERROR, "attachLocalFolders: %s: %c: is the %s drive's letter, skipped", path.c_str(), letter, index == driveLetters.shared ? "shared" : "config");
++            continue;
++        }
++        if(driveLetters.localFolders & (1 << index)) {          // translated_g and translated_G
++            Debug::out(LOG_ERROR, "attachLocalFolders: %s: %c: is already used by another folder, skipped", path.c_str(), letter);
++            continue;
++        }
++        if(conf[index].enabled && conf[index].translatedType != TRANSLATEDTYPE_LOCALFOLDER) {
++            Debug::out(LOG_ERROR, "attachLocalFolders: %s: %c: is in use, skipped", path.c_str(), letter);
++            continue;
++        }
++
++        driveLetters.localFolders |= (1 << index);
++        attachToHostPathByIndex(index, path, TRANSLATEDTYPE_LOCALFOLDER, path);
++        conf[index].label = names[n];
++        Debug::out(LOG_INFO, "attachLocalFolders: %s is %c:", path.c_str(), letter);
++    }
++}
++
+ bool TranslatedDisk::attachToHostPath(std::string hostRootPath, int translatedType, std::string devicePath)
+ {
+     int index = -1;
+@@ -347,6 +406,11 @@ bool TranslatedDisk::attachToHostPath(std::string hostRootPath, int translatedTy
+             continue;
+         }
+ 
++        // if this letter is used by a local folder (/pi/translated_<letter>)
++        if(driveLetters.localFolders & (1 << i)) {
++            continue;
++        }
++
+         if(!conf[i].enabled) {              // not used yet?
+             index = i;                      // found one!
+             break;
+@@ -429,7 +493,7 @@ void TranslatedDisk::detachAllUsbMedia(void)
+ {
+     for(int i=0; i<MAX_DRIVES; i++) {               // go through the drives
+         // if it's shared drive, or it's a config drive, don't detach
+-        if(conf[i].translatedType == TRANSLATEDTYPE_SHAREDDRIVE || conf[i].translatedType == TRANSLATEDTYPE_CONFIGDRIVE) {
++        if(conf[i].translatedType == TRANSLATEDTYPE_SHAREDDRIVE || conf[i].translatedType == TRANSLATEDTYPE_CONFIGDRIVE || conf[i].translatedType == TRANSLATEDTYPE_LOCALFOLDER) {
+             continue;
+         }
+ 
+@@ -579,7 +643,7 @@ void TranslatedDisk::onUnmountDrive(BYTE *cmd)
+     }
+ 
+     // if shared drive or config drive, don't do anything
+-    if(conf[drive].translatedType == TRANSLATEDTYPE_SHAREDDRIVE || conf[drive].translatedType == TRANSLATEDTYPE_CONFIGDRIVE) {
++    if(conf[drive].translatedType == TRANSLATEDTYPE_SHAREDDRIVE || conf[drive].translatedType == TRANSLATEDTYPE_CONFIGDRIVE || conf[drive].translatedType == TRANSLATEDTYPE_LOCALFOLDER) {
+         dataTrans->setStatus(E_OK);
+         return;
+     }
+@@ -1766,6 +1830,10 @@ void TranslatedDisk::driveGetReport(int driveIndex, std::string &reportString)
+             reportString = "shared drive, ";
+             reportString += conf[driveIndex].devicePath;
+             break;
++        case TRANSLATEDTYPE_LOCALFOLDER:
++            reportString = "local folder ";
++            reportString += conf[driveIndex].hostRootPath;
++            break;
+         case TRANSLATEDTYPE_CONFIGDRIVE:
+             reportString = "config drive (located at ";
+             reportString += conf[driveIndex].devicePath;
+-- 
+2.54.0 (Apple Git-157)
+

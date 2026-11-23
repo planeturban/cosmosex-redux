@@ -1,0 +1,28 @@
+From 7c2809c295d87a19d7fb2078ce5cbf9b8bbdc1e4 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 18:16:56 +0100
+Subject: [PATCH] ce_main_app: network settings load logged at debug level
+
+The web interface's status request loads the network settings, about once
+a second while a page is open, and each load wrote an INFO line: ce.log
+filled to its 2 MB limit within hours, with nothing else in it.
+---
+ ce_main_app/config/netsettings.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ce_main_app/config/netsettings.cpp b/ce_main_app/config/netsettings.cpp
+index b9e9da9f..3a81c812 100644
+--- a/ce_main_app/config/netsettings.cpp
++++ b/ce_main_app/config/netsettings.cpp
+@@ -31,7 +31,7 @@ void NetworkSettings::initNetSettings(TNetInterface *neti)
+ 
+ void NetworkSettings::load(void)
+ {
+-    Debug::out(LOG_INFO, "NetworkSettings::load() - starting to load settings");
++    Debug::out(LOG_DEBUG, "NetworkSettings::load() - starting to load settings");     // also on every web status request: not at the default level
+ 
+     #ifdef DISTRO_YOCTO
+     loadOnYocto();
+-- 
+2.54.0 (Apple Git-157)
+

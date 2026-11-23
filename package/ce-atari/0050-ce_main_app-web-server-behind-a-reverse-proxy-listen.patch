@@ -1,0 +1,105 @@
+From efca36088579da5a98f8ceda1ebb828dfd2357dc Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:00:36 +0100
+Subject: [PATCH] ce_main_app: web server behind a reverse proxy: listening
+ address, client address
+
+- CE_WEBLISTEN (build time, default "80"): civetweb's listening_ports,
+  e.g. "127.0.0.1:8081" when nginx on the same machine is what the
+  network reaches.
+- Web login: requests from the CosmosEx itself need no login. Behind a
+  proxy every request comes from 127.0.0.1, so a connection from this
+  machine with an X-Real-IP header (which the proxy sets for every
+  request) counts as coming from the address in the header. The header
+  is ignored on connections from anywhere else.
+---
+ ce_main_app/webserver/webauth.cpp   | 24 +++++++++++++++++++++---
+ ce_main_app/webserver/webserver.cpp |  2 +-
+ ce_main_app/webserver/webserver.h   |  9 +++++++++
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/ce_main_app/webserver/webauth.cpp b/ce_main_app/webserver/webauth.cpp
+index 116bfdc9..f56ecef0 100644
+--- a/ce_main_app/webserver/webauth.cpp
++++ b/ce_main_app/webserver/webauth.cpp
+@@ -233,6 +233,25 @@ bool WebAuth::validSession(struct mg_connection *conn, std::string *token)
+ 
+ static bool startsWith(const char *s, const char *p) { return strncmp(s, p, strlen(p)) == 0; }
+ 
++static bool isLoopback(const char *a)
++{
++    return strcmp(a, "127.0.0.1") == 0 || strcmp(a, "::1") == 0 || strcmp(a, "::ffff:127.0.0.1") == 0;
++}
++
++// The address a request comes from. A connection from this machine that
++// carries X-Real-IP is a reverse proxy's (nginx, which sets the header itself
++// for every request it passes on): the client is the address in the header.
++// Without the header it is a program on the CosmosEx itself. From any other
++// address the header means nothing (anyone can send it) and isn't looked at.
++static std::string clientAddr(struct mg_connection *conn, const struct mg_request_info *ri)
++{
++    if(isLoopback(ri->remote_addr)) {
++        const char *real = mg_get_header(conn, "X-Real-IP");
++        if(real && real[0]) return real;
++    }
++    return ri->remote_addr;
++}
++
+ int WebAuth::beginRequest(struct mg_connection *conn)
+ {
+     const struct mg_request_info *ri = mg_get_request_info(conn);
+@@ -273,7 +292,7 @@ int WebAuth::beginRequest(struct mg_connection *conn)
+                 if(now - failWindowStart >= 60) { failWindowStart = now; failCount = 0; }
+                 if(++failCount >= FAILS_MAX) lockedUntil = now + 60;
+                 pthread_mutex_unlock(&mtx);
+-                Debug::out(LOG_INFO, "WebAuth: wrong password from %s", ri->remote_addr);
++                Debug::out(LOG_INFO, "WebAuth: wrong password from %s", clientAddr(conn, ri).c_str());
+                 sleep(1);                               // slows down guessing
+                 sendJson(conn, 401, "Unauthorized", "{\"status\":\"error\",\"error\":\"Wrong password.\"}");
+                 return 1;
+@@ -319,8 +338,7 @@ int WebAuth::beginRequest(struct mg_connection *conn)
+     }
+ 
+     if(!required()) return 0;                           // login off (setting, or insecure.txt)
+-    if(strcmp(ri->remote_addr, "127.0.0.1") == 0 || strcmp(ri->remote_addr, "::1") == 0 ||
+-       strcmp(ri->remote_addr, "::ffff:127.0.0.1") == 0) return 0;          // from the CosmosEx itself
++    if(isLoopback(clientAddr(conn, ri).c_str())) return 0;                  // from the CosmosEx itself
+ 
+     // what the login page needs
+     if(strcmp(uri, "/login.html") == 0 || strcmp(uri, "/css/app.css") == 0 || startsWith(uri, "/fonts/")) return 0;
+diff --git a/ce_main_app/webserver/webserver.cpp b/ce_main_app/webserver/webserver.cpp
+index 9063d088..799fc7cd 100644
+--- a/ce_main_app/webserver/webserver.cpp
++++ b/ce_main_app/webserver/webserver.cpp
+@@ -7,7 +7,7 @@
+ #include "../debug.h"
+ 
+ #define DOCUMENT_ROOT CE_WEBROOT
+-#define PORT "80"
++#define PORT CE_WEBLISTEN
+ 
+ 
+ WebServer::WebServer():bInited(false)
+diff --git a/ce_main_app/webserver/webserver.h b/ce_main_app/webserver/webserver.h
+index dfea06aa..3564707d 100644
+--- a/ce_main_app/webserver/webserver.h
++++ b/ce_main_app/webserver/webserver.h
+@@ -8,6 +8,15 @@
+ #define CE_WEBROOT "/ce/app/webroot/"
+ #endif
+ 
++// Where the web server listens (civetweb's "listening_ports"): "80", or an
++// address and port, e.g. -DCE_WEBLISTEN='"127.0.0.1:8081"' when a reverse
++// proxy (nginx) on the same machine is the one the network reaches. Behind
++// such a proxy the login takes the client's address from the X-Real-IP
++// header the proxy sets (webauth.cpp).
++#ifndef CE_WEBLISTEN
++#define CE_WEBLISTEN "80"
++#endif
++
+ #include <list> 
+ 
+ #include "CivetServer.h"
+-- 
+2.54.0 (Apple Git-157)
+

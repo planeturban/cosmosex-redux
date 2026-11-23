@@ -1,0 +1,23 @@
+config BR2_PACKAGE_CE_ATARI
+	bool "ce-atari"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_TOOLCHAIN_USES_GLIBC # getaddrinfo_a (libanl)
+	select BR2_PACKAGE_LIBCURL
+	select BR2_PACKAGE_CIVETWEB
+	select BR2_PACKAGE_CIVETWEB_LIB
+	help
+	  Builds the Raspberry Pi side of CosmosEx from source: the
+	  main app (ce_main_app) and the chip flashers flash_stm32 and
+	  flash_xilinx, from the ce-atari "master" branch, with the
+	  bcm2835 and cJSON sources bundled in that tree, and
+	  Buildroot's civetweb (the tree's bundled 1.7 from 2014 isn't
+	  used).
+	  Selected by, and installs into the /ce seed of, the cosmosex
+	  package, which provides everything else (Atari programs,
+	  chip firmware, web UI, scripts).
+
+	  https://github.com/atarijookie/ce-atari
+
+comment "ce-atari needs a glibc toolchain with C++ and threads"
+	depends on !BR2_INSTALL_LIBSTDCPP || !BR2_TOOLCHAIN_HAS_THREADS || !BR2_TOOLCHAIN_USES_GLIBC

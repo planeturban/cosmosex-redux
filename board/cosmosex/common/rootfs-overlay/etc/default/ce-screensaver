@@ -1,0 +1,5 @@
+# HDMI screen saver (ce-screensaver): seconds without activity until the
+# spinning Atari logo appears (-l) and until the HDMI output is switched off
+# (-o); 0 = never. Takes effect after "sudo /etc/init.d/S95screensaver restart"
+# or a reboot.
+SCREENSAVER_ARGS="-l 300 -o 1800"

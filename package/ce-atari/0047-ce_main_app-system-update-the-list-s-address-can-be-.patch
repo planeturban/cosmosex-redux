@@ -1,0 +1,64 @@
+From b3032e5df637965ce1784cba3bbb02eaabe693a2 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:58:49 +0100
+Subject: [PATCH] ce_main_app: system update: the list's address can be set
+
+POST /api/v1/system/update/list {"url": "https://..."} sets where the
+update tool looks for published images (a JSON list, the site's
+images/latest.json); "" goes back to the image's default. GET
+/api/v1/system/update has it as "list", with "listDefault". The address is
+checked here (http/https, no characters a shell reads) and by the tool.
+---
+ .../webserver/api/resource/systemresource.cpp | 21 +++++++++++++++++++
+ .../webserver/api/resource/systemresource.h   |  3 +++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index cad0614f..d8a179f3 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -326,6 +326,27 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         sendStatus(conn);
+         return true;
+     }
++    if(what == "list") {                                    // {"url": where the list of images is; "": the default}
++        cJSON *in = cJSON_Parse(body.c_str());
++        cJSON *ju = in ? cJSON_GetObjectItem(in, "url") : NULL;
++        bool given = ju && ju->type == cJSON_String && ju->valuestring;
++        std::string url = given ? ju->valuestring : "";
++        if(in) cJSON_Delete(in);
++        if(!given) { sendError(conn, 400, "url: the list's address (or \"\" for the default)"); return true; }
++        while(!url.empty() && isspace((unsigned char) url[url.length() - 1])) url.erase(url.length() - 1);
++        while(!url.empty() && isspace((unsigned char) url[0])) url.erase(0, 1);
++        // only characters that mean nothing to a shell (the tool checks the address itself)
++        bool ok = url.length() <= 300 && (url.empty() || url.compare(0, 7, "http://") == 0 || url.compare(0, 8, "https://") == 0);
++        for(size_t i = 0; ok && i < url.length(); i++) ok = isalnum((unsigned char) url[i]) || strchr(".-_~%+/:", url[i]) != NULL;
++        if(!ok) { sendError(conn, 400, "That isn't an address this can use: http:// or https://, and only letters, digits and . - _ ~ % + / in it."); return true; }
++        if(isBusy()) { sendError(conn, 409, "An update is running."); return true; }
++        std::string out;
++        runTool((std::string("seturl '") + (url.empty() ? "default" : url) + "'").c_str(), out);
++        std::string err = valueOf(out, "error");
++        if(!err.empty() || valueOf(out, "list").empty()) { sendError(conn, 400, err.empty() ? "Couldn't save the address." : err); return true; }
++        sendStatus(conn);
++        return true;
++    }
+     if(what == "usb") {                                     // {"path": an image on a USB stick}
+         cJSON *in = cJSON_Parse(body.c_str());
+         cJSON *jp = in ? cJSON_GetObjectItem(in, "path") : NULL;
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index f7a2b7dc..b7253e8f 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -13,6 +13,9 @@
+ //   GET  /api/v1/system/update            state: version, slot, progress, newest published,
+ //                                         slotA/slotB (versions), nextSlot, staged ...
+ //   POST /api/v1/system/update/check      look for the newest published image (waits for it)
++//   POST /api/v1/system/update/list       {"url": the address of the list of published images
++//                                         (latest.json); "": the image's default}; GET has it
++//                                         as "list" (and "listDefault")
+ //   POST /api/v1/system/update/online     {"restart"}: download and install it (runs on; poll GET)
+ //   POST /api/v1/system/update/upload     the body is an SD card image (.img or .img.xz),
+ //                                         Content-Type application/octet-stream,
+-- 
+2.54.0 (Apple Git-157)
+

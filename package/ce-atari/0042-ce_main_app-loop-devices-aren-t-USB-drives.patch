@@ -1,0 +1,35 @@
+From 95fd2a936553a935f9dc6bfb851b8f8b84d316ef Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:33:46 +0100
+Subject: [PATCH] ce_main_app: loop devices aren't USB drives
+
+The hard disk image viewer (ce-hdinspect, "Look inside") opens images
+through loop devices, and udev adds /dev/disk/by-uuid links for their
+partitions: DevFinder took them for a USB drive, cut the name to
+"/dev/loop" and tried to mount that (a translated drive "C: USB drive -
+device /dev/loop" that never worked). Skip loop, ram, zram and dm- devices
+(the PC build still mounts loop devices on purpose).
+---
+ ce_main_app/devfinder.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/ce_main_app/devfinder.cpp b/ce_main_app/devfinder.cpp
+index 249af74b..f6061e55 100644
+--- a/ce_main_app/devfinder.cpp
++++ b/ce_main_app/devfinder.cpp
+@@ -87,6 +87,12 @@ void DevFinder::lookForDevChanges(void)
+                     cutBeforeFirstNumber(file);									// cut before the 1st number (e.g. sda1 -> sda)
+ 		}
+ #else
++		// not USB drives: loop devices (hard disk images opened by
++		// ce-hdinspect, "Look inside"), RAM disks, device mapper
++		if(file.compare(0, 4, "loop") == 0 || file.compare(0, 3, "ram") == 0 ||
++		   file.compare(0, 4, "zram") == 0 || file.compare(0, 3, "dm-") == 0) {
++			continue;
++		}
+                 cutBeforeFirstNumber(file);									// cut before the 1st number (e.g. sda1 -> sda)
+ #endif                
+ 		file = "/dev/" + file;										// create full path - /dev/sda
+-- 
+2.54.0 (Apple Git-157)
+

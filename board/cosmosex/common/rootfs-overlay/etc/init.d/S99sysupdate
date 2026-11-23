@@ -1,0 +1,15 @@
+#!/bin/sh
+# After a system update's trial start: make the new system the default if
+# the app works (ce-sysupdate confirm), in the background.
+
+case "$1" in
+start)
+	( /usr/sbin/ce-sysupdate confirm ) > /dev/null 2>&1 &
+	;;
+stop|restart)
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac

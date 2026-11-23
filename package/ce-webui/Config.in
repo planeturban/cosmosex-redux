@@ -1,0 +1,11 @@
+config BR2_PACKAGE_CE_WEBUI
+	bool "ce-webui"
+	depends on BR2_PACKAGE_COSMOSEX
+	select BR2_PACKAGE_CE_WEBUI_FONTS
+	help
+	  The redesigned CosmosEx web UI (cosmosex-br/webui), installed
+	  to /usr/share/cosmosex/webroot, where the app serves it from
+	  (ce-atari patch 0008). The release's classic pages stay
+	  available next to it until each new page replaces them.
+	  Fonts (Barlow, Barlow Condensed, JetBrains Mono; OFL) are
+	  downloaded at build time and self-hosted.

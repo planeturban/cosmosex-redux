@@ -1,0 +1,1979 @@
+From 6a8b1ac6ac7935b6ad5a7054d47b49f8499434af Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:16:30 +0100
+Subject: [PATCH] ce_main_app: image library sources (IMAGELIB_SOURCES),
+ per-source list cache, USB serials
+
+Stage 1 of the floppy library work (cosmosex-floppy-library.md, 6.1):
+
+- IMAGELIB_SOURCES replaces the hardcoded IMAGELIST_URL: an ordered,
+  comma-separated list of web lists (http/https), share:<path> and
+  usb:<serial>:<path> sources; '!' disables an entry in place; %2C for a
+  comma in a path; at most 8. Default: the original joo.kie.sk list, so
+  nothing changes without the setting. IMAGELIST_URL / IMAGELIB_SOURCE
+  from earlier builds are migrated.
+- Every web source's list is cached as <IMAGELIST_CACHE_DIR>/<id>.list
+  (build-time define, default /ce/app/imagelists). Lists are merged in
+  priority order (first source wins for the same image name). A refresh
+  keeps the old list until the new one is in, and keeps it if the
+  download fails (source "offline"). Missing lists are retried at most
+  once a minute.
+- The newest list version is written to IMAGELIST_CACHE_DIR/version for
+  update.cpp.
+- Settings::getStringLong() (no 255-character limit), keyExists(),
+  removeKey().
+- USB serials from sysfs (usbserial.cpp, no udev needed),
+  ImageStorage::listUsbSticks(), findMountForUsbSerial(),
+  resolveLocation() for share:/usb: locations.
+- Downloads can name their local file (TDownloadRequest.dstFile).
+- Game names keep their original case for display (search stays
+  case-insensitive).
+- Web API: GET/PUT /api/v1/library/sources, POST /api/v1/library/refresh,
+  GET /api/v1/library/search (one result per image, with its games,
+  source, downloaded or not, slots), GET /api/v1/library/usb, and
+  DELETE /api/v1/floppy/<slot> to eject. PUT accepts only
+  application/json.
+
+share: and usb: sources are parsed, resolved and shown, but their folders
+are scanned from stage 6.2 on.
+---
+ ce_main_app/downloader.cpp                    |   3 +
+ ce_main_app/downloader.h                      |   1 +
+ ce_main_app/floppy/imagelibsources.cpp        | 225 ++++++++++
+ ce_main_app/floppy/imagelibsources.h          |  69 +++
+ ce_main_app/floppy/imagelist.cpp              | 359 +++++++++++++--
+ ce_main_app/floppy/imagelist.h                |  71 ++-
+ ce_main_app/floppy/imagestorage.cpp           |  78 ++++
+ ce_main_app/floppy/imagestorage.h             |  16 +
+ ce_main_app/settings.cpp                      |  44 ++
+ ce_main_app/settings.h                        |   7 +
+ ce_main_app/translated/translateddisk.h       |  10 +
+ .../translated/translateddisk_general.cpp     |  28 ++
+ ce_main_app/update.cpp                        |   2 +-
+ ce_main_app/usbserial.cpp                     |  78 ++++
+ ce_main_app/usbserial.h                       |  17 +
+ .../webserver/api/resource/floppyresource.cpp |  17 +
+ .../api/resource/libraryresource.cpp          | 425 ++++++++++++++++++
+ .../webserver/api/resource/libraryresource.h  |  43 ++
+ .../webserver/api/router/apiv1router.cpp      |  15 +
+ .../webserver/api/router/apiv1router.h        |   3 +
+ 20 files changed, 1464 insertions(+), 47 deletions(-)
+ create mode 100644 ce_main_app/floppy/imagelibsources.cpp
+ create mode 100644 ce_main_app/floppy/imagelibsources.h
+ create mode 100644 ce_main_app/usbserial.cpp
+ create mode 100644 ce_main_app/usbserial.h
+ create mode 100644 ce_main_app/webserver/api/resource/libraryresource.cpp
+ create mode 100644 ce_main_app/webserver/api/resource/libraryresource.h
+
+diff --git a/ce_main_app/downloader.cpp b/ce_main_app/downloader.cpp
+index 7f81bf2c..579711d9 100644
+--- a/ce_main_app/downloader.cpp
++++ b/ce_main_app/downloader.cpp
+@@ -524,6 +524,9 @@ void Downloader::run(void)
+ 
+         std::string urlPath, fileName;
+         Utils::splitFilenameFromPath(downloadCurrent.srcUrl, urlPath, fileName);
++        if(!downloadCurrent.dstFile.empty()) {              // the caller chose the local file name
++            fileName = downloadCurrent.dstFile;
++        }
+ 
+         std::string tmpFile, finalFile;
+ 
+diff --git a/ce_main_app/downloader.h b/ce_main_app/downloader.h
+index 54cacc9c..52d10ee0 100644
+--- a/ce_main_app/downloader.h
++++ b/ce_main_app/downloader.h
+@@ -29,6 +29,7 @@
+ typedef struct {
+     std::string srcUrl;         // src url, e.g. http://whatever.com/file.zip
+     std::string dstDir;         // dest dir, e.g. /mnt/sda1
++    std::string dstFile;        // optional: file name in dstDir (default: the file name from srcUrl)
+ 
+     int downloadType;           // defines what is downloaded - update, floppy image, ...
+     WORD checksum;              // used to verify file integrity after download
+diff --git a/ce_main_app/floppy/imagelibsources.cpp b/ce_main_app/floppy/imagelibsources.cpp
+new file mode 100644
+index 00000000..0a9ca63e
+--- /dev/null
++++ b/ce_main_app/floppy/imagelibsources.cpp
+@@ -0,0 +1,225 @@
++// Floppy image library sources: parsing and joining IMAGELIB_SOURCES.
++// See imagelibsources.h. No dependencies on the rest of the app.
++
++#include <stdio.h>
++#include <stdint.h>
++#include <string.h>
++#include <ctype.h>
++
++#include "imagelibsources.h"
++
++std::string ImageLibSources::trim(const std::string &s)
++{
++    size_t a = 0, b = s.length();
++    while(a < b && isspace((unsigned char) s[a])) a++;
++    while(b > a && isspace((unsigned char) s[b - 1])) b--;
++    return s.substr(a, b - a);
++}
++
++// "%2C" (either case) -> ","; nothing else is decoded
++std::string ImageLibSources::decodeComma(const std::string &s)
++{
++    std::string out;
++    for(size_t i = 0; i < s.length(); i++) {
++        if(s[i] == '%' && i + 2 < s.length() &&
++           s[i + 1] == '2' && (s[i + 2] == 'C' || s[i + 2] == 'c')) {
++            out += ',';
++            i += 2;
++        } else {
++            out += s[i];
++        }
++    }
++    return out;
++}
++
++std::string ImageLibSources::encodeComma(const std::string &s)
++{
++    std::string out;
++    for(size_t i = 0; i < s.length(); i++) {
++        if(s[i] == ',') out += "%2C";
++        else            out += s[i];
++    }
++    return out;
++}
++
++std::string ImageLibSources::shortHash(const std::string &s)
++{
++    uint32_t h = 2166136261u;                   // FNV-1a, 32 bit
++    for(size_t i = 0; i < s.length(); i++) {
++        h ^= (unsigned char) s[i];
++        h *= 16777619u;
++    }
++    char buf[16];
++    snprintf(buf, sizeof(buf), "%06x", (unsigned) (h & 0xffffff));
++    return std::string(buf);
++}
++
++std::string ImageLibSources::sanitizeId(const std::string &s)
++{
++    std::string out;
++    for(size_t i = 0; i < s.length() && out.length() < 64; i++) {
++        char c = s[i];
++        if(isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-') out += c;
++        else                                                              out += '_';
++    }
++    return out;
++}
++
++std::string ImageLibSources::urlHost(const std::string &url)
++{
++    size_t p = url.find("://");
++    if(p == std::string::npos) return "";
++    p += 3;
++    size_t e = url.find_first_of("/?#", p);
++    std::string host = url.substr(p, e == std::string::npos ? std::string::npos : e - p);
++    size_t at = host.rfind('@');                // drop user:password@
++    if(at != std::string::npos) host = host.substr(at + 1);
++    return host;
++}
++
++static bool startsWith(const std::string &s, const char *prefix)
++{
++    return s.compare(0, strlen(prefix), prefix) == 0;
++}
++
++static bool startsWithNoCase(const std::string &s, const char *prefix)
++{
++    size_t n = strlen(prefix);
++    if(s.length() < n) return false;
++    for(size_t i = 0; i < n; i++) {
++        if(tolower((unsigned char) s[i]) != tolower((unsigned char) prefix[i])) return false;
++    }
++    return true;
++}
++
++bool ImageLibSources::parseLocation(const std::string &spec, int &type, std::string &serial, std::string &path)
++{
++    serial.clear();
++    path.clear();
++
++    std::string rest;
++    if(startsWith(spec, "share:")) {
++        type = IMAGELIB_TYPE_SHARE;
++        rest = spec.substr(6);
++    } else if(startsWith(spec, "usb:")) {
++        type = IMAGELIB_TYPE_USB;
++        size_t colon = spec.find(':', 4);
++        if(colon == std::string::npos) return false;            // usb:<serial>:<path>
++        serial = trim(spec.substr(4, colon - 4));
++        if(serial.empty()) return false;
++        for(size_t i = 0; i < serial.length(); i++) {           // serials: printable, no '/' (used in ids, compared with sysfs)
++            unsigned char c = serial[i];
++            if(c < 0x21 || c > 0x7e || c == '/' || c == ',') return false;
++        }
++        rest = spec.substr(colon + 1);
++    } else {
++        return false;
++    }
++
++    path = decodeComma(trim(rest));
++    if(path.empty() || path[0] != '/') path = "/" + path;
++    while(path.length() > 1 && path[path.length() - 1] == '/') path.erase(path.length() - 1);
++
++    // no ".." components: a library folder can't point outside its drive
++    std::string p = path + "/";
++    if(p.find("/../") != std::string::npos) return false;
++    return true;
++}
++
++bool ImageLibSources::parseEntry(const std::string &entry, ImageLibSource &src)
++{
++    src.enabled = true;
++    src.spec    = entry;
++    src.url.clear();
++    src.serial.clear();
++    src.path.clear();
++
++    if(startsWithNoCase(entry, "http://") || startsWithNoCase(entry, "https://")) {
++        std::string host = urlHost(entry);
++        if(host.empty()) return false;
++        src.type  = IMAGELIB_TYPE_WEB;
++        src.url   = entry;
++        src.id    = sanitizeId(host + "-" + shortHash(entry));
++        src.label = "WEB " + host;
++        return true;
++    }
++
++    int type;
++    if(!parseLocation(entry, type, src.serial, src.path)) return false;
++    src.type = type;
++
++    if(type == IMAGELIB_TYPE_SHARE) {
++        src.id    = "share-" + shortHash(src.path);
++        src.label = "SHARE " + src.path;
++    } else {
++        src.id    = sanitizeId("usb-" + src.serial);
++        std::string shortSerial = src.serial.length() > 8 ? src.serial.substr(0, 8) + "..." : src.serial;
++        src.label = "USB " + shortSerial + " " + src.path;
++    }
++    return true;
++}
++
++int ImageLibSources::parse(const std::string &value, std::vector<ImageLibSource> &sources, std::vector<std::string> *warnings)
++{
++    sources.clear();
++
++    size_t start = 0;
++    while(start <= value.length()) {
++        size_t comma = value.find(',', start);
++        if(comma == std::string::npos) comma = value.length();
++
++        std::string entry = trim(value.substr(start, comma - start));
++        start = comma + 1;
++
++        if(entry.empty()) continue;                             // e.g. a trailing comma
++
++        bool enabled = true;
++        if(entry[0] == '!') {
++            enabled = false;
++            entry = trim(entry.substr(1));
++            if(entry.empty()) continue;
++        }
++
++        ImageLibSource src;
++        if(!parseEntry(entry, src)) {
++            if(warnings) warnings->push_back("unknown image library source skipped: " + entry);
++            continue;
++        }
++        src.enabled = enabled;
++
++        if((int) sources.size() >= IMAGELIB_MAX_SOURCES) {
++            if(warnings) warnings->push_back("more than 8 image library sources, ignored: " + entry);
++            continue;
++        }
++
++        // two entries with the same id (e.g. the same URL twice): keep the first
++        bool dup = false;
++        for(size_t i = 0; i < sources.size(); i++) {
++            if(sources[i].id == src.id) dup = true;
++        }
++        if(dup) {
++            if(warnings) warnings->push_back("duplicate image library source ignored: " + entry);
++            continue;
++        }
++
++        sources.push_back(src);
++    }
++    return (int) sources.size();
++}
++
++std::string ImageLibSources::join(const std::vector<ImageLibSource> &sources)
++{
++    std::string out;
++    for(size_t i = 0; i < sources.size(); i++) {
++        const ImageLibSource &s = sources[i];
++        std::string entry;
++        if(s.type == IMAGELIB_TYPE_WEB)        entry = s.url;
++        else if(s.type == IMAGELIB_TYPE_SHARE) entry = "share:" + encodeComma(s.path);
++        else                                   entry = "usb:" + s.serial + ":" + encodeComma(s.path);
++
++        if(!out.empty()) out += ", ";
++        if(!s.enabled) out += "!";
++        out += entry;
++    }
++    return out;
++}
+diff --git a/ce_main_app/floppy/imagelibsources.h b/ce_main_app/floppy/imagelibsources.h
+new file mode 100644
+index 00000000..71960df4
+--- /dev/null
++++ b/ce_main_app/floppy/imagelibsources.h
+@@ -0,0 +1,69 @@
++#ifndef _IMAGELIBSOURCES_H_
++#define _IMAGELIBSOURCES_H_
++
++// Floppy image library sources: the IMAGELIB_SOURCES setting.
++//
++// A comma-separated, ordered list (first = highest priority) of:
++//   http://... / https://...   a remote imagelist.csv (the original list or a mirror)
++//   share:<path>               a folder on the shared drive
++//   usb:<serial>:<path>        a folder on the USB stick with this USB serial number
++// An entry starting with '!' is disabled: kept in place, but not used.
++// A comma inside a share:/usb: path is written as %2C (decoded); URLs are
++// passed through unchanged. Empty entries are ignored, unknown ones skipped,
++// at most IMAGELIB_MAX_SOURCES entries (disabled ones count).
++//
++// This file has no dependencies on the rest of the app (unit-tested on the
++// build host).
++
++#include <string>
++#include <vector>
++
++#define IMAGELIB_SOURCES_KEY        "IMAGELIB_SOURCES"
++#define IMAGELIB_DEFAULT_SOURCE     "http://joo.kie.sk/cosmosex/update/imagelist.csv"
++#define IMAGELIB_MAX_SOURCES        8
++
++#define IMAGELIB_TYPE_WEB           0
++#define IMAGELIB_TYPE_SHARE         1
++#define IMAGELIB_TYPE_USB           2
++
++typedef struct {
++    int         type;       // IMAGELIB_TYPE_*
++    bool        enabled;    // false: entry had the '!' prefix
++    std::string spec;       // the entry as configured, without '!' (e.g. "usb:4C53:/atari")
++    std::string url;        // web: the list URL
++    std::string serial;     // usb: the USB serial number
++    std::string path;       // share/usb: folder, %2C decoded, starts with '/'
++    std::string id;         // stable short id, [A-Za-z0-9._-] (file names, save paths)
++    std::string label;      // for the UI, e.g. "WEB joo.kie.sk", "SHARE /atari", "USB 4C53..."
++} ImageLibSource;
++
++class ImageLibSources
++{
++public:
++    // Parses the setting value. Problems (unknown entries, too many) are
++    // appended to warnings, if given. Returns the number of sources.
++    static int  parse(const std::string &value, std::vector<ImageLibSource> &sources, std::vector<std::string> *warnings = NULL);
++
++    // Parses one entry (without '!'); false if it isn't a valid source.
++    static bool parseEntry(const std::string &entry, ImageLibSource &src);
++
++    // The setting value for these sources (inverse of parse()).
++    static std::string join(const std::vector<ImageLibSource> &sources);
++
++    // "share:/a/b" / "usb:SERIAL:/a/b": type, serial and path (decoded).
++    // Used for IMAGELIB_SOURCES, IMAGE_STORAGE and FLOPPY_SAVES.
++    static bool parseLocation(const std::string &spec, int &type, std::string &serial, std::string &path);
++
++    // Host part of an http(s) URL ("" if none).
++    static std::string urlHost(const std::string &url);
++
++    static std::string sanitizeId(const std::string &s);
++    static std::string shortHash(const std::string &s);     // 6 hex chars (FNV-1a)
++
++private:
++    static std::string trim(const std::string &s);
++    static std::string decodeComma(const std::string &s);
++    static std::string encodeComma(const std::string &s);
++};
++
++#endif
+diff --git a/ce_main_app/floppy/imagelist.cpp b/ce_main_app/floppy/imagelist.cpp
+index 3d515551..c13c5579 100644
+--- a/ce_main_app/floppy/imagelist.cpp
++++ b/ce_main_app/floppy/imagelist.cpp
+@@ -8,6 +8,8 @@
+ #include <algorithm>
+ 
+ #include <unistd.h>
++#include <sys/stat.h>
++#include <sys/types.h>
+ 
+ #include "imagelist.h"
+ #include "imagesilo.h"
+@@ -17,63 +19,300 @@
+ #include "../periodicthread.h"
+ #include "../downloader.h"
+ #include "../debug.h"
++#include "../settings.h"
+ 
+ extern SharedObjects shared;
+ 
+ ImageList::ImageList(void)
+ {
+     isLoaded = false;
++
++    for(int i=0; i<(int) (sizeof(downloadSlots) / sizeof(downloadSlots[0])); i++) {
++        downloadSlots[i].used   = false;
++        downloadSlots[i].status = DWNSTATUS_WAITING;
++    }
++
++    migrateSettings();
++    loadSources();
+ }
+ 
+-bool ImageList::exists(void)
++void ImageList::migrateSettings(void)
+ {
+-    bool exists = Utils::fileExists(IMAGELIST_LOCAL);   // check if file exists
++    Settings s;
++    if(s.keyExists(IMAGELIB_SOURCES_KEY)) {
++        return;
++    }
+ 
+-    if(exists) {
+-        return true;
++    // earlier builds of this work stored a single URL; keep them, in this order
++    const char *oldKeys[2] = { "IMAGELIST_URL", "IMAGELIB_SOURCE" };
++    std::string value;
++    for(int i=0; i<2; i++) {
++        std::string old;
++        if(s.getStringLong(oldKeys[i], old, "") && !old.empty()) {
++            if(!value.empty()) value += ", ";
++            value += old;
++        }
+     }
+ 
+-    // ok, so the file does not exist
+-    int cnt = Downloader::count(DWNTYPE_FLOPPYIMG_LIST); // check if it's downloaded at this moment
++    if(!value.empty()) {
++        s.setString(IMAGELIB_SOURCES_KEY, value.c_str());
++        Debug::out(LOG_INFO, "ImageList: migrated IMAGELIST_URL / IMAGELIB_SOURCE to %s = %s", IMAGELIB_SOURCES_KEY, value.c_str());
++    }
++    for(int i=0; i<2; i++) {
++        s.removeKey(oldKeys[i]);
++    }
++}
+ 
+-    if(cnt > 0) {                                       // the file is being downloaded, but we don't have it yet
+-        return false;
++void ImageList::loadSources(void)
++{
++    Settings s;
++    std::string value;
++    s.getStringLong(IMAGELIB_SOURCES_KEY, value, IMAGELIB_DEFAULT_SOURCE);
++
++    std::vector<ImageLibSource> parsed;
++    std::vector<std::string> warnings;
++    ImageLibSources::parse(value, parsed, &warnings);
++    for(size_t i=0; i<warnings.size(); i++) {
++        Debug::out(LOG_ERROR, "ImageList: %s", warnings[i].c_str());
+     }
+ 
+-    downloadFromWeb();      // don't have it, not downloading? download!
+-    return false;
++    // keep what we know about sources that are still configured
++    std::vector<ImageListSource> old = sources;
++    sources.clear();
++
++    for(size_t i=0; i<parsed.size(); i++) {
++        ImageListSource ls;
++        ls.src          = parsed[i];
++        ls.entries      = 0;
++        ls.updated      = 0;
++        ls.lastResult   = -1;
++        ls.lastAttempt  = 0;
++
++        if(ls.src.type == IMAGELIB_TYPE_WEB) {
++            ls.cachePath = std::string(IMAGELIST_CACHE_DIR) + "/" + ls.src.id + ".list";
++        }
++
++        for(size_t j=0; j<old.size(); j++) {
++            if(old[j].src.id == ls.src.id) {
++                ls.entries      = old[j].entries;
++                ls.version      = old[j].version;
++                ls.updated      = old[j].updated;
++                ls.lastResult   = old[j].lastResult;
++                ls.lastAttempt  = old[j].lastAttempt;
++            }
++        }
++        sources.push_back(ls);
++    }
++
++    Utils::mkpath(IMAGELIST_CACHE_DIR, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
++}
++
++volatile BYTE *ImageList::downloadStatusFor(const std::string &id)
++{
++    int n = (int) (sizeof(downloadSlots) / sizeof(downloadSlots[0]));
++    for(int i=0; i<n; i++) {
++        if(downloadSlots[i].used && downloadSlots[i].id == id) {
++            return &downloadSlots[i].status;
++        }
++    }
++    for(int i=0; i<n; i++) {
++        if(!downloadSlots[i].used) {
++            downloadSlots[i].used   = true;
++            downloadSlots[i].id     = id;
++            downloadSlots[i].status = DWNSTATUS_WAITING;
++            return &downloadSlots[i].status;
++        }
++    }
++    return NULL;        // more ids than slots in one session (sources changed many times): no status
+ }
+ 
+-void ImageList::downloadFromWeb(void)
++void ImageList::downloadSource(int sourceIndex)
+ {
+-    // start the download
++    ImageListSource &ls = sources[sourceIndex];
++
++    volatile BYTE *status = downloadStatusFor(ls.src.id);
++    if(status) {
++        *status = DWNSTATUS_WAITING;
++    }
++
+     TDownloadRequest tdr;
+-    tdr.srcUrl          = IMAGELIST_URL;
++    tdr.srcUrl          = ls.src.url;
+     tdr.checksum        = 0;                            // don't check checksum
+-    tdr.dstDir          = IMAGELIST_LOCAL_DIR;
++    tdr.dstDir          = IMAGELIST_CACHE_DIR;
++    tdr.dstFile         = ls.src.id + ".list";          // temp file, then renamed: a failed refresh keeps the old list
+     tdr.downloadType    = DWNTYPE_FLOPPYIMG_LIST;
+-    tdr.pStatusByte     = NULL;                     // don't update this status byte
++    tdr.pStatusByte     = status;
+     Downloader::add(tdr);
++
++    ls.lastAttempt = Utils::getCurrentMs();
++    ls.lastResult  = DWNSTATUS_WAITING;
++    Debug::out(LOG_DEBUG, "ImageList: downloading list of %s from %s", ls.src.id.c_str(), ls.src.url.c_str());
++}
++
++void ImageList::getSourceStatus(int index, std::string &status)
++{
++    if(index < 0 || index >= (int) sources.size()) {
++        status = "unknown";
++        return;
++    }
++
++    ImageListSource &ls = sources[index];
++    if(!ls.src.enabled) {
++        status = "disabled";
++        return;
++    }
++    if(ls.src.type != IMAGELIB_TYPE_WEB) {
++        status = "not_loaded";          // share: and usb: sources are loaded from stage 6.2 on
++        return;
++    }
++
++    volatile BYTE *st = downloadStatusFor(ls.src.id);
++    int result = ls.lastResult;
++    if(result != -1 && st) {
++        result = *st;
++    }
++
++    bool haveCache = Utils::fileExists(ls.cachePath);
++
++    if(result == DWNSTATUS_WAITING || result == DWNSTATUS_DOWNLOADING || result == DWNSTATUS_VERIFYING) {
++        status = "downloading";
++    } else if(result == DWNSTATUS_DOWNLOAD_FAIL) {
++        status = haveCache ? "offline" : "unavailable";     // offline: using the last list we got
++    } else {
++        status = haveCache ? "online" : "unavailable";
++    }
++}
++
++bool ImageList::exists(void)
++{
++    bool anyList    = false;
++    bool anyWeb     = false;
++    DWORD now       = Utils::getCurrentMs();
++
++    for(int i=0; i<(int) sources.size(); i++) {
++        ImageListSource &ls = sources[i];
++        if(!ls.src.enabled || ls.src.type != IMAGELIB_TYPE_WEB) {
++            continue;
++        }
++        anyWeb = true;
++
++        if(Utils::fileExists(ls.cachePath)) {
++            anyList = true;
++            continue;
++        }
++
++        // no list from this source yet: download it, unless that's under way
++        // or was just tried
++        std::string status;
++        getSourceStatus(i, status);
++        if(status == "downloading") {
++            continue;
++        }
++        if(ls.lastAttempt == 0 || (now - ls.lastAttempt) >= IMAGELIST_RETRY_MS) {
++            downloadSource(i);
++        }
++    }
++
++    // no web sources at all: an empty list (nothing to wait for)
++    return anyList || !anyWeb;
++}
++
++std::string ImageList::cacheSignature(void)
++{
++    std::ostringstream sig;
++    for(size_t i=0; i<sources.size(); i++) {
++        if(!sources[i].src.enabled || sources[i].src.type != IMAGELIB_TYPE_WEB) {
++            continue;
++        }
++        struct stat st;
++        sig << sources[i].src.id << ":";
++        if(stat(sources[i].cachePath.c_str(), &st) == 0) {
++            sig << (long) st.st_size << "/" << (long) st.st_mtime;
++        }
++        sig << ";";
++    }
++    return sig.str();
+ }
+ 
+ bool ImageList::getIsLoaded(void)
+ {
+-    return isLoaded;
++    // a list that was downloaded or refreshed since the last load: load again
++    return isLoaded && loadedSignature == cacheSignature();
+ }
+ 
+ bool ImageList::loadList(void)
+ {
+     vectorOfImages.clear();
++    vectorOfResults.clear();
+     isLoaded = false;
+ 
+-    FILE *f = fopen(IMAGELIST_LOCAL, "rt");             // open file
++    std::map<std::string, bool> seen;       // image names already listed (first source wins)
++    bool anyLoaded  = false;
++    bool anyWeb     = false;
++
++    for(int i=0; i<(int) sources.size(); i++) {
++        sources[i].entries = 0;
++        if(!sources[i].src.enabled || sources[i].src.type != IMAGELIB_TYPE_WEB) {
++            continue;
++        }
++        anyWeb = true;
++        if(loadOneList(i, seen)) {
++            anyLoaded = true;
++        }
++    }
++
++    if(anyWeb && !anyLoaded) {
++        return false;
++    }
++
++    loadedSignature = cacheSignature();
++    writeVersionFile();
++
++    isLoaded = true;
++    return true;
++}
++
++void ImageList::writeVersionFile(void)
++{
++    // the newest version (they are dates, e.g. 2026-08-14) over all lists
++    std::string newest;
++    for(size_t i=0; i<sources.size(); i++) {
++        if(sources[i].entries > 0 && sources[i].version > newest) {
++            newest = sources[i].version;
++        }
++    }
++
++    std::string tmp = std::string(IMAGELIST_VERSION_FILE) + ".tmp";
++    FILE *f = fopen(tmp.c_str(), "wt");
++    if(!f) {
++        return;
++    }
++    fprintf(f, "%s\n", newest.c_str());
++    fclose(f);
++    rename(tmp.c_str(), IMAGELIST_VERSION_FILE);
++}
++
++bool ImageList::loadOneList(int sourceIndex, std::map<std::string, bool> &seen)
++{
++    ImageListSource &ls = sources[sourceIndex];
++
++    FILE *f = fopen(ls.cachePath.c_str(), "rt");        // open file
+ 
+     if(!f) {
+         return false;
+     }
+ 
++    struct stat st;
++    ls.updated = (fstat(fileno(f), &st) == 0) ? st.st_mtime : 0;
++
+     char tmp[1024];
+-    fgets(tmp, 1023, f);                                // skip version line
++    memset(tmp, 0, sizeof(tmp));
++    if(fgets(tmp, 1023, f)) {                           // version line
++        ls.version = tmp;
++        while(!ls.version.empty() && (ls.version[ls.version.length() - 1] == '\n' || ls.version[ls.version.length() - 1] == '\r')) {
++            ls.version.erase(ls.version.length() - 1);
++        }
++    }
+ 
+     ImageListItem li;                                   // store url and checksum in structure
+     int n=0;
+@@ -141,40 +380,80 @@ bool ImageList::loadList(void)
+             continue;
+         }
+ 
+-        li.games = tok;                                                                     // store games
+-        std::transform(li.games.begin(), li.games.end(), li.games.begin(), ::tolower);      // convert them to lowercase
+-        std::replace(li.games.begin(), li.games.end(), '\t', ' ');
+-        std::replace(li.games.begin(), li.games.end(), '\\', ' ');
+-        std::replace(li.games.begin(), li.games.end(), '/', ' ');
++        li.gamesDisplay = tok;                                                              // games, original case
++        std::replace(li.gamesDisplay.begin(), li.gamesDisplay.end(), '\t', ' ');
++        std::replace(li.gamesDisplay.begin(), li.gamesDisplay.end(), '\\', ' ');
++        std::replace(li.gamesDisplay.begin(), li.gamesDisplay.end(), '/', ' ');
++        li.games = li.gamesDisplay;                                                         // and lower case for searching (as before)
++        std::transform(li.games.begin(), li.games.end(), li.games.begin(), ::tolower);
+         li.marked = false;
++        li.sourceIndex = sourceIndex;
+ 
+-//      Debug::out(LOG_DEBUG, "[%d] - %s - %s - %s", n, li.url.c_str(), li.imageName.c_str(), li.games.c_str());
++        if(seen.count(li.imageName)) {                  // same image from a source with higher priority
++            continue;
++        }
++        seen[li.imageName] = true;
+ 
+         vectorOfImages.push_back(li);                   // store it in vector
++        ls.entries++;
+     }
+ 
+     fclose(f);
+ 
+-    isLoaded = true;
++    Debug::out(LOG_DEBUG, "ImageList: %s: %d images (list version %s)", ls.src.id.c_str(), ls.entries, ls.version.c_str());
+     return true;
+ }
+ 
++void ImageList::searchImages(const char *part, std::vector<int> &imageIndexes)
++{
++    imageIndexes.clear();
++
++    if(!getIsLoaded()) {
++        if(!loadList()) {
++            return;
++        }
++    }
++
++    std::string sPart = part ? part : "";
++    std::transform(sPart.begin(), sPart.end(), sPart.begin(), ::tolower);
++
++    for(int i=0; i<(int) vectorOfImages.size(); i++) {
++        if(sPart.empty()) {
++            imageIndexes.push_back(i);
++            continue;
++        }
++        std::string name = vectorOfImages[i].imageName;
++        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
++        if(vectorOfImages[i].games.find(sPart) != std::string::npos || name.find(sPart) != std::string::npos) {
++            imageIndexes.push_back(i);
++        }
++    }
++}
++
++const ImageListItem *ImageList::getImage(int imageIndex)
++{
++    if(imageIndex < 0 || imageIndex >= (int) vectorOfImages.size()) {
++        return NULL;
++    }
++    return &vectorOfImages[imageIndex];
++}
++
+ void ImageList::search(const char *part)
+ {
+     std::string sPart = part;
+     std::transform(sPart.begin(), sPart.end(), sPart.begin(), ::tolower);                   // convert to lowercase
+ 
+-    vectorOfResults.clear();                                        // clear results
+-
+-    int cnt = vectorOfImages.size();
+-
+-    // if not loaded, try to load
+-    if(!isLoaded) {
++    // if not loaded (or a list changed since), try to load
++    if(!getIsLoaded()) {
+         if(!loadList()) {   // try to load list, but if failed, quit
+             return;
+         }
+     }
+ 
++    vectorOfResults.clear();                                        // clear results
++
++    int cnt = vectorOfImages.size();
++
+     if(cnt < 1) {           // list empty? quit
+         return;
+     }
+@@ -283,8 +562,8 @@ void ImageList::getSingleGame(std::string &games, std::string &game, size_t pos)
+ 
+ void ImageList::getResultByIndex(int index, char *bfr, int screenResolution)
+ {
+-    // if not loaded, try to load
+-    if(!isLoaded) {
++    // if not loaded (or a list changed since), try to load
++    if(!getIsLoaded()) {
+         if(!loadList()) {    // try to load list, but if failed, quit
+             return;
+         }
+@@ -423,10 +702,16 @@ bool ImageList::getFirstMarkedImage(std::string &url, int &checksum, std::string
+ 
+ void ImageList::refreshList(void)
+ {
+-    unlink(IMAGELIST_LOCAL);                // delete current image list
++    // read IMAGELIB_SOURCES again, then download every web source's list;
++    // the cached lists stay until the new ones are in, and stay if a
++    // download fails (the source is then "offline")
++    loadSources();
++
++    for(int i=0; i<(int) sources.size(); i++) {
++        if(sources[i].src.enabled && sources[i].src.type == IMAGELIB_TYPE_WEB) {
++            downloadSource(i);
++        }
++    }
+ 
+-    vectorOfImages.clear();                 // remove the loaded list from memory
+     isLoaded = false;
+-
+-    exists();                               // this should now start the new image list download
+ }
+diff --git a/ce_main_app/floppy/imagelist.h b/ce_main_app/floppy/imagelist.h
+index 73b970d8..b96afa7e 100644
+--- a/ce_main_app/floppy/imagelist.h
++++ b/ce_main_app/floppy/imagelist.h
+@@ -5,17 +5,33 @@
+ #include <string>
+ #include <vector>
+ #include <sstream>
++#include <time.h>
+ 
+-#define IMAGELIST_URL       "http://joo.kie.sk/cosmosex/update/imagelist.csv"
+-#define IMAGELIST_LOCAL_DIR "/ce/app/"
+-#define IMAGELIST_LOCAL     "/ce/app/imagelist.csv"
+-#define IMAGE_DOWNLOAD_DIR  "/tmp/"
++#include "../datatypes.h"
++#include "imagelibsources.h"
++
++// Per-source list cache: <dir>/<sourceId>.list, one file per web source of
++// IMAGELIB_SOURCES. Must be writable and should survive a reboot; images
++// with a read-only root set it at build time (e.g. -DIMAGELIST_CACHE_DIR=
++// '"/data/imagelists"').
++#ifndef IMAGELIST_CACHE_DIR
++#define IMAGELIST_CACHE_DIR "/ce/app/imagelists"
++#endif
++// The newest list version over all sources (first line of a legacy CSV),
++// written whenever the lists are loaded; read by update.cpp
++#define IMAGELIST_VERSION_FILE  IMAGELIST_CACHE_DIR "/version"
++#define IMAGE_DOWNLOAD_DIR      "/tmp/"
++
++// minimum time between two automatic download attempts of a missing list
++#define IMAGELIST_RETRY_MS      (60 * 1000)
+ 
+ typedef struct {
+     std::string imageName;
+     std::string url;
+     int         checksum;
+-    std::string games;
++    std::string games;          // lower case, for searching (as before)
++    std::string gamesDisplay;   // original case, for showing
++    int         sourceIndex;    // index in the source list
+     bool        marked;
+ } ImageListItem;
+ 
+@@ -24,13 +40,22 @@ typedef struct {
+     int         imageIndex;
+ } SearchResult;
+ 
++// a source of IMAGELIB_SOURCES and what we know about it
++typedef struct {
++    ImageLibSource src;
++    std::string cachePath;      // web: the cached list
++    int         entries;        // images loaded from it
++    std::string version;        // first line of the list
++    time_t      updated;        // cached list's modification time (0: none)
++    int         lastResult;     // DWNSTATUS_* of the last download this session, -1: none
++    DWORD       lastAttempt;    // Utils::getCurrentMs() of the last download request
++} ImageListSource;
++
+ class ImageList
+ {
+ public:
+     ImageList(void);
+ 
+-    static void downloadFromWeb(void);
+-
+     bool exists(void);
+     bool loadList(void);
+     bool getIsLoaded(void);
+@@ -46,14 +71,42 @@ public:
+     bool getImageUrl(const char *imageFileName, std::string &url);
+     bool getImageNameFromResultsByIndex(int index, std::string &imageName);
+ 
++    // Sources (IMAGELIB_SOURCES); read the setting again with loadSources()
++    void loadSources(void);
++    const std::vector<ImageListSource> &getSources(void) { return sources; }
++    void getSourceStatus(int index, std::string &status);   // online / offline / downloading / unavailable / disabled / not_loaded
++
++    // Image search for the web UI: one result per image (not per game),
++    // matching images in list order; all images for an empty query.
++    void searchImages(const char *part, std::vector<int> &imageIndexes);
++    const ImageListItem *getImage(int imageIndex);
++
++    // IMAGELIST_URL / IMAGELIB_SOURCE from earlier builds -> IMAGELIB_SOURCES
++    static void migrateSettings(void);
++
+ private:
+     std::vector<ImageListItem>      vectorOfImages;
+     std::vector<SearchResult>       vectorOfResults;
++    std::vector<ImageListSource>    sources;
+ 
+-    bool isLoaded;
++    // download status bytes, one per source id, never moved (the downloader
++    // writes to them from its thread)
++    struct DownloadSlot {
++        std::string     id;
++        volatile BYTE   status;
++        bool            used;
++    };
++    DownloadSlot downloadSlots[IMAGELIB_MAX_SOURCES * 2];
++
++    bool        isLoaded;
++    std::string loadedSignature;    // cached lists (names, sizes, times) at the last load
+ 
+     void getSingleGame(std::string &games, std::string &game, size_t pos);
++    bool loadOneList(int sourceIndex, std::map<std::string, bool> &seen);
++    void downloadSource(int sourceIndex);
++    std::string cacheSignature(void);
++    volatile BYTE *downloadStatusFor(const std::string &id);
++    void writeVersionFile(void);
+ };
+ 
+ #endif
+-
+diff --git a/ce_main_app/floppy/imagestorage.cpp b/ce_main_app/floppy/imagestorage.cpp
+index e4b1196c..ecde5e8a 100644
+--- a/ce_main_app/floppy/imagestorage.cpp
++++ b/ce_main_app/floppy/imagestorage.cpp
+@@ -17,6 +17,8 @@
+ #include "../downloader.h"
+ #include "../debug.h"
+ #include "../translated/translateddisk.h"
++#include "../usbserial.h"
++#include "imagelibsources.h"
+ 
+ ImageStorage::ImageStorage(void)
+ {
+@@ -135,3 +137,79 @@ bool ImageStorage::weHaveThisImage(const char *imageFileName)    // returns if f
+     bool exists = Utils::fileExists(path.c_str());   // try to access the file
+     return exists;
+ }
++
++void ImageStorage::listUsbSticks(std::vector<UsbStickInfo> &sticks)
++{
++    sticks.clear();
++
++    TranslatedDisk *translated = TranslatedDisk::getInstance();
++    if(!translated) {
++        return;
++    }
++
++    std::vector<TranslatedUsbDrive> drives;
++    translated->mutexLock();
++    translated->getUsbDrives(drives);
++    translated->mutexUnlock();
++
++    for(size_t i=0; i<drives.size(); i++) {
++        UsbStickInfo u;
++        u.letter = drives[i].stDriveLetter;
++        u.device = drives[i].devicePath;
++        u.mount  = drives[i].hostRootPath;
++        u.label  = drives[i].label;
++        usbSerialForBlockDevice(u.device, u.serial);
++        sticks.push_back(u);
++    }
++}
++
++bool ImageStorage::findMountForUsbSerial(const std::string &serial, std::string &mountPath)
++{
++    mountPath.clear();
++
++    std::vector<UsbStickInfo> sticks;
++    listUsbSticks(sticks);
++
++    for(size_t i=0; i<sticks.size(); i++) {
++        if(!sticks[i].serial.empty() && sticks[i].serial == serial) {
++            mountPath = sticks[i].mount;            // first partition of that stick that is attached
++            return true;
++        }
++    }
++    return false;
++}
++
++bool ImageStorage::resolveLocation(const std::string &spec, std::string &hostPath)
++{
++    hostPath.clear();
++
++    int type;
++    std::string serial, path, root;
++    if(!ImageLibSources::parseLocation(spec, type, serial, path)) {
++        Debug::out(LOG_ERROR, "ImageStorage::resolveLocation() - invalid location: %s", spec.c_str());
++        return false;
++    }
++
++    if(type == IMAGELIB_TYPE_SHARE) {
++        TranslatedDisk *translated = TranslatedDisk::getInstance();
++        bool ok = false;
++        if(translated) {
++            translated->mutexLock();
++            ok = translated->getSharedDrivePath(root);
++            translated->mutexUnlock();
++        }
++        if(!ok) {
++            Debug::out(LOG_DEBUG, "ImageStorage::resolveLocation() - %s: the shared drive isn't available", spec.c_str());
++            return false;
++        }
++    } else {
++        if(!findMountForUsbSerial(serial, root)) {
++            Debug::out(LOG_DEBUG, "ImageStorage::resolveLocation() - %s: no USB drive with serial %s attached", spec.c_str(), serial.c_str());
++            return false;
++        }
++    }
++
++    hostPath = root;
++    Utils::mergeHostPaths(hostPath, path);
++    return true;
++}
+diff --git a/ce_main_app/floppy/imagestorage.h b/ce_main_app/floppy/imagestorage.h
+index 4f355958..61a08903 100644
+--- a/ce_main_app/floppy/imagestorage.h
++++ b/ce_main_app/floppy/imagestorage.h
+@@ -8,6 +8,14 @@
+ 
+ #define IMAGE_STORAGE_SUBDIR  "floppy_images"
+ 
++typedef struct {
++    char        letter;         // drive letter on the ST
++    std::string device;         // e.g. /dev/sda1
++    std::string mount;          // e.g. /mnt/sda1
++    std::string label;
++    std::string serial;         // USB serial number ("" if the stick has none)
++} UsbStickInfo;
++
+ class ImageStorage
+ {
+ public:
+@@ -18,6 +26,14 @@ public:
+     bool getImageLocalPath(const char *imageFileName, std::string &path);  // fills the path with full path to the specified image
+     bool weHaveThisImage(const char *imageFileName);    // returns if floppy image with this filename is stored in our storage
+ 
++    // USB sticks attached as translated drives, with their USB serials
++    static void listUsbSticks(std::vector<UsbStickInfo> &sticks);
++    static bool findMountForUsbSerial(const std::string &serial, std::string &mountPath);
++
++    // "share:/a/b" -> "/mnt/shared/a/b"; "usb:SER:/a/b" -> "/mnt/sdX1/a/b".
++    // False (and a log line) if that drive isn't attached right now.
++    static bool resolveLocation(const std::string &spec, std::string &hostPath);
++
+ private:
+ 
+ };
+diff --git a/ce_main_app/settings.cpp b/ce_main_app/settings.cpp
+index b3a0bee5..5064cec7 100644
+--- a/ce_main_app/settings.cpp
++++ b/ce_main_app/settings.cpp
+@@ -6,6 +6,7 @@
+ #include <dirent.h>
+ #include <errno.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ 
+ #define SETTINGS_PATH		"/ce/settings"
+ 
+@@ -186,6 +187,49 @@ char *Settings::getString(const char *key, const char *defValue)
+ 	return buffer;											// return
+ }
+ 
++bool Settings::getStringLong(const char *key, std::string &value, const char *defValue)
++{
++	FILE *file = sOpen(key, true);
++	if(!file) {
++		value = defValue;
++		return false;
++	}
++
++	value.clear();
++	char buffer[1024];
++	size_t n;
++	while((n = fread(buffer, 1, sizeof(buffer), file)) > 0) {
++		value.append(buffer, n);
++	}
++	fclose(file);
++
++	if(!value.empty() && value[value.length() - 1] == '\n') {	// strip one trailing newline
++		value.erase(value.length() - 1);
++		if(!value.empty() && value[value.length() - 1] == '\r') {
++			value.erase(value.length() - 1);
++		}
++	}
++	return true;
++}
++
++bool Settings::keyExists(const char *key)
++{
++	FILE *file = sOpen(key, true);
++	if(!file) {
++		return false;
++	}
++	fclose(file);
++	return true;
++}
++
++void Settings::removeKey(const char *key)
++{
++	std::string path = SETTINGS_PATH;
++	path += "/";
++	path += key;
++	unlink(path.c_str());
++}
++
+ void Settings::setString(const char *key, const char *value)
+ {
+ 	FILE *file = sOpen(key, false);
+diff --git a/ce_main_app/settings.h b/ce_main_app/settings.h
+index 0c5b9456..5d37c846 100644
+--- a/ce_main_app/settings.h
++++ b/ce_main_app/settings.h
+@@ -2,6 +2,7 @@
+ #define _SETTINGS_H_
+ 
+ #include <stdio.h>
++#include <string>
+ #include "datatypes.h"
+ 
+ typedef struct {
+@@ -38,6 +39,12 @@ public:
+ 	void  setFloat(const char *key, float value);
+ 
+ 	char *getString(const char *key, const char *defValue);
++	// The whole value, any length (getString() stops at 255 characters and
++	// returns a shared buffer); one trailing newline is stripped. Returns
++	// false (and defValue) if the key isn't set.
++	bool  getStringLong(const char *key, std::string &value, const char *defValue);
++	bool  keyExists(const char *key);
++	void  removeKey(const char *key);
+ 	void  setString(const char *key, const char *value);
+ 
+     char getChar(const char *key, char defValue);
+diff --git a/ce_main_app/translated/translateddisk.h b/ce_main_app/translated/translateddisk.h
+index 67abf5be..c020a810 100644
+--- a/ce_main_app/translated/translateddisk.h
++++ b/ce_main_app/translated/translateddisk.h
+@@ -4,6 +4,7 @@
+ 
+ #include <stdio.h>
+ #include <string>
++#include <vector>
+ #include <time.h>
+ 
+ #include "dirtranslator.h"
+@@ -51,6 +52,13 @@ typedef struct {
+     int         translatedType;             // normal / shared / config
+ } TranslatedConfTemp;
+ 
++typedef struct {
++    char        stDriveLetter;              // letter on the ST
++    std::string devicePath;                 // e.g. /dev/sda1
++    std::string hostRootPath;               // e.g. /mnt/sda1
++    std::string label;
++} TranslatedUsbDrive;
++
+ typedef struct {
+     FILE *hostHandle;                       // file handle for all the work with the file on host
+     BYTE atariHandle;                       // file handle used on Atari
+@@ -159,6 +167,8 @@ public:
+     void createFullHostPath (const std::string &inFullAtariPath, int inAtariDriveIndex, std::string &outFullHostPath, bool &waitingForMount, int &zipDirNestingLevel);
+ 
+     bool getPathToUsbDriveOrSharedDrive(std::string &hostRootPath);
++    void getUsbDrives(std::vector<TranslatedUsbDrive> &drives);        // attached USB drives (call with mutexLock() held)
++    bool getSharedDrivePath(std::string &hostRootPath);                 // false if the shared drive isn't attached (mutexLock() held)
+ 
+     // for status report
+     bool driveIsEnabled(int driveIndex);
+diff --git a/ce_main_app/translated/translateddisk_general.cpp b/ce_main_app/translated/translateddisk_general.cpp
+index b097ee5d..ef5a302b 100644
+--- a/ce_main_app/translated/translateddisk_general.cpp
++++ b/ce_main_app/translated/translateddisk_general.cpp
+@@ -1804,6 +1804,34 @@ void TranslatedDisk::fillDisplayLines(void)
+     display_setLine(DISP_LINE_TRAN_DRIV, tmp);
+ }
+ 
++void TranslatedDisk::getUsbDrives(std::vector<TranslatedUsbDrive> &drives)
++{
++    drives.clear();
++    for(int i=0; i<MAX_DRIVES; i++) {
++        if(!conf[i].enabled || conf[i].translatedType != TRANSLATEDTYPE_NORMAL) {
++            continue;
++        }
++        TranslatedUsbDrive d;
++        d.stDriveLetter = conf[i].stDriveLetter;
++        d.devicePath    = conf[i].devicePath;
++        d.hostRootPath  = conf[i].hostRootPath;
++        d.label         = conf[i].label;
++        drives.push_back(d);
++    }
++}
++
++bool TranslatedDisk::getSharedDrivePath(std::string &hostRootPath)
++{
++    hostRootPath.clear();
++    for(int i=0; i<MAX_DRIVES; i++) {
++        if(conf[i].enabled && conf[i].translatedType == TRANSLATEDTYPE_SHAREDDRIVE) {
++            hostRootPath = conf[i].hostRootPath;
++            return true;
++        }
++    }
++    return false;
++}
++
+ bool TranslatedDisk::getPathToUsbDriveOrSharedDrive(std::string &hostRootPath)
+ {
+     int i, sharedDriveIndex = -1;
+diff --git a/ce_main_app/update.cpp b/ce_main_app/update.cpp
+index f8be7011..ab7441c3 100644
+--- a/ce_main_app/update.cpp
++++ b/ce_main_app/update.cpp
+@@ -30,7 +30,7 @@ void Update::initialize(void)
+ 
+     Update::versions.current.app.fromString(                (char *) appVersion);
+     Update::versions.current.xilinx.fromFirstLineOfFile(    (char *) XILINX_VERSION_FILE, false);   // xilinx version file without dashes
+-    Update::versions.current.imageList.fromFirstLineOfFile( (char *) IMAGELIST_LOCAL);
++    Update::versions.current.imageList.fromFirstLineOfFile( (char *) IMAGELIST_VERSION_FILE);  // written by ImageList::loadList()
+     Update::versions.updateListWasProcessed = false;
+     Update::versions.gotUpdate              = false;
+ }
+diff --git a/ce_main_app/usbserial.cpp b/ce_main_app/usbserial.cpp
+new file mode 100644
+index 00000000..6976d286
+--- /dev/null
++++ b/ce_main_app/usbserial.cpp
+@@ -0,0 +1,78 @@
++// USB serial number of a block device, from sysfs. See usbserial.h.
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <limits.h>
++#include <unistd.h>
++
++#include "usbserial.h"
++
++std::string usbBlockDiskName(const std::string &devicePath)
++{
++    std::string name = devicePath;
++    size_t slash = name.rfind('/');
++    if(slash != std::string::npos) name = name.substr(slash + 1);
++
++    if(name.compare(0, 6, "mmcblk") == 0 || name.compare(0, 4, "nvme") == 0) {
++        size_t p = name.find('p', 4);                   // mmcblk0p1 -> mmcblk0
++        if(p != std::string::npos && p + 1 < name.length() && isdigit((unsigned char) name[p + 1])) {
++            name = name.substr(0, p);
++        }
++        return name;
++    }
++
++    while(!name.empty() && isdigit((unsigned char) name[name.length() - 1])) {   // sda1 -> sda
++        name.erase(name.length() - 1);
++    }
++    return name;
++}
++
++static bool readFirstLine(const std::string &path, std::string &out)
++{
++    FILE *f = fopen(path.c_str(), "r");
++    if(!f) return false;
++
++    char buf[256];
++    memset(buf, 0, sizeof(buf));
++    char *r = fgets(buf, sizeof(buf), f);
++    fclose(f);
++    if(!r) return false;
++
++    out = buf;
++    while(!out.empty() && (out[out.length() - 1] == '\n' || out[out.length() - 1] == '\r' || out[out.length() - 1] == ' ')) {
++        out.erase(out.length() - 1);
++    }
++    return true;
++}
++
++bool usbSerialForBlockDevice(const std::string &devicePath, std::string &serial, const char *sysRoot)
++{
++    serial.clear();
++
++    std::string disk = usbBlockDiskName(devicePath);
++    if(disk.empty()) return false;
++
++    std::string link = std::string(sysRoot) + "/block/" + disk + "/device";
++    char real[PATH_MAX];
++    if(!realpath(link.c_str(), real)) return false;
++
++    std::string root = std::string(sysRoot) + "/devices";
++    char realRoot[PATH_MAX];
++    if(realpath(root.c_str(), realRoot)) root = realRoot;
++
++    std::string dir = real;
++    while(dir.length() > root.length() && dir.compare(0, root.length(), root) == 0) {
++        std::string s, vendor;
++        if(readFirstLine(dir + "/serial", s) && readFirstLine(dir + "/idVendor", vendor)) {
++            if(s.empty()) return false;                 // USB device without a serial number
++            serial = s;
++            return true;
++        }
++        size_t slash = dir.rfind('/');
++        if(slash == std::string::npos || slash == 0) break;
++        dir.erase(slash);
++    }
++    return false;
++}
+diff --git a/ce_main_app/usbserial.h b/ce_main_app/usbserial.h
+new file mode 100644
+index 00000000..1f765d9c
+--- /dev/null
++++ b/ce_main_app/usbserial.h
+@@ -0,0 +1,17 @@
++#ifndef _USBSERIAL_H_
++#define _USBSERIAL_H_
++
++#include <string>
++
++// The USB serial number of the USB device a block device belongs to, read
++// from sysfs (works without udev / /dev/disk/by-id):
++//   /dev/sda1 -> /sys/block/sda/device -> realpath -> walk up the parents
++//   until a USB device directory (has both "serial" and "idVendor").
++// sysRoot is "/sys" except in unit tests. No dependencies on the rest of
++// the app.
++bool usbSerialForBlockDevice(const std::string &devicePath, std::string &serial, const char *sysRoot = "/sys");
++
++// "/dev/sda1" -> "sda", "/dev/sdb" -> "sdb", "/dev/mmcblk0p1" -> "mmcblk0"
++std::string usbBlockDiskName(const std::string &devicePath);
++
++#endif
+diff --git a/ce_main_app/webserver/api/resource/floppyresource.cpp b/ce_main_app/webserver/api/resource/floppyresource.cpp
+index 33b2f7e9..56f789bf 100644
+--- a/ce_main_app/webserver/api/resource/floppyresource.cpp
++++ b/ce_main_app/webserver/api/resource/floppyresource.cpp
+@@ -19,6 +19,9 @@
+ 
+ #include "service/floppyservice.h"
+ #include "floppy/imagesilo.h"
++#include "periodicthread.h"
++
++extern SharedObjects shared;
+ 
+ FloppyResource::FloppyResource(FloppyService *pxFloppyService) : pxFloppyService(pxFloppyService)
+ {
+@@ -32,6 +35,20 @@ bool FloppyResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+ {
+     Debug::out(LOG_DEBUG, "FloppyResource::dispatch");
+ 
++    if( strcmp(req_info->request_method,"DELETE")==0 ){     // DELETE /api/v1/floppy/<0..2>: eject the image in that slot
++        int iSlot=atoi(sResourceInfo.c_str());
++        if( sResourceInfo.empty() || iSlot<0 || iSlot>2 )
++        {
++            mg_printf(conn, "HTTP/1.1 400 Selected slot not in range 0 to 2\r\nContent-Length: 0\r\n\r\n");
++            return true;
++        }
++        pthread_mutex_lock(&shared.mtxImages);
++        shared.imageSilo->remove(iSlot);
++        pthread_mutex_unlock(&shared.mtxImages);
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}");
++        return true;
++    }
++
+     if( strstr(req_info->request_method,"GET")==0 && strstr(req_info->request_method,"POST")==0 && strstr(req_info->request_method,"PUT")==0 ){
+         mg_printf(conn, "HTTP/1.1 405 Method Not Allowed %s\r\n",req_info->request_method);
+         return true;
+diff --git a/ce_main_app/webserver/api/resource/libraryresource.cpp b/ce_main_app/webserver/api/resource/libraryresource.cpp
+new file mode 100644
+index 00000000..f1b67f10
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/libraryresource.cpp
+@@ -0,0 +1,425 @@
++// /api/v1/library/...: the floppy image library for the web UI (see
++// libraryresource.h). All responses are JSON built with cJSON, so list text
++// is escaped properly.
++
++#include "webserver/webserver.h"
++
++#include <string>
++#include <vector>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <time.h>
++
++#include "lib/cjson-code-58/cJSON.h"
++#include "debug.h"
++#include "global.h"
++#include "libraryresource.h"
++#include "service/floppyservice.h"
++#include "../../../floppy/imagelist.h"
++#include "../../../floppy/imagelibsources.h"
++#include "../../../floppy/imagestorage.h"
++#include "../../../floppy/imagesilo.h"
++#include "../../../floppy/floppysetup.h"
++#include "../../../settings.h"
++#include "../../../utils.h"
++#include "../../../periodicthread.h"
++
++extern SharedObjects shared;
++
++#define LIBRARY_MAX_BODY        (16 * 1024)     // 8 sources with long paths fit easily
++#define LIBRARY_MAX_PAGE_SIZE   100
++
++static const char *typeName(int type)
++{
++    switch(type) {
++    case IMAGELIB_TYPE_WEB:     return "web";
++    case IMAGELIB_TYPE_SHARE:   return "share";
++    case IMAGELIB_TYPE_USB:     return "usb";
++    }
++    return "unknown";
++}
++
++static std::string isoTime(time_t t)
++{
++    if(t == 0) {
++        return "";
++    }
++    char buf[32];
++    struct tm tmv;
++    gmtime_r(&t, &tmv);
++    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
++    return buf;
++}
++
++LibraryResource::LibraryResource(FloppyService *pxFloppyService) : pxFloppyService(pxFloppyService)
++{
++}
++
++LibraryResource::~LibraryResource()
++{
++}
++
++void LibraryResource::sendJson(mg_connection *conn, cJSON *root, int code)
++{
++    char *json = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    std::string sJson = json ? json : "{}";
++    free(json);
++
++    const char *text = (code == 200) ? "OK" : (code == 400) ? "Bad Request" : (code == 404) ? "Not Found" :
++                       (code == 405) ? "Method Not Allowed" : (code == 413) ? "Payload Too Large" :
++                       (code == 415) ? "Unsupported Media Type" : "Error";
++    mg_printf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nCache-Control: no-cache\r\n", code, text);
++    mg_printf(conn, "Content-Length: %lu\r\n\r\n", (unsigned long) sJson.length());
++    mg_write(conn, sJson.c_str(), sJson.length());
++}
++
++void LibraryResource::sendError(mg_connection *conn, int code, const char *message)
++{
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddStringToObject(root, "status", "error");
++    cJSON_AddStringToObject(root, "error", message);
++    sendJson(conn, root, code);
++}
++
++void LibraryResource::addUsbSticks(cJSON *root)
++{
++    std::vector<UsbStickInfo> sticks;
++    ImageStorage::listUsbSticks(sticks);
++
++    cJSON *arr = cJSON_CreateArray();
++    for(size_t i=0; i<sticks.size(); i++) {
++        cJSON *u = cJSON_CreateObject();
++        char letter[2] = { sticks[i].letter, 0 };
++        cJSON_AddStringToObject(u, "letter",    letter);
++        cJSON_AddStringToObject(u, "device",    sticks[i].device.c_str());
++        cJSON_AddStringToObject(u, "mount",     sticks[i].mount.c_str());
++        cJSON_AddStringToObject(u, "label",     sticks[i].label.c_str());
++        if(sticks[i].serial.empty()) {
++            cJSON_AddNullToObject(u, "serial");             // a stick without a serial number can't be a library source
++        } else {
++            cJSON_AddStringToObject(u, "serial", sticks[i].serial.c_str());
++        }
++        cJSON_AddItemToArray(arr, u);
++    }
++    cJSON_AddItemToObject(root, "usb", arr);
++}
++
++void LibraryResource::onGetSources(mg_connection *conn)
++{
++    ImageList *il = shared.imageList;
++    il->exists();                                   // starts downloads of lists we don't have yet
++    if(!il->getIsLoaded()) {
++        il->loadList();                             // so the entry counts are current
++    }
++
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddNumberToObject(root, "max", IMAGELIB_MAX_SOURCES);
++
++    const std::vector<ImageListSource> &sources = il->getSources();
++    cJSON *arr = cJSON_CreateArray();
++    for(int i=0; i<(int) sources.size(); i++) {
++        const ImageListSource &ls = sources[i];
++        cJSON *s = cJSON_CreateObject();
++
++        std::string status;
++        il->getSourceStatus(i, status);
++
++        cJSON_AddStringToObject(s, "id",        ls.src.id.c_str());
++        cJSON_AddStringToObject(s, "type",      typeName(ls.src.type));
++        cJSON_AddStringToObject(s, "spec",      ls.src.spec.c_str());
++        cJSON_AddBoolToObject(s,   "enabled",   ls.src.enabled);
++        cJSON_AddStringToObject(s, "label",     ls.src.label.c_str());
++        if(ls.src.type == IMAGELIB_TYPE_WEB) {
++            cJSON_AddStringToObject(s, "url",   ls.src.url.c_str());
++        } else {
++            cJSON_AddStringToObject(s, "path",  ls.src.path.c_str());
++            if(ls.src.type == IMAGELIB_TYPE_USB) {
++                cJSON_AddStringToObject(s, "serial", ls.src.serial.c_str());
++            }
++            std::string hostPath;
++            if(ls.src.enabled && ImageStorage::resolveLocation(ls.src.spec, hostPath)) {
++                cJSON_AddStringToObject(s, "resolved", hostPath.c_str());
++            } else {
++                cJSON_AddNullToObject(s, "resolved");       // drive not attached right now
++            }
++        }
++        cJSON_AddStringToObject(s, "status",    status.c_str());
++        cJSON_AddNumberToObject(s, "entries",   ls.entries);
++        cJSON_AddStringToObject(s, "version",   ls.version.c_str());
++        cJSON_AddStringToObject(s, "updated",   isoTime(ls.updated).c_str());
++        cJSON_AddItemToArray(arr, s);
++    }
++    cJSON_AddItemToObject(root, "sources", arr);
++
++    addUsbSticks(root);
++
++    std::string storage;
++    if(shared.imageStorage->getStoragePath(storage)) {
++        cJSON_AddStringToObject(root, "storage", storage.c_str());     // where downloads go
++    } else {
++        cJSON_AddNullToObject(root, "storage");
++    }
++
++    sendJson(conn, root);
++}
++
++void LibraryResource::onPutSources(mg_connection *conn)
++{
++    // JSON only: a cross-site form post can't send this without a CORS preflight
++    const char *ctype = mg_get_header(conn, "Content-Type");
++    if(!ctype || strncasecmp(ctype, "application/json", 16) != 0) {
++        sendError(conn, 415, "Content-Type must be application/json");
++        return;
++    }
++
++    std::string body;
++    char buf[1024];
++    int n;
++    while((n = mg_read(conn, buf, sizeof(buf))) > 0) {
++        body.append(buf, n);
++        if(body.length() > LIBRARY_MAX_BODY) {
++            sendError(conn, 413, "request too large");
++            return;
++        }
++    }
++
++    cJSON *req = cJSON_Parse(body.c_str());
++    if(!req) {
++        sendError(conn, 400, "invalid JSON");
++        return;
++    }
++
++    cJSON *arr = cJSON_GetObjectItem(req, "sources");
++    if(!arr || arr->type != cJSON_Array) {
++        cJSON_Delete(req);
++        sendError(conn, 400, "\"sources\" must be an array");
++        return;
++    }
++
++    int count = cJSON_GetArraySize(arr);
++    if(count > IMAGELIB_MAX_SOURCES) {
++        cJSON_Delete(req);
++        sendError(conn, 400, "at most 8 sources");
++        return;
++    }
++
++    std::vector<ImageLibSource> sources;
++    for(int i=0; i<count; i++) {
++        cJSON *item = cJSON_GetArrayItem(arr, i);
++        cJSON *spec = item ? cJSON_GetObjectItem(item, "spec") : NULL;
++        cJSON *enabled = item ? cJSON_GetObjectItem(item, "enabled") : NULL;
++
++        if(!spec || spec->type != cJSON_String || !spec->valuestring) {
++            cJSON_Delete(req);
++            sendError(conn, 400, "each source needs a \"spec\" string");
++            return;
++        }
++
++        std::string sSpec = spec->valuestring;
++        for(size_t c=0; c<sSpec.length(); c++) {            // one entry per spec: no list separators or line breaks
++            if(sSpec[c] == ',' || sSpec[c] == '\n' || sSpec[c] == '\r') {
++                if(sSpec.compare(0, 6, "share:") == 0 || sSpec.compare(0, 4, "usb:") == 0) {
++                    if(sSpec[c] == ',') continue;           // allowed in paths: joined as %2C
++                }
++                cJSON_Delete(req);
++                std::string msg = "invalid character in source: " + sSpec;
++                sendError(conn, 400, msg.c_str());
++                return;
++            }
++        }
++
++        ImageLibSource src;
++        // a path with a literal comma: parseEntry() expects it as %2C
++        std::string entry = sSpec;
++        if(entry.compare(0, 6, "share:") == 0 || entry.compare(0, 4, "usb:") == 0) {
++            std::string enc;
++            for(size_t c=0; c<entry.length(); c++) {
++                if(entry[c] == ',') enc += "%2C"; else enc += entry[c];
++            }
++            entry = enc;
++        }
++        while(!entry.empty() && (entry[0] == ' ' || entry[0] == '\t')) entry.erase(0, 1);
++        while(!entry.empty() && (entry[entry.length() - 1] == ' ' || entry[entry.length() - 1] == '\t')) entry.erase(entry.length() - 1);
++
++        if(!ImageLibSources::parseEntry(entry, src)) {
++            cJSON_Delete(req);
++            std::string msg = "not a valid source (http(s)://..., share:/path or usb:SERIAL:/path): " + sSpec;
++            sendError(conn, 400, msg.c_str());
++            return;
++        }
++        src.enabled = !(enabled && enabled->type == cJSON_False);
++
++        for(size_t j=0; j<sources.size(); j++) {
++            if(sources[j].id == src.id) {
++                cJSON_Delete(req);
++                std::string msg = "the same source twice: " + sSpec;
++                sendError(conn, 400, msg.c_str());
++                return;
++            }
++        }
++        sources.push_back(src);
++    }
++    cJSON_Delete(req);
++
++    std::string value = ImageLibSources::join(sources);
++    Settings s;
++    s.setString(IMAGELIB_SOURCES_KEY, value.c_str());
++    Utils::forceSync();
++    Debug::out(LOG_INFO, "LibraryResource: %s = %s", IMAGELIB_SOURCES_KEY, value.c_str());
++
++    shared.imageList->refreshList();                // read the new sources, fetch their lists
++
++    onGetSources(conn);                             // answer with the new state
++}
++
++void LibraryResource::onRefresh(mg_connection *conn)
++{
++    shared.imageList->refreshList();
++    onGetSources(conn);
++}
++
++void LibraryResource::onSearch(mg_connection *conn, mg_request_info *req_info)
++{
++    const char *qs = req_info->query_string;
++    int qs_len = qs ? strlen(qs) : 0;
++
++    char q[128] = "", tmp[16], source[80] = "";
++    int page = 0, size = 20;
++    if(qs_len > 0) {
++        mg_get_var(qs, qs_len, "q", q, sizeof(q) - 1);
++        if(mg_get_var(qs, qs_len, "page", tmp, sizeof(tmp) - 1) > 0) page = atoi(tmp);
++        if(mg_get_var(qs, qs_len, "size", tmp, sizeof(tmp) - 1) > 0) size = atoi(tmp);
++        mg_get_var(qs, qs_len, "source", source, sizeof(source) - 1);      // only this source id
++    }
++    if(page < 0) page = 0;
++    if(size < 1) size = 1;
++    if(size > LIBRARY_MAX_PAGE_SIZE) size = LIBRARY_MAX_PAGE_SIZE;
++
++    ImageList *il = shared.imageList;
++    cJSON *root = cJSON_CreateObject();
++
++    // the slots, so the page can show what's inserted
++    cJSON *slots = cJSON_CreateArray();
++    for(int i=0; i<3; i++) {
++        cJSON_AddItemToArray(slots, cJSON_CreateString(pxFloppyService->getImageName(i).c_str()));
++    }
++    cJSON_AddItemToObject(root, "slots", slots);
++    cJSON_AddBoolToObject(root, "storage", shared.imageStorage->doWeHaveStorage());
++
++    if(!il->exists()) {                             // no list yet: downloading
++        cJSON_AddStringToObject(root, "status", "downloading");
++        cJSON_AddNumberToObject(root, "total", 0);
++        cJSON_AddItemToObject(root, "results", cJSON_CreateArray());
++        sendJson(conn, root);
++        return;
++    }
++
++    std::vector<int> found;
++    il->searchImages(q, found);
++
++    const std::vector<ImageListSource> &sources = il->getSources();
++    if(source[0]) {
++        std::vector<int> filtered;
++        for(size_t i=0; i<found.size(); i++) {
++            const ImageListItem *img = il->getImage(found[i]);
++            if(img && img->sourceIndex >= 0 && img->sourceIndex < (int) sources.size() &&
++               sources[img->sourceIndex].src.id == source) {
++                filtered.push_back(found[i]);
++            }
++        }
++        found.swap(filtered);
++    }
++
++    int total = (int) found.size();
++    int pages = (total + size - 1) / size;
++    if(page >= pages && pages > 0) page = pages - 1;
++
++    cJSON_AddStringToObject(root, "status", il->getIsLoaded() ? "ok" : "not_loaded");
++    cJSON_AddNumberToObject(root, "total", total);
++    cJSON_AddNumberToObject(root, "page", page);
++    cJSON_AddNumberToObject(root, "pages", pages);
++    cJSON_AddNumberToObject(root, "size", size);
++
++    cJSON *results = cJSON_CreateArray();
++    for(int r = page * size; r < total && r < (page + 1) * size; r++) {
++        const ImageListItem *img = il->getImage(found[r]);
++        if(!img) continue;
++
++        cJSON *o = cJSON_CreateObject();
++        cJSON_AddStringToObject(o, "image", img->imageName.c_str());
++
++        cJSON *games = cJSON_CreateArray();             // the games on this image, original case
++        size_t start = 0;
++        const std::string &g = img->gamesDisplay;
++        while(start <= g.length()) {
++            size_t comma = g.find(',', start);
++            if(comma == std::string::npos) comma = g.length();
++            std::string one = g.substr(start, comma - start);
++            while(!one.empty() && one[0] == ' ') one.erase(0, 1);
++            while(!one.empty() && one[one.length() - 1] == ' ') one.erase(one.length() - 1);
++            if(!one.empty()) cJSON_AddItemToArray(games, cJSON_CreateString(one.c_str()));
++            start = comma + 1;
++        }
++        cJSON_AddItemToObject(o, "games", games);
++
++        if(img->sourceIndex >= 0 && img->sourceIndex < (int) sources.size()) {
++            cJSON_AddStringToObject(o, "sourceId", sources[img->sourceIndex].src.id.c_str());
++            cJSON_AddStringToObject(o, "source", sources[img->sourceIndex].src.label.c_str());
++        }
++
++        cJSON_AddBoolToObject(o, "haveIt", shared.imageStorage->weHaveThisImage(img->imageName.c_str()));
++
++        char inSlots[3];
++        std::string name = img->imageName;
++        shared.imageSilo->containsImageInSlots(name, inSlots);
++        cJSON *slotArr = cJSON_CreateArray();
++        for(int i=0; i<3; i++) {
++            if(inSlots[i] == ROW_OBJ_SELECTED) cJSON_AddItemToArray(slotArr, cJSON_CreateNumber(i));
++        }
++        cJSON_AddItemToObject(o, "inSlots", slotArr);
++
++        cJSON_AddItemToArray(results, o);
++    }
++    cJSON_AddItemToObject(root, "results", results);
++
++    sendJson(conn, root);
++}
++
++void LibraryResource::onGetUsb(mg_connection *conn)
++{
++    cJSON *root = cJSON_CreateObject();
++    addUsbSticks(root);
++    sendJson(conn, root);
++}
++
++bool LibraryResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
++{
++    const char *m = req_info->request_method;
++    std::string path = sResourceInfo;
++    size_t q = path.find('?');
++    if(q != std::string::npos) path.erase(q);
++
++    pthread_mutex_lock(&shared.mtxImages);      // image list, storage and silo are shared with the core thread
++
++    if(path == "sources" && strcmp(m, "GET") == 0) {
++        onGetSources(conn);
++    } else if(path == "sources" && strcmp(m, "PUT") == 0) {
++        onPutSources(conn);
++    } else if(path == "refresh" && strcmp(m, "POST") == 0) {
++        onRefresh(conn);
++    } else if(path == "search" && strcmp(m, "GET") == 0) {
++        onSearch(conn, req_info);
++    } else if(path == "usb" && strcmp(m, "GET") == 0) {
++        onGetUsb(conn);
++    } else if(path == "sources" || path == "refresh" || path == "search" || path == "usb") {
++        sendError(conn, 405, "method not allowed");
++    } else {
++        sendError(conn, 404, "unknown library resource");
++    }
++
++    pthread_mutex_unlock(&shared.mtxImages);
++    return true;
++}
+diff --git a/ce_main_app/webserver/api/resource/libraryresource.h b/ce_main_app/webserver/api/resource/libraryresource.h
+new file mode 100644
+index 00000000..f21d986d
+--- /dev/null
++++ b/ce_main_app/webserver/api/resource/libraryresource.h
+@@ -0,0 +1,43 @@
++#ifndef LIBRARYRESOURCE_H
++#define	LIBRARYRESOURCE_H
++
++#include <string>
++
++#include "../../CivetServer.h"
++
++#include "iapiresource.h"
++
++class FloppyService;
++struct cJSON;
++
++// Floppy image library (IMAGELIB_SOURCES) for the web UI:
++//   GET  /api/v1/library/sources   sources in priority order with their status,
++//                                  attached USB sticks with serials
++//   PUT  /api/v1/library/sources   {"sources":[{"spec":"...","enabled":true},...]}
++//                                  (application/json only) -> IMAGELIB_SOURCES
++//   POST /api/v1/library/refresh   download the web sources' lists again
++//   GET  /api/v1/library/search?q=&page=&size=&source=<id>
++//                                  images (not games) matching q, with their
++//                                  games, source, downloaded or not, slots
++//   GET  /api/v1/library/usb       attached USB sticks with serials
++class LibraryResource : public IApiResource {
++public:
++    LibraryResource(FloppyService *pxFloppyService);
++    virtual ~LibraryResource();
++    bool dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo="" );
++
++private:
++    FloppyService *pxFloppyService;
++
++    void onGetSources(mg_connection *conn);
++    void onPutSources(mg_connection *conn);
++    void onRefresh(mg_connection *conn);
++    void onSearch(mg_connection *conn, mg_request_info *req_info);
++    void onGetUsb(mg_connection *conn);
++
++    void addUsbSticks(cJSON *root);
++    void sendJson(mg_connection *conn, cJSON *root, int code = 200);
++    void sendError(mg_connection *conn, int code, const char *message);
++};
++
++#endif
+diff --git a/ce_main_app/webserver/api/router/apiv1router.cpp b/ce_main_app/webserver/api/router/apiv1router.cpp
+index 606d8710..53aa8304 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.cpp
++++ b/ce_main_app/webserver/api/router/apiv1router.cpp
+@@ -7,6 +7,7 @@
+ #include "../resource/kbdresource.h"
+ #include "../resource/floppyresource.h"
+ #include "../resource/downloadresource.h"
++#include "../resource/libraryresource.h"
+ 
+ #include "../../../debug.h"
+ 
+@@ -19,6 +20,7 @@ ApiV1Router::ApiV1Router(VirtualKeyboardService* pxVKbdService,VirtualMouseServi
+     pxDownload=new DownloadResource(pxFloppyService);
+     pxConfig=new ConfigResource();
+     pxStatus=new StatusResource();
++    pxLibrary=new LibraryResource(pxFloppyService);
+ }
+ 
+ ApiV1Router::~ApiV1Router()
+@@ -30,7 +32,9 @@ ApiV1Router::~ApiV1Router()
+     delete pxConfig;
+     delete pxDownload;
+     delete pxStatus;
++    delete pxLibrary;
+     pxStatus=NULL;
++    pxLibrary=NULL;
+     pxMouse=NULL;
+     pxKeyboard=NULL;
+     pxFloppy=NULL;
+@@ -48,6 +52,11 @@ bool ApiV1Router::handlePut(CivetServer *server, struct mg_connection *conn)
+     return handleGet(server, conn);
+ }
+ 
++bool ApiV1Router::handleDelete(CivetServer *server, struct mg_connection *conn)
++{
++    return handleGet(server, conn);
++}
++
+ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+ {
+     Debug::out(LOG_DEBUG, "Webserver dispatch ApiV1Router");
+@@ -88,6 +97,12 @@ bool ApiV1Router::handleGet(CivetServer *server, struct mg_connection *conn)
+         sResourceInfo.erase(0,7);
+         bool processed=pxConfig->dispatch(conn,req_info,sResourceInfo);
+         return processed;
++    } else if( sResource.substr(0,8)=="library/" )
++    {
++        std::string sResourceInfo=sResource;
++        sResourceInfo.erase(0,8);
++        bool processed=pxLibrary->dispatch(conn,req_info,sResourceInfo);
++        return processed;
+     } else if( sResource=="status" )
+     {
+         bool processed=pxStatus->dispatch(conn,req_info);
+diff --git a/ce_main_app/webserver/api/router/apiv1router.h b/ce_main_app/webserver/api/router/apiv1router.h
+index cf5906d1..c69733b7 100644
+--- a/ce_main_app/webserver/api/router/apiv1router.h
++++ b/ce_main_app/webserver/api/router/apiv1router.h
+@@ -13,6 +13,7 @@
+ #include "../resource/configresource.h"
+ #include "../resource/downloadresource.h"
+ #include "../resource/statusresource.h"
++#include "../resource/libraryresource.h"
+ 
+ class ApiV1Router: public CivetHandler
+ {
+@@ -22,6 +23,7 @@ public:
+     bool handleGet(CivetServer *server, struct mg_connection *conn);
+     bool handlePost(CivetServer *server, struct mg_connection *conn);
+     bool handlePut(CivetServer *server, struct mg_connection *conn);
++    bool handleDelete(CivetServer *server, struct mg_connection *conn);
+ private:
+     MouseResource *pxMouse;
+     KbdResource *pxKeyboard;
+@@ -29,6 +31,7 @@ private:
+     ConfigResource *pxConfig;
+ 	DownloadResource *pxDownload;
+     StatusResource *pxStatus;
++    LibraryResource *pxLibrary;
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

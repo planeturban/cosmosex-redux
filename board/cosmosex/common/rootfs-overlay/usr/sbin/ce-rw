@@ -1,0 +1,9 @@
+#!/bin/sh
+# Make the read-only root filesystem writable until "ce-ro" or a reboot
+# (for debugging and trying out changes; normal operation never needs it).
+# Settings changes don't need this: /etc, /ce, logs and /storage are on the data
+# and /storage partitions.
+case "${0##*/}" in
+ce-ro) mount -o remount,ro / && echo "root filesystem is read-only" ;;
+*)     mount -o remount,rw / && echo "root filesystem is writable until 'sudo ce-ro' or a reboot" ;;
+esac

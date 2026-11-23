@@ -1,0 +1,47 @@
+#!/bin/sh
+# The wireless networks in range, for the web interface (Config -> Network).
+# One line per access point heard:
+#   signal (dBm) <TAB> frequency (MHz) <TAB> open|wep|wpa|wpa3|eap <TAB> name
+# The name is as iw prints it: \xNN for bytes that aren't printable ASCII, \\
+# for a backslash. Networks that hide their name are left out.
+# Exit 2 and "error=..." when there's nothing to scan with.
+# Works with the Wi-Fi switched off too: the link is brought up for the scan
+# and down again. A scan takes 3 to 5 s.
+IF=wlan0
+[ -d /sys/class/net/$IF ] || { echo "error=This CosmosEx has no Wi-Fi adapter."; exit 2; }
+
+wasup=no
+ip link show $IF 2>/dev/null | head -n 1 | grep -q '[<,]UP[,>]' && wasup=yes
+if [ $wasup = no ]; then
+	ip link set $IF up 2>/dev/null || { echo "error=Couldn't switch the Wi-Fi adapter on."; exit 2; }
+	sleep 1
+fi
+
+out=$(iw dev $IF scan 2>/dev/null)
+rc=$?
+if [ $rc != 0 ]; then                     # busy: wpa_supplicant is scanning right now
+	sleep 3
+	out=$(iw dev $IF scan 2>/dev/null) || out=$(iw dev $IF scan dump 2>/dev/null)
+	rc=$?
+fi
+[ $wasup = no ] && ip link set $IF down 2>/dev/null
+[ $rc = 0 ] || { echo "error=The scan failed."; exit 2; }
+
+echo "$out" | awk '
+function flush() {
+	if (!have) return
+	sec = "open"
+	if (rsn || wpa) sec = eap ? "eap" : ((sae && !psk) ? "wpa3" : "wpa")
+	else if (privacy) sec = "wep"
+	if (ssid != "" && ssid !~ /^(\\x00)+$/) printf "%d\t%d\t%s\t%s\n", sig, freq, sec, ssid
+}
+/^BSS [0-9a-f:]+/        { flush(); have = 1; sig = -100; freq = 0; ssid = ""; rsn = wpa = eap = sae = psk = privacy = 0; next }
+/^\tfreq: /              { freq = $2; next }
+/^\tsignal: /            { sig = $2; next }
+/^\tSSID: /              { ssid = $0; sub(/^\tSSID: /, "", ssid); next }
+/^\tcapability: /        { if ($0 ~ / Privacy/) privacy = 1; next }
+/^\tRSN:/                { rsn = 1; next }
+/^\tWPA:/                { wpa = 1; next }
+/Authentication suites:/ { if ($0 ~ /802\.1X/) eap = 1; if ($0 ~ /SAE/) sae = 1; if ($0 ~ /PSK/) psk = 1; next }
+END                      { flush() }'
+exit 0

@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# autofs for the CosmosEx shared drive: write the map from the CosmosEx
+# settings, then start the automounter. (Buildroot's autofs package has no
+# init script.)
+
+PIDFILE=/run/automount.pid
+
+case "$1" in
+start)
+	printf 'Starting automount: '
+	/usr/libexec/ce-shared-mount update
+	start-stop-daemon -S -q -p "$PIDFILE" -x /usr/sbin/automount -- -p "$PIDFILE"
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+	;;
+stop)
+	printf 'Stopping automount: '
+	start-stop-daemon -K -q -p "$PIDFILE"
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+	;;
+restart)
+	"$0" stop
+	sleep 1
+	"$0" start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+	;;
+esac

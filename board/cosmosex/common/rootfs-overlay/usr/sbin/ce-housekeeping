@@ -1,0 +1,32 @@
+#!/bin/sh
+# CosmosEx housekeeping: keeps logs small and saves the clock.
+#   ce-housekeeping once    rotate logs, save the clock
+#   ce-housekeeping loop    do that every hour (started by S03housekeeping)
+#   ce-housekeeping clock   save the clock only (at shutdown)
+#
+# The Pi has no battery clock: /data/clock lets ce-preinit continue from the
+# last known time at boot. Logs: the app opens and closes ce.log for each
+# line, so renaming a log is safe while it runs.
+
+MAX=2097152     # bytes per log; one old copy (.1) is kept
+
+save_clock() {
+	now=$(date +%s)
+	# Only once the real time is known (later than the image build)
+	[ "$now" -gt 1735689600 ] || return 0
+	echo "$now" > /data/clock.new && mv -f /data/clock.new /data/clock
+}
+
+rotate() {
+	for f in /var/log/*; do
+		case "$f" in *.1|*/messages*) continue ;; esac   # syslogd rotates messages itself
+		[ -f "$f" ] && [ "$(wc -c < "$f")" -gt $MAX ] && mv -f "$f" "$f.1"
+	done
+}
+
+case "$1" in
+once)  rotate; save_clock ;;
+clock) save_clock ;;
+loop)  while :; do sleep 3600; rotate; save_clock; done ;;
+*)     echo "Usage: $0 once|loop|clock"; exit 1 ;;
+esac

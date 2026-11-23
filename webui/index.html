@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CosmosEx redux</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Ccircle cx='100' cy='100' r='61' fill='%23121417'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(0)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(72)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(144)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(216)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(288)' fill='%23FFFFFF'/%3E%3Ccircle cx='100' cy='100' r='9' fill='%23FFFFFF'/%3E%3Cpath d='M121.22 20.79 A82 82 0 0 1 171.72 60.25' fill='none' stroke='%233FA650' stroke-width='13'/%3E%3Cpath d='M160.35 66.55 L183.09 53.94 L180.99 87.17 Z' fill='%233FA650' stroke='%233FA650' stroke-width='1.5'/%3E%3Cpath d='M179.21 121.22 A82 82 0 0 1 139.75 171.72' fill='none' stroke='%23E3D23B' stroke-width='13'/%3E%3Cpath d='M133.45 160.35 L146.06 183.09 L112.83 180.99 Z' fill='%23E3D23B' stroke='%23E3D23B' stroke-width='1.5'/%3E%3Cpath d='M78.78 179.21 A82 82 0 0 1 28.28 139.75' fill='none' stroke='%234A90D9' stroke-width='13'/%3E%3Cpath d='M39.65 133.45 L16.91 146.06 L19.01 112.83 Z' fill='%234A90D9' stroke='%234A90D9' stroke-width='1.5'/%3E%3Cpath d='M20.79 78.78 A82 82 0 0 1 60.25 28.28' fill='none' stroke='%23E8679A' stroke-width='13'/%3E%3Cpath d='M66.55 39.65 L53.94 16.91 L87.17 19.01 Z' fill='%23E8679A' stroke='%23E8679A' stroke-width='1.5'/%3E%3C/svg%3E">
+<script>
+  // Apply the stored theme before first paint (no flash of the wrong theme).
+  try { var t = localStorage.getItem('ce-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<!-- Start the fonts used above the fold right away instead of after layout -->
+<link rel="preload" href="fonts/barlow-condensed-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/barlow-condensed-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/barlow-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="css/app.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#page">Skip to content</a>
+<div class="app">
+
+  <!-- Wide screens: sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" width="38" height="38" viewBox="0 0 200 200" aria-hidden="true"><circle cx="100" cy="100" r="61" fill="var(--side-fg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(0)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(72)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(144)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(216)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(288)" fill="var(--side-bg)"/><circle cx="100" cy="100" r="9" fill="var(--side-bg)"/><path d="M121.22 20.79 A82 82 0 0 1 171.72 60.25" fill="none" stroke="#3FA650" stroke-width="13"/><path d="M160.35 66.55 L183.09 53.94 L180.99 87.17 Z" fill="#3FA650" stroke="#3FA650" stroke-width="1.5"/><path d="M179.21 121.22 A82 82 0 0 1 139.75 171.72" fill="none" stroke="#E3D23B" stroke-width="13"/><path d="M133.45 160.35 L146.06 183.09 L112.83 180.99 Z" fill="#E3D23B" stroke="#E3D23B" stroke-width="1.5"/><path d="M78.78 179.21 A82 82 0 0 1 28.28 139.75" fill="none" stroke="#4A90D9" stroke-width="13"/><path d="M39.65 133.45 L16.91 146.06 L19.01 112.83 Z" fill="#4A90D9" stroke="#4A90D9" stroke-width="1.5"/><path d="M20.79 78.78 A82 82 0 0 1 60.25 28.28" fill="none" stroke="#E8679A" stroke-width="13"/><path d="M66.55 39.65 L53.94 16.91 L87.17 19.01 Z" fill="#E8679A" stroke="#E8679A" stroke-width="1.5"/></svg>
+      <span class="brand-text">
+        <span class="brand-name">CosmosEx <span class="brand-redux">redux</span></span>
+        <span class="brand-host"><span class="dot dot-ok" data-conn-dot aria-hidden="true"></span><span data-hostname>cosmosex</span></span>
+      </span>
+    </div>
+    <nav aria-label="Main">
+      <ul class="nav">
+        <li><a class="nav-item" href="#/overview" data-page="overview"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg><span>Overview</span></a></li>
+        <li><a class="nav-item" href="#/floppy" data-page="floppy"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M4 3h12l4 4v14H4z"/><path d="M8 3v5h7V3"/><rect x="7" y="13" width="10" height="8"/></svg><span>Floppy</span></a></li>
+        <li><a class="nav-item" href="#/harddisk" data-page="harddisk"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14"/><path d="M3 14h18"/><path d="M15 16.5h3"/></svg><span>Hard disk</span></a></li>
+        <li><a class="nav-item" href="#/files" data-page="files"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="9" height="16"/><rect x="13" y="4" width="9" height="16"/><path d="M5 8h3M16 8h3"/></svg><span>Files</span></a></li>
+        <li><a class="nav-item" href="#/remote" data-page="remote"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><rect x="2" y="6" width="20" height="12"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg><span>Remote</span></a></li>
+        <li><a class="nav-item" href="#/config" data-page="config"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg><span>Config</span></a></li>
+        <li class="nav-sep"><a class="nav-item nav-ext" href="http://joo.kie.sk/?page_id=415" rel="noopener" target="_blank"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5"/></svg><span>Manual <span aria-hidden="true">↗</span><span class="sr-only">(opens in a new tab)</span></span></a></li>
+        <li><button type="button" class="nav-item nav-btn" data-restart><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v5h-5"/></svg><span>Restart</span></button></li>
+        <li data-logout hidden><a class="nav-item" href="/login.html"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M14 4h6v16h-6M10 8l-4 4 4 4M6 12h10"/></svg><span>Log out</span></a></li>
+      </ul>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="theme-switch" role="group" aria-label="Appearance">
+        <button type="button" data-theme-set="auto" aria-pressed="true">AUTO</button><button type="button" data-theme-set="light" aria-pressed="false">LIGHT</button><button type="button" data-theme-set="dark" aria-pressed="false">DARK</button>
+      </div>
+      <dl class="side-status">
+        <div><dt>HANS</dt><dd><span class="dot dot-dim" data-status-dot="hans" aria-hidden="true"></span><span data-status="hans">—</span></dd></div>
+        <div><dt>FRANZ</dt><dd><span class="dot dot-dim" data-status-dot="franz" aria-hidden="true"></span><span data-status="franz">—</span></dd></div>
+        <div><dt>A:</dt><dd class="side-floppy" data-status="floppy">—</dd></div>
+      </dl>
+      <div class="side-version">app <span data-status="version">—</span></div>
+    </div>
+  </aside>
+
+  <!-- Narrow screens: top bar and drawer -->
+  <header class="topbar">
+    <div class="topbar-row">
+      <button type="button" class="menu-btn" aria-expanded="false" aria-controls="drawer" aria-label="Open menu">
+        <svg class="icon-open" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        <svg class="icon-close" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="square" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+      <svg class="topbar-mark" width="30" height="30" viewBox="0 0 200 200" aria-hidden="true"><circle cx="100" cy="100" r="61" fill="var(--side-fg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(0)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(72)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(144)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(216)" fill="var(--side-bg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(288)" fill="var(--side-bg)"/><circle cx="100" cy="100" r="9" fill="var(--side-bg)"/><path d="M121.22 20.79 A82 82 0 0 1 171.72 60.25" fill="none" stroke="#3FA650" stroke-width="13"/><path d="M160.35 66.55 L183.09 53.94 L180.99 87.17 Z" fill="#3FA650" stroke="#3FA650" stroke-width="1.5"/><path d="M179.21 121.22 A82 82 0 0 1 139.75 171.72" fill="none" stroke="#E3D23B" stroke-width="13"/><path d="M133.45 160.35 L146.06 183.09 L112.83 180.99 Z" fill="#E3D23B" stroke="#E3D23B" stroke-width="1.5"/><path d="M78.78 179.21 A82 82 0 0 1 28.28 139.75" fill="none" stroke="#4A90D9" stroke-width="13"/><path d="M39.65 133.45 L16.91 146.06 L19.01 112.83 Z" fill="#4A90D9" stroke="#4A90D9" stroke-width="1.5"/><path d="M20.79 78.78 A82 82 0 0 1 60.25 28.28" fill="none" stroke="#E8679A" stroke-width="13"/><path d="M66.55 39.65 L53.94 16.91 L87.17 19.01 Z" fill="#E8679A" stroke="#E8679A" stroke-width="1.5"/></svg>
+      <div class="topbar-title">
+        <span class="topbar-page" data-page-title>Overview</span>
+        <span class="topbar-sub">COSMOSEX REDUX · <span data-page-pos>1/4</span></span>
+      </div>
+      <span class="conn"><span class="dot dot-ok" data-conn-dot aria-hidden="true"></span><span data-conn-text>ONLINE</span></span>
+    </div>
+    <nav id="drawer" class="drawer" aria-label="Main" hidden>
+      <ul class="nav">
+        <li><a class="nav-item" href="#/overview" data-page="overview"><span class="nav-label">Overview</span><span class="nav-hint">Status</span></a></li>
+        <li><a class="nav-item" href="#/floppy" data-page="floppy"><span class="nav-label">Floppy</span><span class="nav-hint">Slots &amp; library</span></a></li>
+        <li><a class="nav-item" href="#/harddisk" data-page="harddisk"><span class="nav-label">Hard disk</span><span class="nav-hint">IDs, images &amp; drives</span></a></li>
+        <li><a class="nav-item" href="#/files" data-page="files"><span class="nav-label">Files</span><span class="nav-hint">Drives &amp; images, two panes</span></a></li>
+        <li><a class="nav-item" href="#/remote" data-page="remote"><span class="nav-label">Remote</span><span class="nav-hint">Mouse, keys, screen</span></a></li>
+        <li><a class="nav-item" href="#/config" data-page="config"><span class="nav-label">Config</span><span class="nav-hint">Settings</span></a></li>
+        <li data-logout hidden><a class="nav-item" href="/login.html"><span class="nav-label">Log out</span><span class="nav-hint">Web interface</span></a></li>
+        <li><button type="button" class="nav-item nav-btn" data-restart><span class="nav-label">Restart</span><span class="nav-hint">The CosmosEx, about a minute</span></button></li>
+        <li class="nav-sep"><a class="nav-item nav-ext" href="http://joo.kie.sk/?page_id=415" rel="noopener" target="_blank"><span class="nav-label">Manual <span aria-hidden="true">↗</span><span class="sr-only">(opens in a new tab)</span></span></a></li>
+      </ul>
+      <div class="drawer-foot">
+        <div class="theme-switch" role="group" aria-label="Appearance">
+          <button type="button" data-theme-set="auto" aria-pressed="true">AUTO</button><button type="button" data-theme-set="light" aria-pressed="false">LIGHT</button><button type="button" data-theme-set="dark" aria-pressed="false">DARK</button>
+        </div>
+        <div class="drawer-status">
+          <span><span class="dot dot-dim" data-status-dot="hans" aria-hidden="true"></span>HANS <span data-status="hans">—</span></span>
+          <span><span class="dot dot-dim" data-status-dot="franz" aria-hidden="true"></span>FRANZ <span data-status="franz">—</span></span>
+        </div>
+      </div>
+    </nav>
+  </header>
+
+  <div class="conn-bar" role="status" hidden>Lost connection to CosmosEx — retrying</div>
+
+  <main id="page" class="page" tabindex="-1"></main>
+
+  <!-- Narrow screens: page switcher -->
+  <nav class="pager" aria-label="Pages">
+    <button type="button" class="pager-prev" data-pager="prev">‹ <span data-pager-label="prev"></span></button>
+    <div class="pager-dots">
+      <a href="#/overview" data-page="overview" aria-label="Go to Overview"><span></span></a><a href="#/floppy" data-page="floppy" aria-label="Go to Floppy"><span></span></a><a href="#/harddisk" data-page="harddisk" aria-label="Go to Hard disk"><span></span></a><a href="#/files" data-page="files" aria-label="Go to Files"><span></span></a><a href="#/remote" data-page="remote" aria-label="Go to Remote"><span></span></a><a href="#/config" data-page="config" aria-label="Go to Config"><span></span></a>
+    </div>
+    <button type="button" class="pager-next" data-pager="next"><span data-pager-label="next"></span> ›</button>
+  </nav>
+</div>
+</body>
+</html>

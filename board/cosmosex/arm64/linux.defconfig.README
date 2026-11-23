@@ -1,0 +1,16 @@
+linux.defconfig: the kernel configuration (savedefconfig format), applied
+before linux.fragment.
+
+Made from bcm2711_defconfig + linux.fragment with "make localmodconfig":
+only modules that were loaded on a running CosmosEx (this image and a stock
+Raspbian unit, Nov 2026) or that are needed on demand are kept, 88 of 1329.
+Kept on demand: cifs (+ crypto), nfsd (/storage export), overlay, joydev, xpad, all HID device drivers (USB keyboards, mice,
+gamepads for IKBD), i2c-dev, Wi-Fi (brcmfmac, cfg80211).
+
+To regenerate (e.g. after a kernel update), in the build container:
+  cd /work/output/build/linux-custom
+  make ARCH=arm64 CROSS_COMPILE=aarch64-buildroot-linux-gnu- \
+       LSMOD=<lsmod output + extra module names> localmodconfig
+  make ARCH=arm64 CROSS_COMPILE=aarch64-buildroot-linux-gnu- savedefconfig
+  cp defconfig /src/board/cosmosex/arm64/linux.defconfig
+A module that's missing: add CONFIG_<X>=m to linux.fragment.

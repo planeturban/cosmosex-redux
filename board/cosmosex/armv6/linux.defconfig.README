@@ -1,0 +1,7 @@
+linux.defconfig: the 32-bit ARMv6 kernel configuration (savedefconfig format),
+applied before ../common/linux.fragment.
+
+Made like ../armv7/linux.defconfig.README describes, from the Raspberry Pi
+kernel's bcmrpi_defconfig (Pi 1, Zero) + linux.fragment, "make localmodconfig"
+with ../common/kernel-modules.lsmod (93 modules kept), "make savedefconfig";
+CONFIG_LOCALVERSION "" (kernel 6.12.116).

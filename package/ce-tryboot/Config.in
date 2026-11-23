@@ -1,0 +1,7 @@
+config BR2_PACKAGE_CE_TRYBOOT
+	bool "ce-tryboot"
+	help
+	  Restart with an argument for the Raspberry Pi firmware, e.g.
+	  "0 tryboot": the next boot (only) reads tryboot.txt. Used by
+	  ce-sysupdate to try a new system once (BusyBox reboot can't
+	  pass an argument).

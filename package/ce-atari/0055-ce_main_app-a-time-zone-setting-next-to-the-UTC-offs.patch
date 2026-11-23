@@ -1,0 +1,201 @@
+From 077571f3e29a4c9128ba1b432b12d21b4833cee1 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 17:07:30 +0100
+Subject: [PATCH] ce_main_app: a time zone setting next to the UTC offset
+
+The UTC offset is a fixed number of hours, so it has to be changed by hand
+twice a year where there is daylight saving time. New settings TIME_ZONE (a
+name, e.g. Europe/Stockholm, for whoever shows the setting) and
+TIME_ZONE_RULE (the zone's rule as a POSIX TZ string, e.g.
+CET-1CEST,M3.5.0,M10.5.0/3); with a rule set, it goes into TZ in place of
+the string made from the UTC offset, so everything that uses localtime()
+(the time given to the ST, file dates, the log) follows it. No time zone
+data is needed on the device: the web API takes name and rule together
+(/api/v1/settings/other: timeZone, timeZoneRule; timeZone "" goes back to
+the UTC offset).
+
+The UTC offset byte given to the ST is now the offset in force (tm_gmtoff),
+which is the setting's value when no zone is chosen. Another UTC offset
+typed on the ST's config screen takes the place of a chosen zone. tzset()
+after TZ is set, since localtime_r() doesn't look at TZ again by itself.
+---
+ ce_main_app/config/configstream_screens.cpp   |  7 +++++
+ .../translated/translateddisk_general.cpp     |  9 +++---
+ ce_main_app/utils.cpp                         | 31 +++++++++++++++++++
+ ce_main_app/utils.h                           |  1 +
+ .../api/resource/settingsresource.cpp         | 23 ++++++++++++++
+ 5 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/ce_main_app/config/configstream_screens.cpp b/ce_main_app/config/configstream_screens.cpp
+index 4e52dd12..71ddc484 100644
+--- a/ce_main_app/config/configstream_screens.cpp
++++ b/ce_main_app/config/configstream_screens.cpp
+@@ -1193,6 +1193,13 @@ void ConfigStream::onOtherSave(void)
+         frameSkip=255;
+     }
+ 
++    // another UTC offset typed here takes the place of a time zone chosen in the web interface
++    float oldOffset = s.getFloat("TIME_UTC_OFFSET", 0);
++    if(utcOffset < oldOffset - 0.01f || utcOffset > oldOffset + 0.01f) {
++        s.setString("TIME_ZONE",      "");
++        s.setString("TIME_ZONE_RULE", "");
++    }
++
+     s.setBool     ("TIME_SET",             setDateTime);
+     s.setFloat    ("TIME_UTC_OFFSET",      utcOffset);
+     s.setString   ("TIME_NTP_SERVER",      ntpServer.c_str());
+diff --git a/ce_main_app/translated/translateddisk_general.cpp b/ce_main_app/translated/translateddisk_general.cpp
+index ca703a6b..cdb511f2 100644
+--- a/ce_main_app/translated/translateddisk_general.cpp
++++ b/ce_main_app/translated/translateddisk_general.cpp
+@@ -840,15 +840,14 @@ void TranslatedDisk::onGetConfig(BYTE *cmd)
+     // this can be used to set the right date and time on ST
+     Settings s;
+     bool    setDateTime;
+-    float   utcOffset;
+     setDateTime = s.getBool ("TIME_SET",        true);
+-    utcOffset   = s.getFloat("TIME_UTC_OFFSET", 0);
+-
+-    int iUtcOffset = (int) (utcOffset * 10.0);
+ 
+     time_t timenow      = time(NULL);                           // get time -- the UTC offset / timezone will be applied in localtime()
+     struct tm loctime   = *localtime(&timenow);
+ 
++    // the offset in force now: the UTC offset setting, or what the chosen time zone has at this time of the year
++    int iUtcOffset = (int) (loctime.tm_gmtoff / 360);
++
+     if((loctime.tm_year + 1900) < 2014) {                       // if the retrieved date/time seems to be wrong (too old), clear it and don't set it!
+         memset(&loctime, 0, sizeof(tm));
+         setDateTime = false;
+@@ -865,7 +864,7 @@ void TranslatedDisk::onGetConfig(BYTE *cmd)
+     dataTrans->addDataByte(loctime.tm_min);                     // byte 12 - minutes
+     dataTrans->addDataByte(loctime.tm_sec);                     // byte 13 - seconds
+ 
+-    Debug::out(LOG_DEBUG, "onGetConfig - setDateTime %d, utcOffset %d, %04d-%02d-%02d %02d:%02d:%02d", setDateTime, utcOffset, loctime.tm_year + 1900, loctime.tm_mon + 1, loctime.tm_mday, loctime.tm_hour, loctime.tm_min, loctime.tm_sec);
++    Debug::out(LOG_DEBUG, "onGetConfig - setDateTime %d, utcOffset*10 %d, %04d-%02d-%02d %02d:%02d:%02d", setDateTime, iUtcOffset, loctime.tm_year + 1900, loctime.tm_mon + 1, loctime.tm_mday, loctime.tm_hour, loctime.tm_min, loctime.tm_sec);
+     //------------------
+     // now get and send the IP addresses of eth0 and wlan0 (at +0 is eth0, at +5 is wlan)
+     BYTE tmp[10];
+diff --git a/ce_main_app/utils.cpp b/ce_main_app/utils.cpp
+index 90162aea..76943c1c 100644
+--- a/ce_main_app/utils.cpp
++++ b/ce_main_app/utils.cpp
+@@ -2,6 +2,7 @@
+ #include "utils.h"
+ 
+ #include <libgen.h>
++#include <cctype>
+ #include <cerrno>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -459,10 +460,39 @@ void Utils::storeDword(BYTE *bfr, DWORD val)
+     bfr[3] = val;       // store lo
+ }
+ 
++// A time zone's rule as a POSIX TZ string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3":
++// short, and only of the characters such a string is made of (it ends up in
++// the TZ variable and in a shell script).
++bool Utils::isTimezoneRule(const char *rule)
++{
++    size_t len = strlen(rule);
++    if(len < 3 || len > 48) {
++        return false;
++    }
++
++    for(size_t i=0; i<len; i++) {
++        char c = rule[i];
++        if(!isalnum((unsigned char) c) && !strchr("<>+-:,./", c)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ void Utils::createTimezoneString(char *str)
+ {
+     Settings  s;
+     float     utcOffset;
++
++    // a time zone chosen (web interface): its rule, which also knows the
++    // daylight saving time. Otherwise the fixed UTC offset.
++    const char *rule = s.getString("TIME_ZONE_RULE", "");
++    if(isTimezoneRule(rule)) {
++        strcpy(str, rule);
++        return;
++    }
++
+     utcOffset = s.getFloat("TIME_UTC_OFFSET", 0);          // read UTC offset from settings
+ 
+     char  signChar;
+@@ -514,6 +544,7 @@ void Utils::setTimezoneVariable_inThisContext(void)
+     Debug::out(LOG_DEBUG, "Utils::setTimezoneVariable_inThisContext() -- setting TZ variable to: %s\n", utcOfsset);
+ 
+     setenv("TZ", utcOfsset, 1);
++    tzset();                                                    // localtime_r() doesn't look at TZ again by itself
+ }
+ 
+ std::string Utils::getDeviceLabel(const std::string & devicePath)
+diff --git a/ce_main_app/utils.h b/ce_main_app/utils.h
+index 3118c6b1..51540824 100644
+--- a/ce_main_app/utils.h
++++ b/ce_main_app/utils.h
+@@ -48,6 +48,7 @@ public:
+     static void storeDword(BYTE *bfr, DWORD val);
+ 
+     static void createTimezoneString(char *str);
++    static bool isTimezoneRule(const char *rule);
+     static void setTimezoneVariable_inProfileScript(void);
+     static void setTimezoneVariable_inThisContext(void);
+ 
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 6f261497..a7cf741a 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -626,6 +626,11 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+     if(name == "other") {
+         cJSON_AddBoolToObject(out,   "timeSync",          s.getBool("TIME_SET", true));
+         cJSON_AddNumberToObject(out, "utcOffset",         s.getFloat("TIME_UTC_OFFSET", 0));
++        // a time zone (its name and its rule, a POSIX TZ string) or, with no name, the fixed UTC offset
++        std::string zone = s.getString("TIME_ZONE", ""), rule = s.getString("TIME_ZONE_RULE", "");
++        if(zone.empty() || !Utils::isTimezoneRule(rule.c_str())) { zone = ""; rule = ""; }
++        cJSON_AddStringToObject(out, "timeZone",          zone.c_str());
++        cJSON_AddStringToObject(out, "timeZoneRule",      rule.c_str());
+         cJSON_AddStringToObject(out, "ntpServer",         s.getString("TIME_NTP_SERVER", "200.20.186.76"));
+         cJSON_AddNumberToObject(out, "screencastFrameskip", s.getInt("SCREENCAST_FRAMESKIP", 20));
+         static const char *res[3] = { "low", "mid", "high" };
+@@ -1089,6 +1094,22 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+ 
+         getBool(in, "timeSync", timeSync);
+         getNumber(in, "utcOffset", utc);
++        // timeZone "" = the fixed UTC offset; not given = as it was
++        std::string zone = s.getString("TIME_ZONE", ""), rule = s.getString("TIME_ZONE_RULE", "");
++        if(getString(in, "timeZone", zone)) {
++            rule = "";
++            getString(in, "timeZoneRule", rule);
++            if(!zone.empty()) {
++                bool nameOk = zone.length() <= 64;
++                for(size_t i=0; i<zone.length() && nameOk; i++) {
++                    nameOk = isalnum((unsigned char) zone[i]) || strchr("_+-/", zone[i]);
++                }
++                if(!nameOk) { msg = "timeZone: a name like Europe/Stockholm."; return false; }
++                if(!Utils::isTimezoneRule(rule.c_str())) { msg = "timeZoneRule: the time zone's rule, like CET-1CEST,M3.5.0,M10.5.0/3."; return false; }
++            } else {
++                rule = "";
++            }
++        }
+         getString(in, "ntpServer", ntp);
+         getNumber(in, "screencastFrameskip", frameskip);
+         if(getString(in, "screenResolution", res)) {
+@@ -1104,6 +1125,8 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+ 
+         s.setBool  ("TIME_SET",             timeSync);
+         s.setFloat ("TIME_UTC_OFFSET",      (float) utc);
++        s.setString("TIME_ZONE",            zone.c_str());
++        s.setString("TIME_ZONE_RULE",       rule.c_str());
+         s.setString("TIME_NTP_SERVER",      ntp.c_str());
+         s.setInt   ("SCREENCAST_FRAMESKIP", (int) frameskip);
+         s.setInt   ("SCREEN_RESOLUTION",    screenRes);
+-- 
+2.54.0 (Apple Git-157)
+

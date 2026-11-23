@@ -1,0 +1,7 @@
+config BR2_PACKAGE_CE_SCREENSAVER
+	bool "ce-screensaver"
+	help
+	  HDMI screen saver for the CosmosEx: a spinning, bouncing
+	  Atari logo after a while without activity, then the HDMI
+	  output switched off. Wakes on console input and on USB input
+	  used by the Atari (reported by the CosmosEx app).

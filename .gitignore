@@ -1,0 +1,7 @@
+output-images/
+.DS_Store
+__pycache__/
+# made when testing: an SSH key pair for QEMU, a copy of the upstream source
+tools/.qemu-key
+tools/.qemu-key.pub
+upstream/.src/

@@ -1,0 +1,330 @@
+#!/bin/sh
+# /storage, the CosmosEx's own storage, shared with other computers over NFS
+# (Linux, macOS) and SMB (Windows, macOS: the kernel's SMB3 server ksmbd).
+#
+# Settings: /etc/ce-storageshare.conf (persistent through the /etc overlay; the web
+# interface's Config -> Storage sharing writes it). This script makes /etc/exports
+# and /etc/ksmbd/ksmbd.conf from it and starts, stops or reloads the servers.
+#
+#   ce-storageshare start | stop | apply     (apply: after the settings changed)
+#   ce-storageshare status                   key=value lines (for the web interface)
+#   ce-storageshare smb-password             set the SMB password of user pi (stdin)
+#
+# NFS_MANUAL=yes leaves /etc/exports alone, for hand-written exports (see
+# exports(5): https://man7.org/linux/man-pages/man5/exports.5.html).
+
+CONF=/etc/ce-storageshare.conf
+EXPORTS=/etc/exports
+KSMBD_DIR=/etc/ksmbd
+KSMBD_CONF=$KSMBD_DIR/ksmbd.conf
+KSMBD_PWDDB=$KSMBD_DIR/ksmbdpwd.db
+# ksmbd opens a share's root through its parent folder and needs that
+# parent's file system writable; / is read-only here, so /storage is shared
+# through a bind mount below /run (tmpfs), with crossmnt
+SMB_PATH=/run/storageshare/storage
+AVAHI_DIR=/etc/avahi/services
+PI_UID=1000
+PI_GID=1000
+
+# defaults (also when the file is missing)
+NFS=yes
+NFS_ACCESS=rw
+NFS_MAP=pi
+NFS_CLIENTS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+NFS_MANUAL=no
+SMB=yes
+SMB_ACCESS=rw
+SMB_GUEST=yes
+SMB_CLIENTS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+SMB_WORKGROUP=WORKGROUP
+NR_THREADS=2
+[ -f "$CONF" ] && . "$CONF"
+
+log() {
+	echo "storageshare: $*"
+	logger -t storageshare "$*" 2>/dev/null
+}
+
+storage_mounted() {
+	mountpoint -q /storage
+}
+
+# ------------------------------------------------------------------- NFS
+
+write_exports() {
+	[ "$NFS_MANUAL" = yes ] && return 0
+	opts="$NFS_ACCESS,no_subtree_check,insecure"
+	if [ "$NFS_MAP" = pi ]; then
+		opts="$opts,all_squash,anonuid=$PI_UID,anongid=$PI_GID"
+	else
+		opts="$opts,root_squash"
+	fi
+	{
+		echo "# Made by ce-storageshare from $CONF (web interface: Config > Storage sharing)."
+		echo "# To write this file by hand instead, set NFS_MANUAL=yes in $CONF."
+		echo "# Format: exports(5), https://man7.org/linux/man-pages/man5/exports.5.html"
+		line="/storage"
+		for c in $NFS_CLIENTS; do line="$line $c($opts)"; done
+		[ -n "$NFS_CLIENTS" ] && echo "$line"
+	} > "$EXPORTS.tmp" && mv -f "$EXPORTS.tmp" "$EXPORTS"
+}
+
+# NFS's helpers on fixed ports (they'd pick random ones), so the firewall
+# can limit them to the allowed computers like 111 and 2049
+MOUNTD_PORT=20048
+STATD_PORT=32765
+STATD_OUT_PORT=32766
+NLM_PORT=32768
+NFS_PORTS="111, 2049, $MOUNTD_PORT, $STATD_PORT, $STATD_OUT_PORT, $NLM_PORT"
+
+nfs_start() {
+	modprobe -q nfsd 2>/dev/null
+	mountpoint -q /proc/fs/nfsd || mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null
+	mkdir -p /run/nfs/sm /run/nfs/sm.bak /run/rpcbind /var/lib/nfs
+	touch /run/nfs/rmtab
+	# the kernel's lock manager (lockd): its ports before nfsd starts it
+	modprobe -q lockd 2>/dev/null
+	[ -w /proc/sys/fs/nfs/nlm_tcpport ] && echo $NLM_PORT > /proc/sys/fs/nfs/nlm_tcpport
+	[ -w /proc/sys/fs/nfs/nlm_udpport ] && echo $NLM_PORT > /proc/sys/fs/nfs/nlm_udpport
+	pidof rpcbind > /dev/null || rpcbind
+	pidof rpc.statd > /dev/null || rpc.statd -p $STATD_PORT -o $STATD_OUT_PORT
+	exportfs -ra
+	rpc.nfsd "$NR_THREADS"
+	pidof rpc.mountd > /dev/null || rpc.mountd -p $MOUNTD_PORT
+}
+
+nfs_stop() {
+	killall -q rpc.mountd 2>/dev/null
+	rpc.nfsd 0 2>/dev/null
+	exportfs -au 2>/dev/null
+	killall -q rpc.statd 2>/dev/null
+	killall -q rpcbind 2>/dev/null
+}
+
+nfs_running() {
+	pidof rpc.mountd > /dev/null
+}
+
+# ------------------------------------------------------------------- SMB
+
+netbios_name() {
+	hostname | cut -c1-15 | tr 'a-z' 'A-Z'
+}
+
+write_ksmbd_conf() {
+	mkdir -p "$KSMBD_DIR"
+	ro=no
+	[ "$SMB_ACCESS" = ro ] && ro=yes
+	{
+		echo "; Made by ce-storageshare from $CONF (web interface: Config > Storage sharing)."
+		echo "; Format: ksmbd.conf(5), https://github.com/cifsd-team/ksmbd-tools/blob/master/ksmbd.conf.5.in"
+		echo "[global]"
+		echo "	workgroup = $SMB_WORKGROUP"
+		echo "	netbios name = $(netbios_name)"
+		echo "	server string = CosmosEx $(hostname)"
+		if [ "$SMB_GUEST" = yes ]; then
+			echo "	map to guest = bad user"
+		fi
+		# not pi: that would make ksmbd.adduser think pi exists already;
+		# files are still pi's (force user)
+		echo "	guest account = nobody"
+		echo ""
+		echo "[storage]"
+		echo "	comment = CosmosEx storage (/storage)"
+		echo "	path = $SMB_PATH"
+		echo "	crossmnt = yes"
+		echo "	read only = $ro"
+		echo "	browseable = yes"
+		echo "	force user = pi"
+		echo "	force group = pi"
+		echo "	create mask = 0664"
+		echo "	directory mask = 2775"
+		if [ "$SMB_GUEST" = yes ]; then
+			echo "	guest ok = yes"
+		else
+			echo "	guest ok = no"
+			echo "	valid users = pi"
+		fi
+	} > "$KSMBD_CONF.tmp" && mv -f "$KSMBD_CONF.tmp" "$KSMBD_CONF"
+	# ksmbd.mountd won't start without a user database, even for guests
+	[ -f "$KSMBD_PWDDB" ] || : > "$KSMBD_PWDDB"
+	chmod 600 "$KSMBD_PWDDB"
+}
+
+# Who may reach the SMB server: ksmbd's "hosts allow" only matches exact
+# addresses, so a firewall table does it: ports 139/445 only from
+# SMB_CLIENTS (addresses and networks) and this machine; "*" = everyone
+# The firewall (nftables, table inet storageshare): SMB's and NFS's ports
+# only for the allowed computers (SMB_CLIENTS, NFS_CLIENTS). ksmbd's own
+# "hosts allow" matches exact addresses only, and /etc/exports alone leaves
+# rpcbind, mountd and statd open to everyone. No rule for a protocol that's
+# off, allowed for everyone ("*"), or (NFS) with hand-written exports.
+#   share_firewall <nfs on: yes|no> <smb on: yes|no>   or   share_firewall off
+share_firewall() {
+	nft delete table inet storageshare 2>/dev/null
+	[ "$1" = off ] && return 0
+	nfs_rule=; smb_rule=
+	if [ "$1" = yes ] && [ "$NFS_MANUAL" != yes ]; then
+		case " $NFS_CLIENTS " in *" * "*) ;; *) nfs_rule=yes ;; esac
+	fi
+	if [ "$2" = yes ]; then
+		case " $SMB_CLIENTS " in *" * "*) ;; *) smb_rule=yes ;; esac
+	fi
+	[ -z "$nfs_rule$smb_rule" ] && return 0
+	modprobe -q nf_tables 2>/dev/null
+	{
+		echo "table inet storageshare {"
+		[ -n "$smb_rule" ] && printf '\tset smb_clients {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n\t\telements = { %s }\n\t}\n' "$(echo $SMB_CLIENTS | tr ' ' ',')"
+		[ -n "$nfs_rule" ] && printf '\tset nfs_clients {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t\tauto-merge\n\t\telements = { %s }\n\t}\n' "$(echo $NFS_CLIENTS | tr ' ' ',')"
+		echo "	chain input {"
+		echo "		type filter hook input priority 0; policy accept;"
+		echo "		iif \"lo\" accept"
+		if [ -n "$smb_rule" ]; then
+			echo "		tcp dport { 139, 445 } ip saddr @smb_clients accept"
+			echo "		tcp dport { 139, 445 } drop"
+		fi
+		if [ -n "$nfs_rule" ]; then
+			echo "		meta l4proto { tcp, udp } th dport { $NFS_PORTS } ip saddr @nfs_clients accept"
+			echo "		meta l4proto { tcp, udp } th dport { $NFS_PORTS } drop"
+		fi
+		echo "	}"
+		echo "}"
+	} > /run/storageshare.nft
+	nft -f /run/storageshare.nft
+}
+
+smb_running() {
+	pidof ksmbd.mountd > /dev/null
+}
+
+smb_start() {
+	modprobe -q ksmbd 2>/dev/null
+	mkdir -p "$SMB_PATH"
+	chmod 755 "${SMB_PATH%/*}"
+	mountpoint -q "$SMB_PATH" || mount --bind /storage "$SMB_PATH"
+	if smb_running; then
+		ksmbd.control --reload > /dev/null 2>&1
+	else
+		ksmbd.mountd > /dev/null 2>&1
+	fi
+}
+
+smb_stop() {
+	ksmbd.control --shutdown > /dev/null 2>&1
+	killall -q ksmbd.mountd 2>/dev/null
+	mountpoint -q "$SMB_PATH" && umount "$SMB_PATH" 2>/dev/null
+}
+
+smb_password_set() {
+	[ -s "$KSMBD_PWDDB" ] && grep -q '^pi:' "$KSMBD_PWDDB"
+}
+
+# ----------------------------------------------------------------- avahi
+
+avahi_service() {      # name, type, port, txt, on
+	f="$AVAHI_DIR/cosmosex-storage-$1.service"
+	if [ "$5" != yes ]; then
+		rm -f "$f"
+		return
+	fi
+	mkdir -p "$AVAHI_DIR"
+	cat > "$f.tmp" <<EOF
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!-- made by ce-storageshare -->
+<service-group>
+  <name replace-wildcards="yes">CosmosEx %h /storage</name>
+  <service>
+    <type>$2</type>
+    <port>$3</port>
+    $4
+  </service>
+</service-group>
+EOF
+	cmp -s "$f.tmp" "$f" 2>/dev/null && rm -f "$f.tmp" || mv -f "$f.tmp" "$f"
+}
+
+announce() {
+	avahi_service nfs _nfs._tcp 2049 "<txt-record>path=/storage</txt-record>" "$1"
+	avahi_service smb _smb._tcp 445 "" "$2"
+}
+
+# ------------------------------------------------------------------ main
+
+do_start() {
+	if ! storage_mounted; then
+		log "/storage isn't mounted, not sharing it"
+		announce no no
+		return 0
+	fi
+	nfs_on=no
+	smb_on=no
+	# the firewall first: no server answers before it's in place
+	if ! share_firewall "$NFS" "$SMB"; then
+		log "couldn't load the firewall rules; not sharing /storage"
+		nfs_running && nfs_stop
+		smb_running && smb_stop
+		announce no no
+		return 1
+	fi
+	if [ "$NFS" = yes ]; then
+		write_exports
+		nfs_start
+		nfs_on=yes
+	else
+		nfs_running && nfs_stop
+	fi
+	if [ "$SMB" = yes ]; then
+		write_ksmbd_conf
+		smb_start
+		smb_on=yes
+	else
+		smb_running && smb_stop
+	fi
+	announce $nfs_on $smb_on
+	log "/storage: NFS $nfs_on${NFS:+ ($NFS_ACCESS)}, SMB $smb_on${SMB:+ ($SMB_ACCESS, $( [ "$SMB_GUEST" = yes ] && echo guest || echo password))}"
+}
+
+do_stop() {
+	nfs_stop
+	smb_stop
+	share_firewall off
+	announce no no
+}
+
+case "$1" in
+	start|apply)
+		do_start
+		;;
+	stop)
+		do_stop
+		;;
+	status)
+		echo "storage_mounted=$(storage_mounted && echo yes || echo no)"
+		echo "nfs_running=$(nfs_running && echo yes || echo no)"
+		echo "smb_running=$(smb_running && echo yes || echo no)"
+		echo "smb_password_set=$(smb_password_set && echo yes || echo no)"
+		echo "exports=$(exportfs 2>/dev/null | awk '{print $1" "$2}' | tr '\n' ';')"
+		;;
+	smb-password)
+		# the password on stdin (one line); empty: remove the user
+		IFS= read -r pw
+		mkdir -p "$KSMBD_DIR"
+		[ -f "$KSMBD_PWDDB" ] || : > "$KSMBD_PWDDB"
+		if [ -z "$pw" ]; then
+			ksmbd.adduser --delete pi > /dev/null 2>&1
+		elif smb_password_set; then
+			ksmbd.adduser --update --password="$pw" pi > /dev/null 2>&1
+		else
+			ksmbd.adduser --add --password="$pw" pi > /dev/null 2>&1
+		fi
+		rc=$?
+		chmod 600 "$KSMBD_PWDDB"
+		smb_running && ksmbd.control --reload > /dev/null 2>&1
+		exit $rc
+		;;
+	*)
+		echo "Usage: $0 {start|stop|apply|status|smb-password}"
+		exit 1
+		;;
+esac

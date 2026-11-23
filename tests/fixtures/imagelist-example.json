@@ -1,0 +1,60 @@
+{
+  "format": "cosmosex-imagelist",
+  "format_version": 1,
+  "list_version": "2026-11-15",
+  "name": "Example list",
+  "description": "Test fixture: a menu disk, a two-disk game and an inline thumbnail",
+  "generated": "2026-11-15T12:00:00Z",
+  "entries": [
+    {
+      "id": "automation-100",
+      "title": "Automation Disk 100",
+      "type": "compilation",
+      "group": "Automation",
+      "year": 1989,
+      "tags": ["menu", "compact"],
+      "games": [
+        { "title": "Xenon 2: Megablast" },
+        { "title": "Ikari Warriors", "media": [ { "role": "screenshot", "src": "thumbs/auto100-ikari.png" } ] }
+      ],
+      "disks": [
+        {
+          "file": "menus/automation/auto_100.zip",
+          "size": 412833,
+          "md5": "9e107d9d372bb6826bd81d3542a419d6",
+          "checksum": "0x1a2b",
+          "container": "zip",
+          "format": "msa",
+          "inner_md5": "e4d909c290d0fb1ca068ffaddf22cbd0"
+        }
+      ],
+      "media": [ { "role": "title", "src": "thumbs/auto_100_title.png" } ]
+    },
+    {
+      "id": "dungeon-master",
+      "title": "Dungeon Master",
+      "type": "game",
+      "year": 1987,
+      "games": [ { "title": "Dungeon Master" } ],
+      "disks": [
+        { "file": "originals/dm/dm_disk1.st", "label": "Game disk", "size": 737280, "md5": "0cc175b9c0f1b6a831c399e269772661", "format": "st" },
+        { "file": "originals/dm/dm_disk2.st", "label": "Utility / save disk", "size": 737280, "md5": "92eb5ffee6ae2fec3ad71c777531578f", "format": "st" }
+      ],
+      "media": [ { "role": "thumbnail", "src": "originals/dm/dm.webp" } ],
+      "compat": { "machines": ["st", "ste"], "ram_kb_min": 512, "tos": ["1.02", "1.04"], "notes": "" }
+    },
+    {
+      "id": "oids",
+      "title": "Oids",
+      "type": "game",
+      "year": 1987,
+      "games": [ "Oids" ],
+      "disks": [ { "file": "originals/oids.msa", "size": 401234, "md5": "4a8a08f09d37b73795649038408b5f33", "format": "msa" } ],
+      "media": [
+        { "role": "thumbnail", "mime": "image/png", "width": 1, "height": 1,
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP438AAAAQBAYDFKhhdAAAAAElFTkSuQmCC" }
+      ],
+      "links": [ { "label": "Atarimania", "url": "https://www.atarimania.com/" } ]
+    }
+  ]
+}

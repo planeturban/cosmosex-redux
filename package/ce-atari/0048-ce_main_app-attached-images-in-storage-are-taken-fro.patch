@@ -1,0 +1,368 @@
+From a255696e751b9dea0c8e9d0ca18c3719b7354f92 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:32:10 +0100
+Subject: [PATCH] ce_main_app: attached images in /storage are taken from the
+ share user
+
+/storage is shared over NFS and SMB, where everyone is one user (uid 1000).
+File locks don't keep them from an image the ST has attached, so while an
+image file below /storage is open: the file is root's and only root may
+write it (others may read), its folder gets the sticky bit and root as
+owner (group write stays), and a read lock is held for programs that ask.
+Given back at detach; what was taken is listed in /data/ce-imageguard and
+given back at the next start after a crash or power cut. Image notes
+(<image>.json) are written as uid 1000, so the share user can still delete
+them in the sticky folder.
+
+Attaching through the API is refused while someone else has the image open
+for writing (a program on a share): asked with a read lease, which is only
+given when the file has no writer.
+
+The share user can rename folders and make links in /storage, so what runs
+as root there doesn't go through links: the listed files and the folder are
+opened with RESOLVE_NO_SYMLINKS, a listed file is only given back when it
+is the same inode, and the notes file's temporary copy is made with O_EXCL
+and O_NOFOLLOW (before: fopen, through any link put there).
+---
+ ce_main_app/native/imagefilemedia.cpp         | 182 +++++++++++++++++-
+ ce_main_app/native/imagefilemedia.h           |  10 +
+ ce_main_app/native/scsi.cpp                   |   2 +
+ .../api/resource/settingsresource.cpp         |  60 +++++-
+ 4 files changed, 252 insertions(+), 2 deletions(-)
+
+diff --git a/ce_main_app/native/imagefilemedia.cpp b/ce_main_app/native/imagefilemedia.cpp
+index 068661ee..8d18b212 100644
+--- a/ce_main_app/native/imagefilemedia.cpp
++++ b/ce_main_app/native/imagefilemedia.cpp
+@@ -7,12 +7,190 @@
+ //#include <stdio.h>
+ #include <string.h>
+ 
++#include <stdio.h>
++#include <stdlib.h>
++#include <limits.h>
++#include <sys/syscall.h>
++#include <linux/openat2.h>
++#include <string>
++#include <vector>
++
+ #include "imagefilemedia.h"
+ #include "../debug.h"
+ 
+ ImageFileMedia::ImageFileMedia()
+-: BCapacity(0), SCapacity(0), mediaHasChanged(0), fd(-1)
++: BCapacity(0), SCapacity(0), mediaHasChanged(0), fd(-1), guarded(false)
++{
++    guardPath[0] = 0;
++    guardUid = guardGid = guardMode = 0;
++}
++
++// --- attached images and the network shares ----------------------------------
++// /storage is shared over NFS and SMB, and everyone who comes in that way is
++// one user there (uid 1000: all_squash / force user). File locks don't keep
++// them from an image the ST has attached (they're advisory, and nothing stops
++// a delete or a rename), so while an image in /storage is open here:
++//  - the file is root's and only root may write it (others may still read it);
++//  - its folder gets the sticky bit and root as owner (group and its write bit
++//    stay): the share user still adds and removes files of their own there,
++//    but can't delete or rename root's. Not /storage itself; the folder stays so;
++//  - a read lock is held on it: an SMB program that asks gets "in use".
++// What was taken is listed in GUARD_LIST first (owner, group, mode, path), so
++// guardSweep() can give it back at the next start after a crash or power cut.
++#define GUARD_ROOT  "/storage/"
++#define GUARD_LIST  "/data/ce-imageguard"
++
++// What's listed, and where it's used again as root (the sweep at start, the
++// folder at attach), must not be led elsewhere: the share user can rename
++// folders in /storage and put links there. So: paths are opened with no link
++// anywhere in them, and a listed file is only given back when it's still the
++// same file (device and inode).
++struct GuardEntry { unsigned uid, gid, mode; unsigned long long dev, ino; std::string path; };
++
++static int openNoLinks(const char *path, int flags)
++{
++    struct open_how how;
++    memset(&how, 0, sizeof(how));
++    how.flags = flags | O_CLOEXEC;
++    how.resolve = RESOLVE_NO_SYMLINKS;
++    return (int) syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how));
++}
++
++static void guardRead(std::vector<GuardEntry> &list)
++{
++    FILE *f = fopen(GUARD_LIST, "r");
++    if(!f) return;
++    char line[PATH_MAX + 64];
++    while(fgets(line, sizeof(line), f)) {
++        GuardEntry e;
++        int at = 0;
++        if(sscanf(line, "%u %u %o %llu %llu %n", &e.uid, &e.gid, &e.mode, &e.dev, &e.ino, &at) < 5 || at == 0) continue;
++        e.path = line + at;
++        while(!e.path.empty() && (e.path[e.path.length() - 1] == '\n' || e.path[e.path.length() - 1] == '\r')) e.path.erase(e.path.length() - 1);
++        if(e.path.compare(0, strlen(GUARD_ROOT), GUARD_ROOT) == 0) list.push_back(e);
++    }
++    fclose(f);
++}
++
++static bool guardWrite(const std::vector<GuardEntry> &list)
++{
++    if(list.empty()) { unlink(GUARD_LIST); return true; }
++    FILE *f = fopen(GUARD_LIST ".tmp", "w");
++    if(!f) return false;
++    for(size_t i = 0; i < list.size(); i++) fprintf(f, "%u %u %o %llu %llu %s\n", list[i].uid, list[i].gid, list[i].mode, list[i].dev, list[i].ino, list[i].path.c_str());
++    bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
++    fclose(f);
++    return ok && rename(GUARD_LIST ".tmp", GUARD_LIST) == 0;
++}
++
++// give a file back: only the very file that was taken, a regular file that is still root's (as we left it)
++static void guardGiveBack(int fd, const GuardEntry &e)
++{
++    struct stat st;
++    if(fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != 0) return;
++    if((unsigned long long) st.st_dev != e.dev || (unsigned long long) st.st_ino != e.ino) return;
++    if(fchown(fd, e.uid, e.gid) != 0 || fchmod(fd, e.mode & 07777) != 0)
++        Debug::out(LOG_ERROR, "ImageFileMedia - couldn't give %s back to its owner: %s", e.path.c_str(), strerror(errno));
++}
++
++void ImageFileMedia::guardSweep(void)
++{
++    std::vector<GuardEntry> list;
++    guardRead(list);
++    for(size_t i = 0; i < list.size(); i++) {
++        int f = openNoLinks(list[i].path.c_str(), O_RDONLY | O_NONBLOCK);
++        if(f < 0) continue;                                 // gone meanwhile
++        guardGiveBack(f, list[i]);
++        close(f);
++        Debug::out(LOG_DEBUG, "ImageFileMedia - %s given back to its owner (left taken at the last stop)", list[i].path.c_str());
++    }
++    list.clear();
++    guardWrite(list);
++}
++
++void ImageFileMedia::guardTake(const char *path)
++{
++    guarded = false;
++    char real[PATH_MAX];
++    struct stat st;
++    if(!realpath(path, real) || strncmp(real, GUARD_ROOT, strlen(GUARD_ROOT)) != 0) return;     // only what's shared
++    if(strchr(real, '\n') || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return;
++    struct stat rs;                                         // the file we have open is the one at that path
++    if(lstat(real, &rs) != 0 || rs.st_dev != st.st_dev || rs.st_ino != st.st_ino) return;
++
++    struct flock fl;                                        // "in use" for programs that ask
++    memset(&fl, 0, sizeof(fl));
++    fl.l_type = F_RDLCK;
++    fl.l_whence = SEEK_SET;
++#ifdef F_OFD_SETLK
++    fcntl(fd, F_OFD_SETLK, &fl);                            // (this open file's own: not lost when the app closes another handle of the file)
++#else
++    fcntl(fd, F_SETLK, &fl);
++#endif
++
++    // the folder: sticky and root's, when its group can write (so nobody loses access)
++    char dir[PATH_MAX];
++    strcpy(dir, real);
++    char *slash = strrchr(dir, '/');
++    if(slash && slash > dir + strlen(GUARD_ROOT) - 1) {     // (not /storage itself)
++        *slash = 0;
++        struct stat ds;
++        int dfd = openNoLinks(dir, O_RDONLY | O_DIRECTORY);
++        if(dfd >= 0 && fstat(dfd, &ds) == 0 && S_ISDIR(ds.st_mode) && (ds.st_mode & S_IWGRP) && (ds.st_uid != 0 || !(ds.st_mode & S_ISVTX))) {
++            if(fchown(dfd, 0, ds.st_gid) != 0 || fchmod(dfd, (ds.st_mode & 07777) | S_ISVTX) != 0)
++                Debug::out(LOG_ERROR, "ImageFileMedia - couldn't protect the folder %s: %s", dir, strerror(errno));
++        }
++        if(dfd >= 0) close(dfd);
++    }
++
++    unsigned mode = 0600 | ((st.st_mode & S_IRUSR) ? 0044 : 0);
++    if(st.st_uid == 0 && (st.st_mode & 07777 & ~mode) == 0) return;      // root's already and closed to others: nothing to take
++
++    std::vector<GuardEntry> list;
++    guardRead(list);
++    bool listed = false;
++    for(size_t i = 0; i < list.size(); i++) {
++        if(list[i].path != real) continue;
++        if(list[i].dev == (unsigned long long) st.st_dev && list[i].ino == (unsigned long long) st.st_ino) {
++            listed = true; guardUid = list[i].uid; guardGid = list[i].gid; guardMode = list[i].mode;
++        } else {
++            list.erase(list.begin() + i);                   // another file had this name: its entry is of no use
++            i--;
++        }
++    }
++    if(!listed) {
++        GuardEntry e;
++        e.uid = guardUid = st.st_uid; e.gid = guardGid = st.st_gid; e.mode = guardMode = st.st_mode & 07777; e.path = real;
++        e.dev = st.st_dev; e.ino = st.st_ino;
++        list.push_back(e);
++        if(!guardWrite(list)) {                             // not noted: don't take what couldn't be given back
++            Debug::out(LOG_ERROR, "ImageFileMedia - couldn't write " GUARD_LIST ", %s stays as it is", real);
++            return;
++        }
++    }
++    if(fchown(fd, 0, 0) != 0 || fchmod(fd, mode) != 0) {
++        Debug::out(LOG_ERROR, "ImageFileMedia - couldn't take %s from the shares: %s", real, strerror(errno));
++    }
++    strncpy(guardPath, real, sizeof(guardPath) - 1);
++    guardPath[sizeof(guardPath) - 1] = 0;
++    guarded = true;
++    Debug::out(LOG_DEBUG, "ImageFileMedia - %s is root's while attached (was %u:%u %o)", real, guardUid, guardGid, guardMode);
++}
++
++void ImageFileMedia::guardRelease(void)
+ {
++    if(!guarded || fd < 0) return;
++    guarded = false;
++    GuardEntry e;
++    e.uid = guardUid; e.gid = guardGid; e.mode = guardMode; e.path = guardPath;
++    struct stat own;
++    if(fstat(fd, &own) != 0) return;
++    e.dev = own.st_dev; e.ino = own.st_ino;                 // (our own open file: the one that was taken)
++    guardGiveBack(fd, e);
++    std::vector<GuardEntry> list, rest;
++    guardRead(list);
++    for(size_t i = 0; i < list.size(); i++) if(list[i].path != e.path) rest.push_back(list[i]);
++    guardWrite(rest);
+ }
+ 
+ ImageFileMedia::~ImageFileMedia()
+@@ -59,6 +237,7 @@ bool ImageFileMedia::iopen(const char *path, bool createIfNotExists)
+     }
+ 
+     mediaHasChanged = false;
++    if(!imageWasCreated) guardTake(path);
+ 
+     Debug::out(LOG_DEBUG, "ImageFileMedia - open succeeded, capacity: %lld sectors / %lld bytes, was created: %d",
+                (long long)SCapacity, (long long)BCapacity, (int)imageWasCreated);
+@@ -69,6 +248,7 @@ bool ImageFileMedia::iopen(const char *path, bool createIfNotExists)
+ void ImageFileMedia::iclose(void)
+ {
+     if(fd >= 0) {
++        guardRelease();
+         close(fd);
+     }
+ 
+diff --git a/ce_main_app/native/imagefilemedia.h b/ce_main_app/native/imagefilemedia.h
+index 2fc747aa..945907fa 100644
+--- a/ce_main_app/native/imagefilemedia.h
++++ b/ce_main_app/native/imagefilemedia.h
+@@ -30,6 +30,16 @@ private:
+     bool    mediaHasChanged;
+ 
+     int     fd;
++
++    // an image in /storage is taken from the share user while it's open (see imagefilemedia.cpp)
++    void guardTake(const char *path);
++    void guardRelease(void);
++    bool guarded;
++    char guardPath[4096];
++    unsigned guardUid, guardGid, guardMode;
++
++public:
++    static void guardSweep(void);       // at start: give back what a crash or power cut left taken
+ };
+ 
+ #endif // _IMAGEFILEMEDIA_H_
+diff --git a/ce_main_app/native/scsi.cpp b/ce_main_app/native/scsi.cpp
+index 9db2f980..cda41da9 100644
+--- a/ce_main_app/native/scsi.cpp
++++ b/ce_main_app/native/scsi.cpp
+@@ -15,6 +15,8 @@ Scsi::Scsi(void)
+ 
+     dataTrans = 0;
+ 
++    ImageFileMedia::guardSweep();       // images left taken from the shares by a crash or power cut
++
+     dataBuffer  = new BYTE[SCSI_BUFFER_SIZE];
+     dataBuffer2 = new BYTE[SCSI_BUFFER_SIZE];
+ 
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index 7735af0a..50663a2a 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -17,6 +17,7 @@
+ #include <sys/wait.h>
+ #include <sys/statvfs.h>
+ #include <fcntl.h>
++#include <sys/sysmacros.h>
+ #include <dirent.h>
+ #include <unistd.h>
+ #include <errno.h>
+@@ -329,9 +330,15 @@ static bool writeImageNotes(const std::string &imageName, const std::string &not
+     cJSON_Delete(o);
+     if(!txt) return false;
+     std::string tmp = p + ".tmp";
+-    FILE *f = fopen(tmp.c_str(), "w");
++    // a new file of our own, never through a link: the share user can put
++    // files and links in this folder, and this runs as root
++    unlink(tmp.c_str());
++    int tfd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0664);
++    FILE *f = tfd >= 0 ? fdopen(tfd, "w") : NULL;
++    if(!f && tfd >= 0) close(tfd);
+     bool ok = f && fputs(txt, f) >= 0 && fputc('\n', f) != EOF;
+     free(txt);
++    if(f && fchown(fileno(f), 1000, 1000) != 0) { /* stays root's */ }      // the share user's, as the images are (they can delete it)
+     if(f) { ok = (fflush(f) == 0) && (fsync(fileno(f)) == 0) && ok; if(fclose(f) != 0) ok = false; }
+     if(!ok || rename(tmp.c_str(), p.c_str()) != 0) { unlink(tmp.c_str()); return false; }
+     return true;
+@@ -1102,6 +1109,57 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+         if(path.find("/mnt/shared/") == 0) warning = "An HDD image on the network isn't safe: a dropped connection can corrupt it.";
+ 
+         int was = imageId(s, path);
++        // open for writing somewhere else: a program on a network share (an
++        // emulator running from it, a copy still going). Once attached, the
++        // image is root's and that program's writes fail, so it's refused
++        // here, where it can be said. A read lease is only given when nobody
++        // has the file open for writing. The NFS server keeps a file open for
++        // a moment after its last use: waited for, up to 4 s. An NFS 4 client
++        // with the file open is seen the same way (its server-side open); an
++        // NFS 3 client that isn't writing just now can't be. (Not asked when
++        // the image is attached already: the app itself has it open.)
++        if(was < 0 && path.compare(0, 9, "/storage/") == 0) {
++            bool busy = true;
++            for(int i = 0; i < 20 && busy; i++) {
++                if(i) usleep(200 * 1000);
++                int lf = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++                if(lf < 0) {
++                    // an NFS 4 client holds a write delegation: this open recalls it
++                    // (not waited for here, O_NONBLOCK); try again once it's back
++                    if(errno == EWOULDBLOCK || errno == EAGAIN) continue;
++                    busy = false;
++                    break;
++                }
++                if(fcntl(lf, F_SETLEASE, F_RDLCK) == 0) { fcntl(lf, F_SETLEASE, F_UNLCK); busy = false; }
++                else if(errno != EAGAIN) busy = false;      // no leases here: can't tell
++                close(lf);
++            }
++            // NFS 4: the server's own list of what its clients have open
++            // (/proc/fs/nfsd/clients/<n>/states), one line per open file:
++            //   { type: open, access: rw, ..., superblock: "b3:06:15", ... }
++            // with the device (hex major:minor) and the inode (decimal)
++            if(!busy) {
++                char want[64];
++                snprintf(want, sizeof(want), "superblock: \"%02x:%02x:%lu\"", (unsigned) major(st.st_dev), (unsigned) minor(st.st_dev), (unsigned long) st.st_ino);
++                DIR *cd = opendir("/proc/fs/nfsd/clients");
++                struct dirent *ce;
++                while(cd && !busy && (ce = readdir(cd)) != NULL) {
++                    if(ce->d_name[0] == '.') continue;
++                    std::string sp = std::string("/proc/fs/nfsd/clients/") + ce->d_name + "/states";
++                    FILE *sf = fopen(sp.c_str(), "r");
++                    if(!sf) continue;
++                    char line[1024];
++                    while(!busy && fgets(line, sizeof(line), sf)) {
++                        const char *acc = strstr(line, "access: ");
++                        if(!strstr(line, "type: open") || !acc || !strstr(line, want)) continue;
++                        for(acc += 8; *acc && *acc != ',' && *acc != ' '; acc++) if(*acc == 'w') busy = true;
++                    }
++                    fclose(sf);
++                }
++                if(cd) closedir(cd);
++            }
++            if(busy) { msg = "This image is open for writing on a network share (NFS or SMB): close it there first, then attach it."; return false; }
++        }
+         if(id < 0) {                                    // the old way: where it is, or the first raw ID without an image
+             if(was >= 0 && was < 8) id = was;
+             for(int i = 0; i < 8 && id < 0; i++) {
+-- 
+2.54.0 (Apple Git-157)
+

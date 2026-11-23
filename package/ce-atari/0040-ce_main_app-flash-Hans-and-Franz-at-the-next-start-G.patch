@@ -1,0 +1,121 @@
+From 7b97c028970b48b92b766ff2c938f2d659cdeff9 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:47:05 +0100
+Subject: [PATCH] ce_main_app: flash Hans and Franz at the next start (GET/POST
+ /api/v1/system/flash)
+
+POST {"chips": ["hans", "franz"]} records the request with
+/usr/sbin/ce-flash and restarts; the chips are flashed at the next start,
+before the app starts. Refused while a system update is in progress.
+GET returns the request and the last flash's result.
+---
+ .../webserver/api/resource/systemresource.cpp | 65 +++++++++++++++++++
+ .../webserver/api/resource/systemresource.h   |  2 +
+ 2 files changed, 67 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 7a692219..151311b2 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -262,6 +262,7 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         sendError(conn, 405, "GET /api/v1/system/backup[/download] or POST /api/v1/system/backup/restore");
+         return true;
+     }
++    if(what == "flash") { flash(conn, req_info); return true; }
+     if(what.compare(0, 6, "update") != 0) { sendError(conn, 404, "unknown resource"); return true; }
+     what.erase(0, 6);
+     while(!what.empty() && what[0] == '/') what.erase(0, 1);
+@@ -346,6 +347,70 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+ }
+ 
+ 
++/* ------------------------------------------------- chip firmware */
++
++// GET: what's asked for and how the last flash went; POST {"chips": ["hans", "franz"]}:
++// flash them at the next start, before the app starts, and restart now
++void SystemResource::flash(mg_connection *conn, mg_request_info *req_info)
++{
++    const char *m = req_info->request_method;
++    if(access(FLASH_TOOL, X_OK) != 0) { sendError(conn, 404, "Flashing the chips isn't available on this system."); return; }
++    if(strcmp(m, "POST") == 0) {
++        const char *ctype = mg_get_header(conn, "Content-Type");
++        if(!ctype || strncasecmp(ctype, "application/json", 16) != 0) { sendError(conn, 415, "Content-Type must be application/json"); return; }
++        std::string body;
++        char buf[256];
++        int n;
++        while((n = mg_read(conn, buf, sizeof(buf))) > 0) if(body.length() < 4096) body.append(buf, n);
++        cJSON *in = cJSON_Parse(body.c_str());
++        cJSON *jc = in ? cJSON_GetObjectItem(in, "chips") : NULL;
++        std::string chips;
++        bool bad = !jc || jc->type != cJSON_Array || cJSON_GetArraySize(jc) == 0;
++        for(int i = 0; !bad && i < cJSON_GetArraySize(jc); i++) {
++            cJSON *c = cJSON_GetArrayItem(jc, i);
++            if(!c || c->type != cJSON_String || !c->valuestring || (strcmp(c->valuestring, "hans") != 0 && strcmp(c->valuestring, "franz") != 0)) bad = true;
++            else chips += std::string(" ") + c->valuestring;
++        }
++        if(in) cJSON_Delete(in);
++        if(bad) { sendError(conn, 400, "Which chips? {\"chips\": [\"hans\", \"franz\"]}"); return; }
++        // a restart now would also start (or decide on) a new system: not in the middle of that
++        if(toolAvailable()) {
++            std::string su;
++            runTool("status", su);
++            std::string s = valueOf(su, "state");
++            if(valueOf(su, "busy") == "yes" || s == "staged" || s == "trial" || s == "restarting") {
++                sendError(conn, 409, "A system update is in progress: finish it first (restart into it, Keep, or Don't start it).");
++                return;
++            }
++        }
++        std::string out;
++        runToolAt(FLASH_TOOL, ("request" + chips).c_str(), out);
++        std::string err = valueOf(out, "error");
++        if(!err.empty() || valueOf(out, "pending").empty()) { sendError(conn, 400, err.empty() ? "Couldn't ask for the flash." : err); return; }
++        if(!startToolAt(FLASH_TOOL, "reboot")) { runToolAt(FLASH_TOOL, "cancel", out); sendError(conn, 500, "Couldn't restart."); return; }
++        Debug::out(LOG_INFO, "SystemResource: flash%s at the next start, restarting", chips.c_str());
++    } else if(strcmp(m, "GET") != 0) {
++        sendError(conn, 405, "GET or POST /api/v1/system/flash");
++        return;
++    }
++    std::string out;
++    runToolAt(FLASH_TOOL, "status", out);
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddBoolToObject(root, "available", true);
++    size_t pos = 0;
++    while(pos < out.length()) {
++        size_t end = out.find('\n', pos);
++        if(end == std::string::npos) end = out.length();
++        std::string line = out.substr(pos, end - pos);
++        pos = end + 1;
++        size_t eq = line.find('=');
++        if(eq == std::string::npos || eq == 0) continue;
++        cJSON_AddStringToObject(root, line.substr(0, eq).c_str(), line.substr(eq + 1).c_str());
++    }
++    sendJson(conn, root);
++}
++
++
+ /* ------------------------------------------------- encrypted backups */
+ 
+ // A backup with passwords and keys is encrypted with a password the user
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index 9e56f406..f7a2b7dc 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -46,6 +46,7 @@
+ #define SYSUPDATE_MAX_MB    2048            // largest upload
+ #define BACKUP_TOOL         "/usr/sbin/ce-backup"
+ #define BACKUP_MAX_MB       4096            // largest backup upload
++#define FLASH_TOOL          "/usr/sbin/ce-flash"    // chip firmware, flashed at the next start
+ 
+ class SystemResource : public IApiResource {
+ public:
+@@ -61,6 +62,7 @@ private:
+     void backupInfo(mg_connection *conn);
+     void backupDownload(mg_connection *conn, mg_request_info *req_info);
+     void backupRestore(mg_connection *conn);
++    void flash(mg_connection *conn, mg_request_info *req_info);
+     // receive the body into <tool's workdir>/<name>; false: answered with an error
+     bool receiveFile(mg_connection *conn, const char *tool, long long maxMB, const std::string &name, std::string &path);
+ };
+-- 
+2.54.0 (Apple Git-157)
+

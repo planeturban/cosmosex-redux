@@ -1,0 +1,39 @@
+# CosmosEx on Raspberry Pi 1 (B, B+, A+) / Zero / Zero W, 32-bit ARMv6 (Buildroot)
+
+# Cut-down firmware: smaller and faster to load; no video codecs/camera/3D,
+# which the CosmosEx doesn't use. The HDMI console still works. To go back to
+# the full firmware: start.elf / fixup.dat and gpu_mem=64.
+start_file=start_cd.elf
+fixup_file=fixup_cd.dat
+# 32-bit ARMv6 kernel (bcmrpi, BCM2835): Pi 1 and Zero
+kernel=zImage
+disable_overscan=1
+
+# Same as the stock CosmosEx image (stretch_2019-08-13.img), except gpu_mem
+# (stock: 64, with the full firmware).
+# GPIO14/15 are wired to the CosmosEx STM32s (IKBD data and chip flashing),
+# so the PL011 UART must be on those pins and must not carry a console.
+dtparam=i2c_arm=off
+dtparam=spi=off
+core_freq=250
+start_x=0
+enable_uart=1
+gpu_mem=16
+
+# Faster boot
+disable_splash=1
+boot_delay=0
+# Full CPU clock for the first 30 s instead of ramping up
+initial_turbo=30
+# No HAT EEPROM on the ID_SD/ID_SC pins (GPIO0/1); don't probe for one
+force_eeprom_read=0
+# HDMI screen saver (ce-screensaver, /etc/default/ce-screensaver): the
+# spinning logo after 5 minutes without activity, the screen off after 30.
+# With this, "off" means no HDMI signal, so the monitor can go to standby.
+hdmi_blanking=1
+
+[pi0w]
+# Zero W: the PL011 UART is on Bluetooth by default; move it back to
+# GPIO14/15 (the other Pi 1 models have no Bluetooth)
+dtoverlay=disable-bt
+[all]

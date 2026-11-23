@@ -1,0 +1,3 @@
+BR2_GLOBAL_PATCH_DIR of the CosmosEx defconfigs (instead of Buildroot's
+board/raspberrypi/patches): hashes for the pinned kernel (linux/) and for the
+toolchain's kernel headers (linux-headers/, kept at the older commit).

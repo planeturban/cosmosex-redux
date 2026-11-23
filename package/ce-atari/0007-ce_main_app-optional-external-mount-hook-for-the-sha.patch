@@ -1,0 +1,92 @@
+From fe942c4f9bbb3b45edde42363e906b74a5c649f2 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 23:38:26 +0200
+Subject: [PATCH] ce_main_app: optional external mount hook for the shared
+ drive
+
+If /usr/libexec/ce-shared-mount exists and is executable, the app runs it
+with "update" whenever the shared drive settings may have changed (start,
+settings save, new network address) and only attaches /mnt/shared, instead
+of mounting it itself. The hook reads the SHARED_* settings on its own, so
+credentials don't appear on a command line.
+
+This lets the system manage the share, e.g. with autofs: mount on first
+access, retry when the server comes up later, unmount when idle. Without
+the hook nothing changes.
+---
+ ce_main_app/translated/translateddisk.h       |  4 +++
+ .../translated/translateddisk_general.cpp     | 36 +++++++++++++------
+ 2 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/ce_main_app/translated/translateddisk.h b/ce_main_app/translated/translateddisk.h
+index 8e76758e..67abf5be 100644
+--- a/ce_main_app/translated/translateddisk.h
++++ b/ce_main_app/translated/translateddisk.h
+@@ -19,6 +19,10 @@ class SettingsReloadProxy;
+ 
+ #define CONFIG_DRIVE_PATH       "/tmp/configdrive"
+ #define SHARED_DRIVE_PATH       "/mnt/shared"
++// Optional: if this executable exists, it mounts the shared drive instead of
++// the app (called with "update" whenever the shared drive settings may have
++// changed; it reads the SHARED_* settings itself).
++#define SHARED_DRIVE_MOUNT_HOOK "/usr/libexec/ce-shared-mount"
+ 
+ // this version number should be increased whenever command, data or status part of translated disk has changed - to enable CE_DD vs. Main App pairing.
+ // The CE_DD should check this version number and it this doesn't match expectations, it should refuse to work.
+diff --git a/ce_main_app/translated/translateddisk_general.cpp b/ce_main_app/translated/translateddisk_general.cpp
+index 6a606509..b097ee5d 100644
+--- a/ce_main_app/translated/translateddisk_general.cpp
++++ b/ce_main_app/translated/translateddisk_general.cpp
+@@ -209,6 +209,20 @@ void TranslatedDisk::mountAndAttachSharedDrive(void)
+ {
+     std::string mountPath = SHARED_DRIVE_PATH;
+ 
++    // If the system provides a shared drive mount hook (e.g. one that
++    // configures an automounter), let it handle mounting: tell it the shared
++    // drive settings may have changed (it reads them from the settings
++    // itself), and only attach SHARED_DRIVE_PATH here.
++    bool externalMount = (access(SHARED_DRIVE_MOUNT_HOOK, X_OK) == 0);
++
++    if(externalMount) {
++        Debug::out(LOG_DEBUG, "mountAndAttachSharedDrive: running %s", SHARED_DRIVE_MOUNT_HOOK);
++        int ret = system(SHARED_DRIVE_MOUNT_HOOK " update");
++        if(ret != 0) {
++            Debug::out(LOG_ERROR, "mountAndAttachSharedDrive: %s failed (%d)", SHARED_DRIVE_MOUNT_HOOK, ret);
++        }
++    }
++
+     Settings s;
+     std::string addr, path, username, password;
+     bool sharedEnabled;
+@@ -233,16 +247,18 @@ void TranslatedDisk::mountAndAttachSharedDrive(void)
+         return;
+     }
+ 
+-    TMounterRequest tmr;                                                    // fill this struct to mount something somewhere
+-    tmr.action              = MOUNTER_ACTION_MOUNT;                         // action: mount
+-    tmr.deviceNotShared     = false;
+-    tmr.shared.host         = addr;
+-    tmr.shared.hostDir      = path;
+-    tmr.shared.nfsNotSamba  = nfsNotSamba;
+-    tmr.shared.username     = username;
+-    tmr.shared.password     = password;
+-    tmr.mountDir            = mountPath;
+-    Mounter::add(tmr);
++    if(!externalMount) {
++        TMounterRequest tmr;                                                // fill this struct to mount something somewhere
++        tmr.action              = MOUNTER_ACTION_MOUNT;                     // action: mount
++        tmr.deviceNotShared     = false;
++        tmr.shared.host         = addr;
++        tmr.shared.hostDir      = path;
++        tmr.shared.nfsNotSamba  = nfsNotSamba;
++        tmr.shared.username     = username;
++        tmr.shared.password     = password;
++        tmr.mountDir            = mountPath;
++        Mounter::add(tmr);
++    }
+ 
+     std::string devicePath;
+     if(nfsNotSamba) {
+-- 
+2.54.0 (Apple Git-157)
+

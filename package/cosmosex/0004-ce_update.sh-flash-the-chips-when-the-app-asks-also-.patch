@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:24:50 +0100
+Subject: [PATCH] ce_update.sh: flash the chips when the app asks, also without an
+ update
+
+The image's ce_update.sh stops at once when there's no USB update ("no
+online update"). But the app also runs it when it wants the chips
+flashed: on a Xilinx HW/FW mismatch (the ACSI/SCSI jumper changed) it
+writes /tmp/FW_FLASH_XILINX and the update script, then exits. The
+script stopped, cesuper.sh started the app again, the app found the same
+mismatch and exited: every 5 seconds, for good. Recovery level 3 (first
+firmware, then a restart) didn't work either.
+
+With FW_FLASH_XILINX, FW_FLASH_ALL or REBOOT_AFTER_UPDATE and no USB
+update: stop the app, run check_and_flash_chips.sh, restart if asked.
+---
+--- a/ce_update.sh
++++ b/ce_update.sh
+@@ -9,6 +9,24 @@
+ # files in /ce, never the system or the image's own app. The image is
+ # updated by writing a new image to the SD card (later: the image's own
+ # update). An update from a USB stick (/tmp/UPDATE_FROM_USB) still works.
++#
++# The app also runs this script when it wants the chips flashed without an
++# update: a Xilinx HW/FW mismatch (the ACSI/SCSI jumper changed: it writes
++# /tmp/FW_FLASH_XILINX, then exits) and recovery level 3 (first firmware,
++# then a restart: /tmp/REBOOT_AFTER_UPDATE). Do that part here; stopping
++# early would bring the app back with the same mismatch every 5 seconds.
++if [ ! -f /tmp/UPDATE_FROM_USB ] && { [ -f /tmp/FW_FLASH_XILINX ] || [ -f /tmp/FW_FLASH_ALL ] || [ -f /tmp/REBOOT_AFTER_UPDATE ]; }; then
++    echo "Flashing the chips as the app asked (no update)."
++    /ce/ce_stop.sh $1 $2
++    /ce/update/check_and_flash_chips.sh
++    sync
++    if [ -f /tmp/REBOOT_AFTER_UPDATE ]; then
++        rm -f /tmp/REBOOT_AFTER_UPDATE
++        reboot now
++    fi
++    echo "ce_update.sh finished at: $( date )"
++    exit 0
++fi
+ if [ ! -f /tmp/UPDATE_FROM_USB ]; then
+     echo "Online update is not available on this image."
+     echo "To update, write a new image to the SD card."
+-- 
+2.0

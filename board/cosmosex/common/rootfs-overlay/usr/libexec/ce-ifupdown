@@ -1,0 +1,43 @@
+#!/bin/sh
+# CosmosEx: /sbin/ifup and /sbin/ifdown.
+#
+# The CosmosEx app runs "ifdown wlan0" / "ifup wlan0" after Wi-Fi settings
+# change (Raspbian's ifupdown). Here dhcpcd manages every interface (DHCP
+# and the static entries the app writes to /etc/dhcpcd.conf) and its
+# 10-wpa_supplicant hook starts wpa_supplicant. BusyBox ifup would start
+# udhcpc next to dhcpcd, so for wlan0/eth0 this script only:
+#   ifdown: takes the link down (dhcpcd drops the address)
+#   ifup:   brings the link up, makes wpa_supplicant re-read its config
+#           (the app has just rewritten it) and makes dhcpcd re-read
+#           /etc/dhcpcd.conf and rebind the interface
+# Anything else (lo, -a, other options) goes to BusyBox unchanged.
+
+cmd=${0##*/}
+log() { logger -t "ce-$cmd" "$*" 2>/dev/null; }
+
+case "$*" in
+    wlan0|eth0) iface=$1 ;;
+    *) exec /bin/busybox "$cmd" "$@" ;;
+esac
+
+[ -e "/sys/class/net/$iface" ] || { echo "$cmd: no $iface" >&2; exit 1; }
+
+case "$cmd" in
+    ifdown)
+        log "$iface down"
+        ip link set "$iface" down
+        ;;
+    ifup)
+        log "$iface up"
+        ip link set "$iface" up
+        if [ "$iface" = wlan0 ] && wpa_cli -i wlan0 ping >/dev/null 2>&1; then
+            wpa_cli -i wlan0 reconfigure >/dev/null 2>&1
+        fi
+        # Re-read dhcpcd.conf (the app may have changed static/DHCP), then rebind.
+        if [ -f /var/run/dhcpcd/pid ]; then
+            dhcpcd -g >/dev/null 2>&1
+            dhcpcd -n "$iface" >/dev/null 2>&1
+        fi
+        ;;
+esac
+exit 0

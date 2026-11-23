@@ -1,0 +1,265 @@
+From a963fa8ae94c26443bfe7493a39c0c09683ae3ec Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 00:22:09 +0100
+Subject: [PATCH] ce_main_app: look inside hard disk images; fork without
+ allocating
+
+GET /api/v1/settings/hddimage/inspect?path=: the image's partitions
+(PC/MBR or Atari AHDI/ICD; type, size, label), &part=&dir=: a folder,
+inspectfile?path=&part=&file=: a file. Done by the image's
+/usr/sbin/ce-hdinspect (read-only loop device and mounts), run without a
+shell; only listed images.
+
+The children of fork() in the app (this and the system update starter)
+no longer allocate memory: the argument lists are made before the fork
+(another thread may hold the allocator's lock).
+---
+ .../api/resource/settingsresource.cpp         | 175 ++++++++++++++++++
+ .../webserver/api/resource/settingsresource.h |   3 +
+ .../webserver/api/resource/systemresource.cpp |   2 +-
+ 3 files changed, 179 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index f5bfdf13..42c66b3c 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -14,6 +14,7 @@
+ #include <strings.h>
+ #include <ctype.h>
+ #include <sys/stat.h>
++#include <sys/wait.h>
+ #include <sys/statvfs.h>
+ #include <fcntl.h>
+ #include <dirent.h>
+@@ -1139,6 +1140,176 @@ void SettingsResource::sendError(mg_connection *conn, int code, const char *mess
+     sendJson(conn, root, code);
+ }
+ 
++/* ----------------------------------------------- look inside an image */
++
++#define HDINSPECT_TOOL  "/usr/sbin/ce-hdinspect"
++
++// run a program without a shell (arguments from requests can't become
++// commands); its stdout into out (at most maxOut bytes), or as a chunked
++// response to conn. Returns the exit status (-1: couldn't run).
++static int runArgv(const std::vector<std::string> &args, std::string *out, size_t maxOut, mg_connection *stream)
++{
++    std::vector<char *> argv;                   // made before fork: the child mustn't allocate (other threads)
++    for(size_t i = 0; i < args.size(); i++) argv.push_back((char *) args[i].c_str());
++    argv.push_back(NULL);
++    int fds[2];
++    if(pipe(fds) != 0) return -1;
++    pid_t pid = fork();
++    if(pid < 0) { close(fds[0]); close(fds[1]); return -1; }
++    if(pid == 0) {
++        dup2(fds[1], 1);
++        int nul = open("/dev/null", O_RDWR);
++        if(nul >= 0) { dup2(nul, 0); dup2(nul, 2); }
++        long maxFd = sysconf(_SC_OPEN_MAX);
++        for(long fd = 3; fd < (maxFd > 0 ? maxFd : 1024); fd++) close(fd);
++        execv(argv[0], &argv[0]);
++        _exit(127);
++    }
++    close(fds[1]);
++    std::vector<char> buf(65536);
++    ssize_t n;
++    bool ok = true;
++    while((n = read(fds[0], &buf[0], buf.size())) > 0) {
++        if(stream && ok) {
++            char head[16];
++            int hl = snprintf(head, sizeof(head), "%lx\r\n", (unsigned long) n);
++            if(mg_write(stream, head, hl) != hl || mg_write(stream, &buf[0], n) != (int) n || mg_write(stream, "\r\n", 2) != 2) ok = false;
++        } else if(out && out->length() < maxOut) {
++            out->append(&buf[0], n);
++        }
++    }
++    close(fds[0]);
++    int st = 0;
++    while(waitpid(pid, &st, 0) < 0 && errno == EINTR) { }
++    if(stream && ok) mg_write(stream, "0\r\n\r\n", 5);
++    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
++}
++
++static std::string lineValue(const std::string &out, const char *key)
++{
++    std::string k = std::string(key) + "=";
++    size_t pos = 0;
++    while(pos < out.length()) {
++        size_t end = out.find('\n', pos);
++        if(end == std::string::npos) end = out.length();
++        if(out.compare(pos, k.length(), k) == 0) return out.substr(pos + k.length(), end - pos - k.length());
++        pos = end + 1;
++    }
++    return "";
++}
++
++// GET /api/v1/settings/hddimage/inspect?path=<image>              its partitions
++// GET /api/v1/settings/hddimage/inspect?path=<image>&part=N&dir=/  a folder in one
++// GET /api/v1/settings/hddimage/inspectfile?path=&part=&file=      a file from it
++void SettingsResource::inspectImage(mg_connection *conn, mg_request_info *req_info, bool file)
++{
++    const char *qs = req_info->query_string ? req_info->query_string : "";
++    char path[PATH_MAX], part[8] = "", where[PATH_MAX] = "";
++    std::string real, kind;
++    if(mg_get_var(qs, strlen(qs), "path", path, sizeof(path)) <= 0 || !listedImage(path, real, kind)) {
++        sendError(conn, 404, "no such image");
++        return;
++    }
++    mg_get_var(qs, strlen(qs), "part", part, sizeof(part));
++    mg_get_var(qs, strlen(qs), file ? "file" : "dir", where, sizeof(where));
++    for(const char *c = part; *c; c++) if(*c < '0' || *c > '9') { sendError(conn, 400, "bad partition"); return; }
++
++    std::vector<std::string> args;
++    args.push_back(HDINSPECT_TOOL);
++    std::string out;
++
++    if(file) {
++        if(!part[0] || !where[0]) { sendError(conn, 400, "which partition and file?"); return; }
++        // is it a file? (the tool's listing of its folder)
++        std::string w = where, dir = w.substr(0, w.find_last_of('/') + 1), name = w.substr(w.find_last_of('/') + 1);
++        args.push_back("ls"); args.push_back(real); args.push_back(part); args.push_back(dir.empty() ? "/" : dir);
++        int rc = runArgv(args, &out, 1 << 20, NULL);
++        std::string err = lineValue(out, "error");
++        if(rc != 0) { sendError(conn, 400, err.empty() ? "can't read that" : err.c_str()); return; }
++        bool isFile = false;
++        size_t pos = 0;
++        while(pos < out.length()) {
++            size_t end = out.find('\n', pos);
++            if(end == std::string::npos) end = out.length();
++            std::string line = out.substr(pos, end - pos);
++            pos = end + 1;
++            size_t t = line.rfind('\t');
++            if(t != std::string::npos && line[0] == 'f' && line.substr(t + 1) == name) isFile = true;
++        }
++        if(!isFile) { sendError(conn, 404, "no such file"); return; }
++        std::string dn = name;
++        for(size_t i = 0; i < dn.length(); i++) if(dn[i] == '"' || dn[i] == '\\' || (unsigned char) dn[i] < 32) dn[i] = '_';
++        mg_printf(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-cache\r\n"
++                        "Content-Disposition: attachment; filename=\"%s\"\r\nTransfer-Encoding: chunked\r\n\r\n", dn.c_str());
++        args.clear();
++        args.push_back(HDINSPECT_TOOL); args.push_back("cat"); args.push_back(real); args.push_back(part); args.push_back(w);
++        runArgv(args, NULL, 0, conn);
++        return;
++    }
++
++    cJSON *root = cJSON_CreateObject();
++    if(!part[0]) {                                          // the partitions
++        args.push_back("parts"); args.push_back(real);
++        int rc = runArgv(args, &out, 1 << 16, NULL);
++        std::string err = lineValue(out, "error");
++        if(rc != 0) { cJSON_Delete(root); sendError(conn, 400, err.empty() ? "can't open the image" : err.c_str()); return; }
++        cJSON_AddStringToObject(root, "image", real.c_str());
++        cJSON_AddNumberToObject(root, "sizeMB", atof(lineValue(out, "sizeMB").c_str()));
++        cJSON_AddStringToObject(root, "table", lineValue(out, "table").c_str());
++        cJSON_AddBoolToObject(root, "swapped", lineValue(out, "swapped") == "yes");
++        cJSON *parts = cJSON_CreateArray();
++        size_t pos = 0;
++        while(pos < out.length()) {
++            size_t end = out.find('\n', pos);
++            if(end == std::string::npos) end = out.length();
++            std::string line = out.substr(pos, end - pos);
++            pos = end + 1;
++            if(line.compare(0, 5, "part=") != 0) continue;
++            std::vector<std::string> f;
++            size_t a = 5, b;
++            while((b = line.find('|', a)) != std::string::npos && f.size() < 4) { f.push_back(line.substr(a, b - a)); a = b + 1; }
++            f.push_back(line.substr(a));
++            if(f.size() < 5) continue;
++            cJSON *o = cJSON_CreateObject();
++            cJSON_AddNumberToObject(o, "n", atoi(f[0].c_str()));
++            cJSON_AddNumberToObject(o, "start", atof(f[1].c_str()));
++            cJSON_AddNumberToObject(o, "sizeMB", atof(f[2].c_str()));
++            cJSON_AddStringToObject(o, "type", f[3].c_str());
++            cJSON_AddStringToObject(o, "label", f[4].c_str());
++            cJSON_AddItemToArray(parts, o);
++        }
++        cJSON_AddItemToObject(root, "parts", parts);
++    } else {                                                // a folder
++        args.push_back("ls"); args.push_back(real); args.push_back(part); args.push_back(where[0] ? where : "/");
++        int rc = runArgv(args, &out, 4 << 20, NULL);
++        std::string err = lineValue(out, "error");
++        if(rc != 0) { cJSON_Delete(root); sendError(conn, 400, err.empty() ? "can't read that" : err.c_str()); return; }
++        cJSON_AddStringToObject(root, "dir", where[0] ? where : "/");
++        cJSON *entries = cJSON_CreateArray();
++        size_t pos = 0;
++        while(pos < out.length()) {
++            size_t end = out.find('\n', pos);
++            if(end == std::string::npos) end = out.length();
++            std::string line = out.substr(pos, end - pos);
++            pos = end + 1;
++            if(line == "more=yes") { cJSON_AddBoolToObject(root, "more", true); continue; }
++            size_t t1 = line.find('\t'), t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1), t3 = t2 == std::string::npos ? t2 : line.find('\t', t2 + 1);
++            if(t3 == std::string::npos) continue;
++            cJSON *o = cJSON_CreateObject();
++            const char *types[] = { "d", "folder", "f", "file", "l", "link", "o", "other" };
++            std::string ty = line.substr(0, t1), tyName = "other";
++            for(int i = 0; i < 8; i += 2) if(ty == types[i]) tyName = types[i + 1];
++            cJSON_AddStringToObject(o, "type", tyName.c_str());
++            cJSON_AddNumberToObject(o, "size", atof(line.substr(t1 + 1, t2 - t1 - 1).c_str()));
++            cJSON_AddNumberToObject(o, "mtime", atof(line.substr(t2 + 1, t3 - t2 - 1).c_str()));
++            cJSON_AddStringToObject(o, "name", line.substr(t3 + 1).c_str());
++            cJSON_AddItemToArray(entries, o);
++        }
++        cJSON_AddItemToObject(root, "entries", entries);
++    }
++    sendJson(conn, root);
++}
++
+ // GET /api/v1/settings/hddimage/download?path=<image>: the file itself
+ void SettingsResource::downloadImage(mg_connection *conn, mg_request_info *req_info)
+ {
+@@ -1182,6 +1353,10 @@ bool SettingsResource::dispatch(mg_connection *conn, mg_request_info *req_info,
+         downloadImage(conn, req_info);
+         return true;
+     }
++    if((section == "hddimage/inspect" || section == "hddimage/inspectfile") && strcmp(req_info->request_method, "GET") == 0) {
++        inspectImage(conn, req_info, section == "hddimage/inspectfile");
++        return true;
++    }
+ 
+     bool known = section.empty();
+     for(int i=0; i<SECTION_COUNT; i++) {
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.h b/ce_main_app/webserver/api/resource/settingsresource.h
+index e81addd9..6f1dcd29 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.h
++++ b/ce_main_app/webserver/api/resource/settingsresource.h
+@@ -23,6 +23,8 @@ struct cJSON;
+ // "name"}} for images in that folder (not the attached one for delete), and
+ // GET /api/v1/settings/hddimage/download?path=<image> for the file; the
+ // section lists the images there and in USB drives' top folders.
++// GET .../hddimage/inspect?path=[&part=&dir=] and .../inspectfile?path=&part=&file=
++// look inside an image (partitions, folders, files; /usr/sbin/ce-hdinspect).
+ // Secrets are never returned: the shared drive password and the Wi-Fi key
+ // are reported as "passwordSet" / "pskSet"; leave them out of a PUT (or
+ // null) to keep them, send "" to clear.
+@@ -38,6 +40,7 @@ private:
+     bool saveSection(const std::string &name, cJSON *in, std::string &message, std::string &warning);
+ 
+     void downloadImage(mg_connection *conn, mg_request_info *req_info);
++    void inspectImage(mg_connection *conn, mg_request_info *req_info, bool file);
+     void sendJson(mg_connection *conn, cJSON *root, int code = 200);
+     void sendError(mg_connection *conn, int code, const char *message);
+ };
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 3e7f0be5..09c7be08 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -65,6 +65,7 @@ static std::string valueOf(const std::string &kv, const char *key)
+ // CosmosEx). Double fork, so no zombie; no inherited sockets.
+ static bool startToolAt(const char *tool, const std::string &args)
+ {
++    std::string cmd = std::string(tool) + " " + args;      // before fork: the child mustn't allocate (other threads)
+     pid_t pid = fork();
+     if(pid < 0) return false;
+     if(pid == 0) {
+@@ -75,7 +76,6 @@ static bool startToolAt(const char *tool, const std::string &args)
+         int nul = open("/dev/null", O_RDWR);
+         if(nul >= 0) { dup2(nul, 0); dup2(nul, 1); dup2(nul, 2); if(nul > 2) close(nul); }
+         signal(SIGPIPE, SIG_DFL);
+-        std::string cmd = std::string(tool) + " " + args;
+         execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *) NULL);
+         _exit(127);
+     }
+-- 
+2.54.0 (Apple Git-157)
+

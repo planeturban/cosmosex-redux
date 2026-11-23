@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CosmosEx redux — Log in</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 200 200'%3E%3Ccircle cx='100' cy='100' r='61' fill='%23121417'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(0)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(72)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(144)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(216)' fill='%23FFFFFF'/%3E%3Cpath d='M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z' transform='translate(100 100) rotate(288)' fill='%23FFFFFF'/%3E%3Ccircle cx='100' cy='100' r='9' fill='%23FFFFFF'/%3E%3Cpath d='M121.22 20.79 A82 82 0 0 1 171.72 60.25' fill='none' stroke='%233FA650' stroke-width='13'/%3E%3Cpath d='M160.35 66.55 L183.09 53.94 L180.99 87.17 Z' fill='%233FA650' stroke='%233FA650' stroke-width='1.5'/%3E%3Cpath d='M179.21 121.22 A82 82 0 0 1 139.75 171.72' fill='none' stroke='%23E3D23B' stroke-width='13'/%3E%3Cpath d='M133.45 160.35 L146.06 183.09 L112.83 180.99 Z' fill='%23E3D23B' stroke='%23E3D23B' stroke-width='1.5'/%3E%3Cpath d='M78.78 179.21 A82 82 0 0 1 28.28 139.75' fill='none' stroke='%234A90D9' stroke-width='13'/%3E%3Cpath d='M39.65 133.45 L16.91 146.06 L19.01 112.83 Z' fill='%234A90D9' stroke='%234A90D9' stroke-width='1.5'/%3E%3Cpath d='M20.79 78.78 A82 82 0 0 1 60.25 28.28' fill='none' stroke='%23E8679A' stroke-width='13'/%3E%3Cpath d='M66.55 39.65 L53.94 16.91 L87.17 19.01 Z' fill='%23E8679A' stroke='%23E8679A' stroke-width='1.5'/%3E%3C/svg%3E">
+<script>
+  try { var t = localStorage.getItem('ce-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .login { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px 16px; }
+  .login-box { width: 100%; max-width: 380px; }
+  .login-logo { display: flex; align-items: center; gap: 12px; margin: 0 0 18px; font-family: var(--font-display); font-weight: 700; font-size: 30px; letter-spacing: .04em; text-transform: uppercase; line-height: 1; }
+  .login-logo svg { flex: none; }
+  .login-redux { font-weight: 600; text-transform: none; letter-spacing: .02em; color: var(--accent-text); }
+  .login-box h1 { margin: 2px 0 18px; }
+  .login-form { display: flex; flex-direction: column; gap: 14px; }
+  .login-form .btn { width: 100%; }
+  .login-err { min-height: 1.4em; margin: 0; color: var(--danger); font-size: 14px; }
+  .login-help { margin: 18px 0 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<main class="login">
+  <section class="panel login-box" aria-labelledby="login-h">
+    <p class="login-logo"><svg width="46" height="46" viewBox="0 0 200 200" aria-hidden="true"><circle cx="100" cy="100" r="61" fill="var(--fg)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(0)" fill="var(--panel)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(72)" fill="var(--panel)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(144)" fill="var(--panel)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(216)" fill="var(--panel)"/><path d="M-6.5 0V-30H-17L0 -55L17 -30H6.5V0Z" transform="translate(100 100) rotate(288)" fill="var(--panel)"/><circle cx="100" cy="100" r="9" fill="var(--panel)"/><path d="M121.22 20.79 A82 82 0 0 1 171.72 60.25" fill="none" stroke="#3FA650" stroke-width="13"/><path d="M160.35 66.55 L183.09 53.94 L180.99 87.17 Z" fill="#3FA650" stroke="#3FA650" stroke-width="1.5"/><path d="M179.21 121.22 A82 82 0 0 1 139.75 171.72" fill="none" stroke="#E3D23B" stroke-width="13"/><path d="M133.45 160.35 L146.06 183.09 L112.83 180.99 Z" fill="#E3D23B" stroke="#E3D23B" stroke-width="1.5"/><path d="M78.78 179.21 A82 82 0 0 1 28.28 139.75" fill="none" stroke="#4A90D9" stroke-width="13"/><path d="M39.65 133.45 L16.91 146.06 L19.01 112.83 Z" fill="#4A90D9" stroke="#4A90D9" stroke-width="1.5"/><path d="M20.79 78.78 A82 82 0 0 1 60.25 28.28" fill="none" stroke="#E8679A" stroke-width="13"/><path d="M66.55 39.65 L53.94 16.91 L87.17 19.01 Z" fill="#E8679A" stroke="#E8679A" stroke-width="1.5"/></svg><span>CosmosEx <span class="login-redux">redux</span></span></p>
+    <p class="eyebrow">Web interface</p>
+    <h1 id="login-h">Log in</h1>
+    <form class="login-form" id="form">
+      <label class="field"><span>Password</span>
+        <input class="input" type="password" id="pw" autocomplete="current-password" required autofocus></label>
+      <p class="login-err" id="err" role="alert"></p>
+      <button class="btn btn-primary" type="submit" id="go">Log in</button>
+    </form>
+    <p class="hint login-help">Forgot the password? Put an empty file <span class="mono">insecure.txt</span> on the SD card's <b>CosmosEx</b> volume (where the SSH keys go): the login is then off until you remove it.</p>
+  </section>
+</main>
+<script>
+(function () {
+  // where to go afterwards: a path on this CosmosEx only
+  var next = new URLSearchParams(location.search).get('next') || '/';
+  if (next.charAt(0) !== '/' || next.charAt(1) === '/' || next.indexOf('/login.html') === 0) next = '/';
+
+  // no login needed (switched off, insecure.txt, or already logged in): go on
+  fetch('/api/v1/auth/status').then(function (r) { return r.json(); }).then(function (s) {
+    if (!s.required || s.loggedIn) location.replace(next);
+  }).catch(function () {});
+
+  var form = document.getElementById('form'), pw = document.getElementById('pw'), err = document.getElementById('err'), go = document.getElementById('go');
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    err.textContent = '';
+    go.disabled = true;
+    go.textContent = 'Checking…';
+    fetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw.value }) })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (x) {
+        if (x.ok) { location.replace(next); return; }
+        err.textContent = (x.d && x.d.error) || 'Couldn’t log in.';
+        pw.select();
+      })
+      .catch(function () { err.textContent = 'The CosmosEx doesn’t answer.'; })
+      .then(function () { go.disabled = false; go.textContent = 'Log in'; });
+  });
+})();
+</script>
+</body>
+</html>

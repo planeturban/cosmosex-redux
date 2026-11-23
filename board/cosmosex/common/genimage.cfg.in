@@ -1,0 +1,47 @@
+# The card layout (README.md, "SD card layout"). MBR (the Pi 3 can't boot GPT).
+# Sized to fit a 1 GB card with room for /storage (2026-11-15):
+#   1 boot   FAT, 48 MB, label CosmosEx     /boot (read-only; both systems' kernels)
+#   2 rootA  ext4, 128 MB                   /     (read-only)
+#   3 rootB  128 MB, the other system for updates (empty until the first update)
+#   made by ce-preinit on first boot:
+#   4 extended, holding:
+#     5 data ext4, 128 MB                   /data
+#     6 storage ext4, the rest of the card  /storage
+# The root file system's size is BR2_TARGET_ROOTFS_EXT2_SIZE in the
+# defconfigs (keep it equal to rootB's); post-image.sh reports how full it is.
+# post-image.sh cuts sdcard.img off after rootA: rootB is only an entry in
+# the partition table, so the image is small and quick to write to a card.
+image boot.vfat {
+	vfat {
+		# Volume name on a PC/Mac (FAT: at most 11 characters)
+		label = "CosmosEx"
+		files = {
+#BOOT_FILES#
+		}
+	}
+
+	size = 48M
+}
+
+image sdcard.img {
+	hdimage {
+		# SD cards: start partitions on erase-block boundaries
+		align = 4M
+	}
+
+	partition boot {
+		partition-type = 0xC
+		bootable = "true"
+		image = "boot.vfat"
+	}
+
+	partition rootA {
+		partition-type = 0x83
+		image = "rootfs.ext4"
+	}
+
+	partition rootB {
+		partition-type = 0x83
+		size = 128M
+	}
+}

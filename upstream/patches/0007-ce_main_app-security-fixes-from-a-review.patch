@@ -1,0 +1,86 @@
+From 28d9f8840261fb02dc76cf5aed5731b39f1b8d92 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:29:55 +0100
+Subject: [PATCH 7/8] ce_main_app: security fixes from a review
+
+- floppy image insert/download from the web interface: an image name in
+  the download folder is a plain file name; "../../" names led out of
+  it (any .st/.msa/.zip on the device into a floppy slot, and whether
+  any other file exists)
+- web server: no directory listings (civetweb's default lists folders)
+- Wi-Fi: wpa_supplicant.conf written 0600 (it holds the password), and
+  the password isn't written to the debug log
+---
+ ce_main_app/config/netsettings.cpp  | 8 ++++++--
+ ce_main_app/floppy/imagestorage.cpp | 9 +++++++++
+ ce_main_app/webserver/webserver.cpp | 4 +++-
+ 3 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/ce_main_app/config/netsettings.cpp b/ce_main_app/config/netsettings.cpp
+index b9e9da9f..92a6b555 100644
+--- a/ce_main_app/config/netsettings.cpp
++++ b/ce_main_app/config/netsettings.cpp
+@@ -1,3 +1,5 @@
++#include <fcntl.h>
++#include <sys/stat.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -145,7 +147,7 @@ void NetworkSettings::dumpSettings(void)
+     Debug::out(LOG_DEBUG, "   netmask %s", wlan0.netmask.c_str());
+     Debug::out(LOG_DEBUG, "   gateway %s", wlan0.gateway.c_str());
+     Debug::out(LOG_DEBUG, "  wpa-ssid %s", wlan0.wpaSsid.c_str());
+-    Debug::out(LOG_DEBUG, "   wpa-psk %s", wlan0.wpaPsk.c_str());
++    Debug::out(LOG_DEBUG, "   wpa-psk %s", wlan0.wpaPsk.empty() ? "(none)" : "(set)");      // not the Wi-Fi password itself
+     
+     Debug::out(LOG_DEBUG, "nameserver %s", nameserver.c_str());
+ }
+@@ -180,7 +182,9 @@ int NetworkSettings::ipNetmaskToCIDRnetmask(const char *ipNetmask)
+ 
+ void NetworkSettings::saveWpaSupplicant(void)
+ {
+-    FILE *f = fopen(WPA_SUPPLICANT_FILE, "wt");
++    int wfd = open(WPA_SUPPLICANT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);    // holds the Wi-Fi password: root only
++    if(wfd >= 0) fchmod(wfd, 0600);                                             // also when it existed before
++    FILE *f = (wfd >= 0) ? fdopen(wfd, "wt") : NULL;
+ 
+     if(!f) {
+         Debug::out(LOG_ERROR, "NetworkSettings::saveWpaSupplicant - failed to open wpa supplication file.\n");
+diff --git a/ce_main_app/floppy/imagestorage.cpp b/ce_main_app/floppy/imagestorage.cpp
+index e4b1196c..966cd5db 100644
+--- a/ce_main_app/floppy/imagestorage.cpp
++++ b/ce_main_app/floppy/imagestorage.cpp
+@@ -92,6 +92,15 @@ bool ImageStorage::getImageLocalPath(const char *imageFileName, std::string &pat
+ {
+     std::string filename = imageFileName;   // to std::string
+ 
++    // an image in the download folder: a plain file name, nothing that
++    // leads out of the folder ("../../etc/..." from a web request or a list)
++    if(filename.empty() || filename == "." || filename == ".." ||
++       filename.find('/') != std::string::npos || filename.find('\\') != std::string::npos) {
++        Debug::out(LOG_ERROR, "ImageStorage::getImageLocalPath() - refused image name: %s", imageFileName);
++        path.clear();
++        return false;
++    }
++
+     bool res = getStoragePath(path);        // get path to storage
+     if(!res) {                              // no path? fail
+         Debug::out(LOG_DEBUG, "ImageStorage::getImageLocalPath() - fail, no storage path");
+diff --git a/ce_main_app/webserver/webserver.cpp b/ce_main_app/webserver/webserver.cpp
+index 2af15748..26012193 100644
+--- a/ce_main_app/webserver/webserver.cpp
++++ b/ce_main_app/webserver/webserver.cpp
+@@ -25,7 +25,9 @@ void WebServer::start()
+     Debug::out(LOG_DEBUG, "Webserver starting...");
+ 
+     const char * options[] = { "document_root", DOCUMENT_ROOT,
+-                               "listening_ports", PORT, 0
++                               "listening_ports", PORT,
++                               "enable_directory_listing", "no",   // folders aren't listed (civetweb's default is yes)
++                               0
+                              };
+     struct mg_callbacks callbacks;
+     memset(&callbacks, 0, sizeof(callbacks));
+-- 
+2.54.0 (Apple Git-157)
+

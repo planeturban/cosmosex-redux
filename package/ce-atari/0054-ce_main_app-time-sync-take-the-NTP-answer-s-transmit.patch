@@ -1,0 +1,41 @@
+From a3638ffb50a6464b9b1a99ca2a4de17171f22ff6 Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 12:41:42 +0100
+Subject: [PATCH] ce_main_app: time sync: take the NTP answer's transmit time
+
+readNtpPacket() set the clock from word 4 of the answer, the reference
+timestamp: the moment the server's own clock was last corrected, which is
+seconds to many minutes in the past (two answers 20 s apart were 3 s behind
+and 11 s ahead of the system clock; the clock ended up 17 s slow). The
+transmit time, as the comment above the line says, is word 10. Also refuse
+an answer shorter than an NTP packet.
+---
+ ce_main_app/timesync.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/ce_main_app/timesync.cpp b/ce_main_app/timesync.cpp
+index 16d21638..cdac2e39 100644
+--- a/ce_main_app/timesync.cpp
++++ b/ce_main_app/timesync.cpp
+@@ -182,10 +182,17 @@ void TimeSync::readNtpPacket(void)
+ 
+     /*
+      * The high word of transmit time is the 10th word we get back
++     * (word 4 is the reference timestamp: when the server's own clock was
++     * last set, which can be many minutes ago)
+      * tmit is the time in seconds not accounting for network delays which
+      * should be way less than a second if this is a local NTP server
+      */
+-    tmit = ntohl((time_t)buf[4]);    //# get transmit time
++    if(n < 48) {
++        Debug::out(LOG_ERROR, "TimeSync: NTP packet too short (%ld bytes)", (long)n);
++        eState = NTP_FAILED;
++        return;
++    }
++    tmit = ntohl(buf[10]);          //# get transmit time
+ 
+     /*
+      * Convert time to unix standard time NTP is number of seconds since 0000
+-- 
+2.54.0 (Apple Git-157)
+

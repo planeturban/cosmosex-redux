@@ -1,0 +1,173 @@
+From fcb0cdd844505fad9fdc448a91e01e9eddc624ba Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:36:12 +0100
+Subject: [PATCH] ce_main_app: developer mode: the app's web server reachable
+ past the proxy
+
+Behind a proxy (CE_WEBLISTEN "127.0.0.1:<port>") the app can't be reached
+when the proxy doesn't work. With developer mode on, the app listens on
+that port on every address (http://<address>:8081/), so a restart or an
+update can still be started from a browser. The web login applies there
+too; X-Real-IP is still only believed on connections from this machine.
+
+On with devmode.txt on the boot partition, or the setting WEB_DEVMODE
+(GET/POST /api/v1/system/devmode {"on": bool}); read when the app starts.
+---
+ .../webserver/api/resource/systemresource.cpp | 34 +++++++++++++++++++
+ .../webserver/api/resource/systemresource.h   |  1 +
+ ce_main_app/webserver/webserver.cpp           | 22 ++++++++++--
+ ce_main_app/webserver/webserver.h             | 18 ++++++++++
+ 4 files changed, 73 insertions(+), 2 deletions(-)
+
+diff --git a/ce_main_app/webserver/api/resource/systemresource.cpp b/ce_main_app/webserver/api/resource/systemresource.cpp
+index 75b5ea39..097b4bfa 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.cpp
++++ b/ce_main_app/webserver/api/resource/systemresource.cpp
+@@ -21,6 +21,7 @@
+ #include "debug.h"
+ #include "systemresource.h"
+ #include "global.h"
++#include "webserver/webserver.h"
+ #include <openssl/evp.h>
+ #include <openssl/rand.h>
+ #include <openssl/crypto.h>
+@@ -263,6 +264,38 @@ void SystemResource::upload(mg_connection *conn)
+     sendStatus(conn);
+ }
+ 
++// GET /api/v1/system/devmode; POST {"on": true|false} sets the setting (used
++// from the next start of the app). See webserver.h.
++void SystemResource::devMode(mg_connection *conn, mg_request_info *req_info)
++{
++    if(strcmp(req_info->request_method, "POST") == 0) {
++        std::string body;
++        char buf[512];
++        int n;
++        while((n = mg_read(conn, buf, sizeof(buf))) > 0) if(body.length() < 4096) body.append(buf, n);
++        cJSON *in = cJSON_Parse(body.c_str());
++        cJSON *jo = in ? cJSON_GetObjectItem(in, "on") : NULL;
++        bool given = jo && (jo->type == cJSON_True || jo->type == cJSON_False);
++        bool on = given && jo->type == cJSON_True;
++        if(in) cJSON_Delete(in);
++        if(!given) { sendError(conn, 400, "on: true or false"); return; }
++        if(!WebServer::devModePossible()) { sendError(conn, 404, "This system's web server isn't behind a proxy."); return; }
++        WebServer::setDevModeSetting(on);
++        Debug::out(LOG_INFO, "SystemResource: developer mode setting %s", on ? "on" : "off");
++    } else if(strcmp(req_info->request_method, "GET") != 0) {
++        sendError(conn, 405, "GET or POST /api/v1/system/devmode");
++        return;
++    }
++    cJSON *root = cJSON_CreateObject();
++    cJSON_AddBoolToObject(root, "available", WebServer::devModePossible());
++    cJSON_AddBoolToObject(root, "setting", WebServer::devModeSetting());
++    cJSON_AddBoolToObject(root, "file", WebServer::devModeFile());
++    cJSON_AddBoolToObject(root, "active", WebServer::devModeActive());
++    cJSON_AddStringToObject(root, "listening", WebServer::listening());
++    if(WebServer::devModePossible()) cJSON_AddNumberToObject(root, "port", atoi(CE_WEBLISTEN + 10));
++    sendJson(conn, root);
++}
++
+ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, std::string sResourceInfo)
+ {
+     std::string what = sResourceInfo;
+@@ -281,6 +314,7 @@ bool SystemResource::dispatch(mg_connection *conn, mg_request_info *req_info, st
+         return true;
+     }
+     if(what == "flash") { flash(conn, req_info); return true; }
++    if(what == "devmode") { devMode(conn, req_info); return true; }
+     if(what.compare(0, 6, "update") != 0) { sendError(conn, 404, "unknown resource"); return true; }
+     what.erase(0, 6);
+     while(!what.empty() && what[0] == '/') what.erase(0, 1);
+diff --git a/ce_main_app/webserver/api/resource/systemresource.h b/ce_main_app/webserver/api/resource/systemresource.h
+index b7253e8f..b6b7873f 100644
+--- a/ce_main_app/webserver/api/resource/systemresource.h
++++ b/ce_main_app/webserver/api/resource/systemresource.h
+@@ -66,6 +66,7 @@ private:
+     void backupDownload(mg_connection *conn, mg_request_info *req_info);
+     void backupRestore(mg_connection *conn);
+     void flash(mg_connection *conn, mg_request_info *req_info);
++    void devMode(mg_connection *conn, mg_request_info *req_info);
+     // receive the body into <tool's workdir>/<name>; false: answered with an error
+     bool receiveFile(mg_connection *conn, const char *tool, long long maxMB, const std::string &name, std::string &path);
+ };
+diff --git a/ce_main_app/webserver/webserver.cpp b/ce_main_app/webserver/webserver.cpp
+index 799fc7cd..60ed1f47 100644
+--- a/ce_main_app/webserver/webserver.cpp
++++ b/ce_main_app/webserver/webserver.cpp
+@@ -7,7 +7,19 @@
+ #include "../debug.h"
+ 
+ #define DOCUMENT_ROOT CE_WEBROOT
+-#define PORT CE_WEBLISTEN
++#include <sys/stat.h>
++#include <string>
++#include "../settings.h"
++
++static std::string listenSpec = CE_WEBLISTEN;
++static bool devActive = false;
++
++bool WebServer::devModePossible(void) { return strncmp(CE_WEBLISTEN, "127.0.0.1:", 10) == 0; }
++bool WebServer::devModeFile(void)     { struct stat st; return stat(WEBUI_DEVMODE_FILE, &st) == 0; }
++bool WebServer::devModeSetting(void)  { Settings s; return s.getBool(WEBUI_DEVMODE_KEY, false); }
++void WebServer::setDevModeSetting(bool on) { Settings s; s.setBool(WEBUI_DEVMODE_KEY, on); }
++bool WebServer::devModeActive(void)   { return devActive; }
++const char *WebServer::listening(void) { return listenSpec.c_str(); }
+ 
+ 
+ WebServer::WebServer():bInited(false)
+@@ -24,9 +36,15 @@ void WebServer::start()
+ {
+     Debug::out(LOG_DEBUG, "Webserver starting...");
+ 
++    if(devModePossible() && (devModeFile() || devModeSetting())) {
++        listenSpec = CE_WEBLISTEN + 10;     // the port alone: every address
++        devActive = true;
++        Debug::out(LOG_INFO, "Webserver: developer mode, listening on port %s on every address", listenSpec.c_str());
++    }
++
+     // civetweb's built-in MIME table predates web fonts and WebP
+     const char * options[] = { "document_root", DOCUMENT_ROOT,
+-                               "listening_ports", PORT,
++                               "listening_ports", listenSpec.c_str(),
+                                "extra_mime_types", ".woff2=font/woff2,.woff=font/woff,.webp=image/webp",
+                                "enable_directory_listing", "no",   // folders aren't listed (civetweb's default is yes)
+                                0
+diff --git a/ce_main_app/webserver/webserver.h b/ce_main_app/webserver/webserver.h
+index 3564707d..88f22784 100644
+--- a/ce_main_app/webserver/webserver.h
++++ b/ce_main_app/webserver/webserver.h
+@@ -17,6 +17,17 @@
+ #define CE_WEBLISTEN "80"
+ #endif
+ 
++// Developer mode: when CE_WEBLISTEN names 127.0.0.1 (the app behind a proxy),
++// the app's own web server listens on that port on every address instead, so
++// it can be reached without the proxy (http://<address>:8081/): to restart or
++// update when the proxy doesn't work. The login applies there as everywhere.
++// On with the file WEBUI_DEVMODE_FILE on the boot partition or the setting
++// WEBUI_DEVMODE_KEY (/ce/settings; Config page); read when the app starts.
++#ifndef WEBUI_DEVMODE_FILE
++#define WEBUI_DEVMODE_FILE      "/boot/devmode.txt"
++#endif
++#define WEBUI_DEVMODE_KEY       "WEB_DEVMODE"
++
+ #include <list> 
+ 
+ #include "CivetServer.h"
+@@ -33,6 +44,13 @@ public:
+     void start();
+     void stop();
+     bool bInited;
++
++    static bool devModeFile(void);          // devmode.txt is on the boot partition
++    static bool devModeSetting(void);
++    static void setDevModeSetting(bool on);
++    static bool devModeActive(void);        // this run of the app listens on every address
++    static bool devModePossible(void);      // CE_WEBLISTEN is a 127.0.0.1 port
++    static const char *listening(void);     // what this run listens on
+ };
+ 
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,8 @@
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-atari/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-webui/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-webui-fonts/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/cosmosex/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-screensaver/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-tryboot/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-files/Config.in"
+source "$BR2_EXTERNAL_COSMOSEX_PATH/package/ce-gemdosfs/Config.in"
