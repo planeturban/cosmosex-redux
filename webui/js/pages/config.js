@@ -373,9 +373,14 @@ const SECTIONS = {
           <div data-tz-offset${d.timeZone ? ' hidden' : ''}>${text('utcOffset', 'UTC offset (hours)', String(d.utcOffset), { type: 'number', step: '0.5', min: '-12', max: '14' })}</div>
           ${text('ntpServer', 'NTP server', d.ntpServer, { mono: true })}
           ${text('screencastFrameskip', 'Screencast frame skip (10–255)', String(d.screencastFrameskip), { type: 'number', min: '10', max: '255' })}
-          ${d.screenSaverOff === undefined ? '' : `${text('screenSaverLogo', 'HDMI screen saver: logo after (seconds, 0 = no logo)', String(d.screenSaverLogo), { type: 'number', min: '0', max: '86400' })}
-          ${text('screenSaverOff', 'HDMI screen off after (seconds, 0 = never)', String(d.screenSaverOff), { type: 'number', min: '0', max: '86400' })}`}
         </div>
+        ${d.screenSaverOff === undefined ? '' : `<fieldset class="cf-box cf-saver">
+          <legend>HDMI screen saver</legend>
+          <div class="cf-grid">
+            ${text('screenSaverLogo', 'Logo after (seconds, 0 = no logo)', String(d.screenSaverLogo), { type: 'number', min: '0', max: '86400' })}
+            ${text('screenSaverOff', 'Screen off after (seconds, 0 = never)', String(d.screenSaverOff), { type: 'number', min: '0', max: '86400' })}
+          </div>
+        </fieldset>`}
         <div class="cf-radios">${radios('screenResolution', 'Config screen resolution on the ST', [['low', 'Low'], ['mid', 'Medium'], ['high', 'High']], d.screenResolution)}</div>`;
     },
     read(sec) {

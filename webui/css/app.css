@@ -599,6 +599,8 @@ a.link-action:hover { text-decoration: underline; }
 .cf-id .hint { font-size: 13px; }
 .cf-boxes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 16px; }
 .cf-box { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px 14px; margin: 0; min-width: 0; }
+.cf-box.cf-saver { margin-top: 16px; }
+.cf-box.cf-saver .cf-grid { margin-top: 4px; }
 .cf-box legend { padding: 0 6px; font-family: var(--font-display); font-size: 15px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--fg2); }
 .cf-hdd-new { margin-top: 16px; }
 .cf-hdd-new-go { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; }
