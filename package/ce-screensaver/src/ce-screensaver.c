@@ -15,10 +15,16 @@
  *     grabs those devices exclusively, so their events never reach us; the
  *     app's GET /api/v1/status reports when it last saw them (chips.ikbd_usb).
  *
- *   ce-screensaver [-l seconds] [-o seconds] [-t]
- *     -l  idle time until the logo appears (default 300; 0 = never)
+ *   ce-screensaver [-l seconds] [-o seconds] [-s directory] [-t]
+ *     -l  idle time until the logo appears (default 300; 0 = no logo)
  *     -o  idle time until the screen is switched off (default 1800; 0 = never)
+ *     -s  the CosmosEx app's settings (default /ce/settings): the files
+ *         SCREENSAVER_LOGO_SECS and SCREENSAVER_OFF_SECS there, set in the
+ *         web interface, take the place of -l and -o, and are read again
+ *         every few seconds, so a change needs no restart
  *     -t  test: start the logo at once
+ * With no logo the screen goes straight off. Times under 15 seconds count
+ * as 15 (a screen that goes off while one reads it is no use).
  */
 
 #include <dirent.h>
@@ -301,21 +307,47 @@ static void saver_stop(void)
     saver_on = 0;
 }
 
+/* -------------------------------------------------------------- settings */
+
+#define MIN_SECS 15
+
+/* a time from the app's settings file (a number in a text file), or def */
+static int setting_secs(const char *dir, const char *key, int def)
+{
+    char path[400], line[32];
+    int v = def;
+    snprintf(path, sizeof path, "%s/%s", dir, key);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fgets(line, sizeof line, f)) {
+            char *end;
+            long n = strtol(line, &end, 10);
+            if (end != line && n >= 0 && n <= 86400) v = (int) n;
+        }
+        fclose(f);
+    }
+    return v > 0 && v < MIN_SECS ? MIN_SECS : v;
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(int argc, char **argv)
 {
-    int idle_logo = 300, idle_off = 1800, test = 0, opt;
-    while ((opt = getopt(argc, argv, "l:o:t")) != -1) {
+    int def_logo = 300, def_off = 1800, test = 0, opt;
+    const char *settings = "/ce/settings";
+    while ((opt = getopt(argc, argv, "l:o:s:t")) != -1) {
         switch (opt) {
-        case 'l': idle_logo = atoi(optarg); break;
-        case 'o': idle_off = atoi(optarg); break;
+        case 'l': def_logo = atoi(optarg); break;
+        case 'o': def_off = atoi(optarg); break;
+        case 's': settings = optarg; break;
         case 't': test = 1; break;
         default:
-            fprintf(stderr, "usage: %s [-l seconds] [-o seconds] [-t]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-l seconds] [-o seconds] [-s directory] [-t]\n", argv[0]);
             return 2;
         }
     }
+    int idle_logo = setting_secs(settings, "SCREENSAVER_LOGO_SECS", def_logo);
+    int idle_off = setting_secs(settings, "SCREENSAVER_OFF_SECS", def_off);
     if (fb_open() < 0) return 1;
     tty0 = open("/dev/tty0", O_RDWR | O_CLOEXEC);
     if (tty0 < 0) { perror("ce-screensaver: /dev/tty0"); return 1; }
@@ -326,7 +358,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     double last_activity = test ? now_s() - idle_logo - 1 : now_s();
-    double next_scan = 0, next_status = 0, saver_since = 0;
+    double next_scan = 0, next_status = 0, next_settings = 0, saver_since = 0;
 
     int h = vinfo.yres / 4;
     if (h < 24) h = 24;
@@ -351,6 +383,11 @@ int main(int argc, char **argv)
             next_status = now + (saver_on ? 1 : 3);
         }
         if (test && saver_on && last_activity > saver_since) test = 0;
+        if (now >= next_settings) {             /* changed in the web interface? */
+            idle_logo = setting_secs(settings, "SCREENSAVER_LOGO_SECS", def_logo);
+            idle_off = setting_secs(settings, "SCREENSAVER_OFF_SECS", def_off);
+            next_settings = now + 3;
+        }
 
         double idle = now - last_activity;
         if (!saver_on) {

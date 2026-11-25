@@ -1,0 +1,56 @@
+From cf02c29293b3cedf1d3a6793a7208f69e48de62a Mon Sep 17 00:00:00 2001
+From: CosmosEx Buildroot <4372835+planeturban@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:11:48 +0100
+Subject: [PATCH] ce_main_app: the HDMI screen saver's times as settings
+
+New settings SCREENSAVER_LOGO_SECS (default 300) and SCREENSAVER_OFF_SECS
+(default 1800): the seconds without activity until the screen saver's logo
+appears and until the HDMI output is switched off. 0 = no logo, and never
+off; with no logo the screen goes straight off. Otherwise 15 seconds to a
+day. In the web API they are /api/v1/settings/other: screenSaverLogo and
+screenSaverOff. The app only keeps them; the screen saver (a program of
+its own) reads the settings files.
+---
+ .../webserver/api/resource/settingsresource.cpp      | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/ce_main_app/webserver/api/resource/settingsresource.cpp b/ce_main_app/webserver/api/resource/settingsresource.cpp
+index a7cf741a..d94a2028 100644
+--- a/ce_main_app/webserver/api/resource/settingsresource.cpp
++++ b/ce_main_app/webserver/api/resource/settingsresource.cpp
+@@ -636,6 +636,9 @@ bool SettingsResource::buildSection(const std::string &name, cJSON *out)
+         static const char *res[3] = { "low", "mid", "high" };
+         int r = s.getInt("SCREEN_RESOLUTION", 1);
+         cJSON_AddStringToObject(out, "screenResolution",  (r >= 0 && r <= 2) ? res[r] : "mid");
++        // the HDMI screen saver (read by ce-screensaver): seconds without activity, 0 = never
++        cJSON_AddNumberToObject(out, "screenSaverLogo",   s.getInt("SCREENSAVER_LOGO_SECS", 300));
++        cJSON_AddNumberToObject(out, "screenSaverOff",    s.getInt("SCREENSAVER_OFF_SECS", 1800));
+         return true;
+     }
+ 
+@@ -1120,6 +1123,13 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+         }
+         if(utc < -12 || utc > 14) { msg = "UTC offset: -12 to +14 hours."; return false; }
+         if(ntp.empty() || ntp.length() > 100 || !safeText(ntp, " ,;'`$")) { msg = "NTP server: a host name or IP address."; return false; }
++        // the HDMI screen saver's times: 0 (never) or 15 seconds to a day
++        double saverLogo = s.getInt("SCREENSAVER_LOGO_SECS", 300), saverOff = s.getInt("SCREENSAVER_OFF_SECS", 1800);
++        getNumber(in, "screenSaverLogo", saverLogo);
++        getNumber(in, "screenSaverOff",  saverOff);
++        if(saverLogo != 0 && (saverLogo < 15 || saverLogo > 86400)) { msg = "screenSaverLogo: 0 (no logo) or 15 to 86400 seconds."; return false; }
++        if(saverOff  != 0 && (saverOff  < 15 || saverOff  > 86400)) { msg = "screenSaverOff: 0 (never) or 15 to 86400 seconds."; return false; }
++
+         if(frameskip < 10)  frameskip = 10;                 // as the config screen
+         if(frameskip > 255) frameskip = 255;
+ 
+@@ -1130,6 +1140,8 @@ bool SettingsResource::saveSection(const std::string &name, cJSON *in, std::stri
+         s.setString("TIME_NTP_SERVER",      ntp.c_str());
+         s.setInt   ("SCREENCAST_FRAMESKIP", (int) frameskip);
+         s.setInt   ("SCREEN_RESOLUTION",    screenRes);
++        s.setInt   ("SCREENSAVER_LOGO_SECS", (int) saverLogo);
++        s.setInt   ("SCREENSAVER_OFF_SECS",  (int) saverOff);
+ 
+         do_timeSync = true;
+         Utils::forceSync();
+-- 
+2.54.0 (Apple Git-157)
+

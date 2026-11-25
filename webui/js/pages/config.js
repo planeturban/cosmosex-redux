@@ -373,6 +373,8 @@ const SECTIONS = {
           <div data-tz-offset${d.timeZone ? ' hidden' : ''}>${text('utcOffset', 'UTC offset (hours)', String(d.utcOffset), { type: 'number', step: '0.5', min: '-12', max: '14' })}</div>
           ${text('ntpServer', 'NTP server', d.ntpServer, { mono: true })}
           ${text('screencastFrameskip', 'Screencast frame skip (10–255)', String(d.screencastFrameskip), { type: 'number', min: '10', max: '255' })}
+          ${d.screenSaverOff === undefined ? '' : `${text('screenSaverLogo', 'HDMI screen saver: logo after (seconds, 0 = no logo)', String(d.screenSaverLogo), { type: 'number', min: '0', max: '86400' })}
+          ${text('screenSaverOff', 'HDMI screen off after (seconds, 0 = never)', String(d.screenSaverOff), { type: 'number', min: '0', max: '86400' })}`}
         </div>
         <div class="cf-radios">${radios('screenResolution', 'Config screen resolution on the ST', [['low', 'Low'], ['mid', 'Medium'], ['high', 'High']], d.screenResolution)}</div>`;
     },
@@ -381,6 +383,7 @@ const SECTIONS = {
         timeSync: chk(sec, 'timeSync'), utcOffset: Number(val(sec, 'utcOffset')) || 0, ntpServer: val(sec, 'ntpServer').trim(),
         timeZone: val(sec, 'timeZone'), timeZoneRule: sec.querySelector('[data-key="timeZone"]')?.selectedOptions[0]?.dataset.rule || '',
         screencastFrameskip: Number(val(sec, 'screencastFrameskip')) || 20, screenResolution: radioVal(sec, 'screenResolution'),
+        ...(sec.querySelector('[data-key="screenSaverOff"]') ? { screenSaverLogo: Number(val(sec, 'screenSaverLogo')) || 0, screenSaverOff: Number(val(sec, 'screenSaverOff')) || 0 } : {}),
       };
     },
   },
